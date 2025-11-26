@@ -119,12 +119,24 @@ async def embed_video(data: dict):
         
         print(f"Processing video {video_id} with {len(identification_segments)} segments", flush=True)
         
+        # Debug: Log first segment structure
+        if identification_segments:
+            first_seg = identification_segments[0]
+            print(f"DEBUG: First segment keys: {list(first_seg.keys())}", flush=True)
+            print(f"DEBUG: First segment has 'text' key: {'text' in first_seg}", flush=True)
+            if 'text' in first_seg:
+                print(f"DEBUG: First segment text length: {len(first_seg.get('text', ''))}", flush=True)
+                print(f"DEBUG: First segment text preview: {first_seg.get('text', '')[:100]}", flush=True)
+            else:
+                print(f"DEBUG: First segment full content: {first_seg}", flush=True)
+        
         # First, delete existing embeddings for this video (if any)
         delete_existing_embeddings(video_id)
         
         # Prepare points for batch insertion
         points = []
         segments_embedded = 0
+        segments_without_text = 0
         
         for idx, segment in enumerate(identification_segments):
             # Extract segment data
@@ -138,13 +150,19 @@ async def embed_video(data: dict):
             
             # Skip empty segments
             if not text or len(text.strip()) < 3:
+                segments_without_text += 1
+                if idx < 3:  # Log first 3 skipped segments
+                    print(f"DEBUG: Skipping segment {idx}: speaker={speaker}, start={start_time}, end={end_time}, text='{text[:50] if text else 'EMPTY'}'", flush=True)
                 continue
             
             # Generate embedding for this segment
             vector = model.encode(text).tolist()
             
-            # Create unique ID for this segment
-            point_id = f"video_{video_id}_seg_{idx}_{uuid.uuid4().hex[:8]}"
+            # Create unique ID for this segment (Qdrant accepts string or UUID)
+            # Using UUID format for compatibility
+            import hashlib
+            id_string = f"video_{video_id}_seg_{idx}"
+            point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, id_string))
             
             # Prepare metadata payload
             payload = {
@@ -175,7 +193,8 @@ async def embed_video(data: dict):
             segments_embedded += 1
         
         if not points:
-            raise HTTPException(status_code=400, detail="No valid segments found to embed")
+            print(f"DEBUG: No valid segments found. Total segments: {len(identification_segments)}, Segments without text: {segments_without_text}", flush=True)
+            raise HTTPException(status_code=400, detail=f"No valid segments found to embed. Total: {len(identification_segments)}, Without text: {segments_without_text}")
         
         # Batch insert all points (Qdrant handles batches efficiently)
         batch_size = 100
@@ -186,15 +205,22 @@ async def embed_video(data: dict):
             
             batch_payload = {"points": batch}
             
-            response = requests.put(
-                f"{QDRANT_URL}/collections/{SEGMENTS_COLLECTION}/points",
-                json=batch_payload,
-                headers=get_qdrant_headers(),
-                timeout=30
-            )
-            response.raise_for_status()
-            total_inserted += len(batch)
-            print(f"Inserted batch {i//batch_size + 1}: {len(batch)} segments (total: {total_inserted})", flush=True)
+            try:
+                response = requests.put(
+                    f"{QDRANT_URL}/collections/{SEGMENTS_COLLECTION}/points",
+                    json=batch_payload,
+                    headers=get_qdrant_headers(),
+                    timeout=30
+                )
+                response.raise_for_status()
+                total_inserted += len(batch)
+                print(f"Inserted batch {i//batch_size + 1}: {len(batch)} segments (total: {total_inserted})", flush=True)
+            except requests.exceptions.HTTPError as e:
+                print(f"ERROR: Qdrant rejected batch {i//batch_size + 1}", flush=True)
+                print(f"Status code: {e.response.status_code}", flush=True)
+                print(f"Response: {e.response.text}", flush=True)
+                print(f"Sample point from batch: {batch[0] if batch else 'empty'}", flush=True)
+                raise HTTPException(status_code=500, detail=f"Qdrant error: {e.response.text}")
         
         return {
             "success": True,
