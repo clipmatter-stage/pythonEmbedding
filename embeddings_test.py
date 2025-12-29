@@ -17,47 +17,31 @@ print("Warming up model...", flush=True)
 _ = model.encode("warmup text", show_progress_bar=False)
 print("Model warmed up and ready", flush=True)
 
-# Qdrant connection
 QDRANT_URL = "https://558d3fea-5962-46da-bffa-94aba210a6c6.eu-west-1-0.aws.cloud.qdrant.io:6333"
 QDRANT_API_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJhY2Nlc3MiOiJtIiwiZXhwIjoxNzY5NjA5NTM4fQ.zKJKxYEPp7JHVxa6DuS4nMgp5Uy6_2NHFeFrJCMjrKY"
 
-print("Connecting to Qdrant.. .", flush=True)
-qdrant_client = QdrantClient(
-    url=QDRANT_URL,
-    api_key=QDRANT_API_KEY,
-    timeout=30,
-    prefer_grpc=False,  # keep REST over HTTPS; set True if you also expose gRPC on 6334
-)
-print("Connected to Qdrant successfully", flush=True)
+SEGMENTS_COLLECTION = "video_transcript_segments"
+LEGACY_COLLECTION = "text_embeddings"
 
+print("Connecting to Qdrant.. .", flush=True)
+qdrant_client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY, timeout=30)
+print("Connected to Qdrant successfully", flush=True)
 
 def create_segments_collection():
     try:
-        collections = qdrant_client.get_collections().collections
+        collections = qdrant_client.get_collections(). collections
         collection_names = [c.name for c in collections]
-
+        
         if SEGMENTS_COLLECTION not in collection_names:
             print(f"Creating collection '{SEGMENTS_COLLECTION}'...", flush=True)
             qdrant_client.create_collection(
                 collection_name=SEGMENTS_COLLECTION,
                 vectors_config=VectorParams(size=384, distance=Distance.COSINE),
-                optimizers_config=models.OptimizersConfigDiff(indexing_threshold=1000),
+                optimizers_config=models.OptimizersConfigDiff(indexing_threshold=1000)
             )
-            qdrant_client.create_payload_index(
-                collection_name=SEGMENTS_COLLECTION,
-                field_name="video_id",
-                field_schema=models.PayloadSchemaType.INTEGER,
-            )
-            qdrant_client.create_payload_index(
-                collection_name=SEGMENTS_COLLECTION,
-                field_name="speaker",
-                field_schema=models.PayloadSchemaType.KEYWORD,
-            )
-            qdrant_client.create_payload_index(
-                collection_name=SEGMENTS_COLLECTION,
-                field_name="start_time",
-                field_schema=models.PayloadSchemaType.FLOAT,
-            )
+            qdrant_client.create_payload_index(collection_name=SEGMENTS_COLLECTION, field_name="video_id", field_schema=models.PayloadSchemaType.INTEGER)
+            qdrant_client.create_payload_index(collection_name=SEGMENTS_COLLECTION, field_name="speaker", field_schema=models.PayloadSchemaType. KEYWORD)
+            qdrant_client.create_payload_index(collection_name=SEGMENTS_COLLECTION, field_name="start_time", field_schema=models.PayloadSchemaType. FLOAT)
             print(f"Collection '{SEGMENTS_COLLECTION}' created successfully", flush=True)
         else:
             print(f"Collection '{SEGMENTS_COLLECTION}' already exists", flush=True)
