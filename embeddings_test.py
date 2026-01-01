@@ -84,8 +84,51 @@ def create_legacy_collection():
     except Exception as e:
         print(f"Error managing legacy collection:  {str(e)}", flush=True)
 
+def ensure_indexes():
+    """Create required indexes if they don't exist."""
+    try:
+        print("Checking and creating indexes.. .", flush=True)
+        
+        # Get current collection info
+        collection_info = qdrant_client. get_collection(collection_name=SEGMENTS_COLLECTION)
+        
+        # Create indexes for filterable fields
+        indexes_to_create = [
+            ("video_id", models.PayloadSchemaType.INTEGER),
+            ("speaker", models.PayloadSchemaType. KEYWORD),
+            ("video_title", models.PayloadSchemaType.TEXT),
+            ("language", models.PayloadSchemaType. KEYWORD),
+            ("start_time", models. PayloadSchemaType.FLOAT),
+            ("end_time", models. PayloadSchemaType.FLOAT),
+        ]
+        
+        for field_name, field_schema in indexes_to_create:
+            try:
+                qdrant_client.create_payload_index(
+                    collection_name=SEGMENTS_COLLECTION,
+                    field_name=field_name,
+                    field_schema=field_schema,
+                    wait=True
+                )
+                print(f"  Created index for '{field_name}'", flush=True)
+            except Exception as e:
+                # Index might already exist, which is fine
+                if "already exists" in str(e).lower():
+                    print(f"  Index for '{field_name}' already exists", flush=True)
+                else:
+                    print(f"  Note: Could not create index for '{field_name}':  {str(e)}", flush=True)
+        
+        print("Index check completed", flush=True)
+        
+    except Exception as e:
+        print(f"Error ensuring indexes: {str(e)}", flush=True)
+
+
+# Call this after creating the collection
 create_segments_collection()
 create_legacy_collection()
+ensure_indexes()
+
 
 def parse_search_query(query:  str) -> Dict: 
     """
