@@ -90,10 +90,7 @@ create_legacy_collection()
 def parse_search_query(query: str) -> Dict:
     """
     Parse search query to extract filters and keywords. 
-    Examples:
-      - "speaker:John machine learning" -> speaker filter + semantic query
-      - "title:intro python" -> title filter + semantic query
-      - "video: 123 speaker:Jane AI" -> video_id + speaker filter + semantic query
+    Simpler and more robust version. 
     """
     parsed = {
         "video_id": None,
@@ -104,30 +101,35 @@ def parse_search_query(query: str) -> Dict:
     }
     
     # Extract video_id filter
-    video_match = re.search(r'video: (\d+)', query, re.IGNORECASE)
+    video_match = re.search(r'video:(\d+)', query, re.IGNORECASE)
     if video_match:
         parsed["video_id"] = int(video_match.group(1))
-        query = re.sub(r'video:\d+', '', query, flags=re.IGNORECASE)
+        query = query.replace(video_match.group(0), '')
     
     # Extract speaker filter
-    speaker_match = re.search(r'speaker:([^\s]+)', query, re.IGNORECASE)
+    speaker_match = re. search(r'speaker:(\w+)', query, re.IGNORECASE)
     if speaker_match:
         parsed["speaker"] = speaker_match.group(1)
-        query = re.sub(r'speaker:[^\s]+', '', query, flags=re.IGNORECASE)
+        query = query. replace(speaker_match.group(0), '')
     
-    # Extract title filter
-    title_match = re. search(r'title:([^\s]+(? :\s+[^\s]+)*?)(?=\s+\w+:|$)', query, re.IGNORECASE)
+    # Extract title filter - simplified to match until next filter or end
+    title_match = re.search(r'title:([\w\s]+?)(?=\s+(? : video|speaker|$))', query, re.IGNORECASE)
+    if not title_match:
+        # Fallback:  match title until end of string
+        title_match = re.search(r'title:([\w\s]+?)$', query, re.IGNORECASE)
+    
     if title_match:
         parsed["title"] = title_match.group(1).strip()
-        query = re. sub(r'title:[^\s]+(? :\s+[^\s]+)*?(? =\s+\w+:|$)', '', query, flags=re.IGNORECASE)
+        query = query.replace(title_match. group(0), '')
     
     # Clean up query
     query = re.sub(r'\s+', ' ', query).strip()
     parsed["semantic_query"] = query
     
     # Extract keywords (words in quotes or individual words)
-    keywords = re.findall(r'"([^"]+)"|(\S+)', query)
-    parsed["keywords"] = [k[0] if k[0] else k[1] for k in keywords]
+    if query: 
+        keywords = re.findall(r'"([^"]+)"|(\S+)', query)
+        parsed["keywords"] = [k[0] if k[0] else k[1] for k in keywords]
     
     return parsed
 
