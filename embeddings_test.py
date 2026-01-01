@@ -379,13 +379,17 @@ async def embed(data: dict):
 @app.post("/search")
 async def search(data: dict):
     """
-    Enhanced search with proper handling of query vs filters. 
+    Enhanced search with elastic/fuzzy matching for speaker and title.
+    Automatically searches for names in both transcript text AND speaker field.
     
-    - query: Text to search semantically in transcript content
-    - words: Keywords to find in transcript text
-    - speaker: Filter by speaker name (exact or partial match)
-    - video_id: Filter by specific video
-    - title: Filter by video title
+    - query: Text to search (semantic + keyword search in text AND speaker field)
+    - words: Additional keywords to find in transcript text
+    - speaker: Filter by speaker name (fuzzy/partial match - case insensitive)
+    - video_id: Filter by specific video (exact match)
+    - title: Filter by video title (fuzzy/partial match - case insensitive)
+    - language: Filter by language (exact match)
+    
+    Example: query="junaid" will search for "junaid" in both transcript text AND speaker names
     """
     query_text = data.get("query", "")
     words = data.get("words", [])
@@ -432,7 +436,8 @@ async def search(data: dict):
             detail="Either 'query', 'words', or 'title' is required"
         )
 
-    # Build Qdrant filter - only use exact filters
+    # Build Qdrant filter - only use exact filters (video_id, language)
+    # Speaker and title will be filtered client-side for fuzzy matching
     filter_conditions = []
     
     if video_id_filter is not None:
@@ -440,11 +445,7 @@ async def search(data: dict):
             FieldCondition(key="video_id", match=MatchValue(value=video_id_filter))
         )
     
-    # Only use speaker filter for exact single-word matches
-    if speaker_filter is not None and " " not in speaker_filter:
-        filter_conditions.append(
-            FieldCondition(key="speaker", match=MatchValue(value=speaker_filter))
-        )
+    # Remove speaker from Qdrant filter - do fuzzy matching client-side instead
     
     if language_filter is not None:
         filter_conditions.append(
@@ -485,8 +486,12 @@ async def search(data: dict):
             )
 
             for r in sem_search_results: 
-                # Client-side title filter if needed
-                if title_filter and title_filter. lower() not in r.payload. get("video_title", "").lower():
+                # Client-side fuzzy title filter (partial/elastic matching)
+                if title_filter and title_filter.lower() not in r.payload.get("video_title", "").lower():
+                    continue
+                
+                # Client-side fuzzy speaker filter (partial/elastic matching)
+                if speaker_filter and speaker_filter.lower() not in r.payload.get("speaker", "").lower():
                     continue
                 
                 # Client-side speaker search (partial match in text or speaker field)
@@ -521,6 +526,12 @@ async def search(data: dict):
 
     # Strategy 2: Keyword search (also search for speaker name in text)
     search_words = list(words) if words else []
+    
+    # Add query words to keyword search for elastic name matching
+    if query_text:
+        query_words = query_text.strip().split()
+        search_words.extend(query_words)
+    
     if speaker_search_in_text: 
         # Add speaker name words to keyword search
         search_words.extend(speaker_search_in_text.split())
@@ -551,13 +562,18 @@ async def search(data: dict):
                 for p in points:
                     scanned += 1
                     text = (p.payload.get("text") or "").lower()
-                    speaker_field = (p. payload.get("speaker") or "").lower()
+                    speaker_field = (p.payload.get("speaker") or "").lower()
                     combined_text = f"{text} {speaker_field}"
                     
-                    # Check if ANY word matches (OR logic for names)
+                    # Check if ANY word matches in text OR speaker field (OR logic for names)
+                    # This enables elastic search for names
                     if any(w in combined_text for w in words_lower):
-                        # Client-side title filter
+                        # Client-side fuzzy title filter (partial/elastic matching)
                         if title_filter and title_filter.lower() not in p.payload.get("video_title", "").lower():
+                            continue
+                        
+                        # Client-side fuzzy speaker filter (partial/elastic matching)
+                        if speaker_filter and speaker_filter.lower() not in p.payload.get("speaker", "").lower():
                             continue
                         
                         keyword_results.append({
@@ -889,8 +905,8 @@ async def root():
         "search_features": [
             "Semantic search using embeddings",
             "Multi-keyword search (AND/OR logic)",
-            "Video title search (fuzzy matching)",
-            "Speaker filtering",
+            "Fuzzy/elastic title search (partial, case-insensitive)",
+            "Fuzzy/elastic speaker filtering (partial, case-insensitive)",
             "Time range filtering",
             "Query parsing (e.g., 'speaker:John title:intro AI')",
             "Combined search strategies",
