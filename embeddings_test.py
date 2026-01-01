@@ -87,52 +87,55 @@ def create_legacy_collection():
 create_segments_collection()
 create_legacy_collection()
 
-def parse_search_query(query: str) -> Dict:
+def parse_search_query(query:  str) -> Dict: 
     """
-    Parse search query to extract filters and keywords. 
-    Simpler and more robust version. 
+    Parse search query to extract filters and keywords.
+    Examples:
+      - "speaker: John machine learning" -> speaker filter + semantic query
+      - "title:intro python" -> title filter + semantic query
+      - "video:123 speaker:Jane AI" -> video_id + speaker filter + semantic query
     """
     parsed = {
         "video_id": None,
-        "speaker": None,
+        "speaker":  None,
         "title": None,
         "keywords": [],
         "semantic_query": query
     }
     
-    # Extract video_id filter
-    video_match = re.search(r'video:(\d+)', query, re.IGNORECASE)
-    if video_match:
-        parsed["video_id"] = int(video_match.group(1))
-        query = query.replace(video_match.group(0), '')
+    remaining_query = query
     
-    # Extract speaker filter
-    speaker_match = re. search(r'speaker:(\w+)', query, re.IGNORECASE)
+    # Extract video_id filter (video: 123)
+    video_pattern = re.compile(r'video:(\d+)', re.IGNORECASE)
+    video_match = video_pattern.search(remaining_query)
+    if video_match: 
+        parsed["video_id"] = int(video_match. group(1))
+        remaining_query = video_pattern.sub('', remaining_query)
+    
+    # Extract speaker filter (speaker:John)
+    speaker_pattern = re.compile(r'speaker: (\S+)', re.IGNORECASE)
+    speaker_match = speaker_pattern.search(remaining_query)
     if speaker_match:
         parsed["speaker"] = speaker_match.group(1)
-        query = query. replace(speaker_match.group(0), '')
+        remaining_query = speaker_pattern.sub('', remaining_query)
     
-    # Extract title filter - simplified to match until next filter or end
-    title_match = re.search(r'title:([\w\s]+?)(?=\s+(? : video|speaker|$))', query, re.IGNORECASE)
-    if not title_match:
-        # Fallback:  match title until end of string
-        title_match = re.search(r'title:([\w\s]+?)$', query, re.IGNORECASE)
-    
+    # Extract title filter (title: something)
+    title_pattern = re.compile(r'title: (\S+)', re.IGNORECASE)
+    title_match = title_pattern. search(remaining_query)
     if title_match:
-        parsed["title"] = title_match.group(1).strip()
-        query = query.replace(title_match. group(0), '')
+        parsed["title"] = title_match.group(1)
+        remaining_query = title_pattern.sub('', remaining_query)
     
-    # Clean up query
-    query = re.sub(r'\s+', ' ', query).strip()
-    parsed["semantic_query"] = query
+    # Clean up remaining query - remove extra spaces
+    remaining_query = ' '.join(remaining_query.split()).strip()
+    parsed["semantic_query"] = remaining_query
     
-    # Extract keywords (words in quotes or individual words)
-    if query: 
-        keywords = re.findall(r'"([^"]+)"|(\S+)', query)
-        parsed["keywords"] = [k[0] if k[0] else k[1] for k in keywords]
+    # Extract keywords from remaining query
+    if remaining_query: 
+        parsed["keywords"] = remaining_query.split()
     
     return parsed
-
+    
 @app.post("/embed-video")
 async def embed_video(data: dict):
     try:
