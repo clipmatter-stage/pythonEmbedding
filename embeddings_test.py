@@ -7,6 +7,7 @@ import os
 from datetime import datetime
 from typing import Optional, List, Dict
 import re
+import requests
 
 app = FastAPI()
 
@@ -84,50 +85,60 @@ def create_legacy_collection():
     except Exception as e:
         print(f"Error managing legacy collection:  {str(e)}", flush=True)
 
-def ensure_indexes():
-    """Create required indexes if they don't exist."""
-    try:
-        print("Checking and creating indexes.. .", flush=True)
+
+def ensure_indexes_http():
+    """Create required indexes using direct HTTP requests to avoid client version issues."""
+    try: 
+        print("Creating indexes via HTTP...", flush=True)
         
-        # Get current collection info
-        collection_info = qdrant_client. get_collection(collection_name=SEGMENTS_COLLECTION)
-        
-        # Create indexes for filterable fields
         indexes_to_create = [
-            ("video_id", models.PayloadSchemaType.INTEGER),
-            ("speaker", models.PayloadSchemaType. KEYWORD),
-            ("video_title", models.PayloadSchemaType.TEXT),
-            ("language", models.PayloadSchemaType. KEYWORD),
-            ("start_time", models. PayloadSchemaType.FLOAT),
-            ("end_time", models. PayloadSchemaType.FLOAT),
+            {"field_name": "video_id", "field_schema": "integer"},
+            {"field_name": "speaker", "field_schema": "keyword"},
+            {"field_name": "video_title", "field_schema": "text"},
+            {"field_name": "language", "field_schema": "keyword"},
+            {"field_name":  "start_time", "field_schema": "float"},
+            {"field_name": "end_time", "field_schema": "float"},
         ]
         
-        for field_name, field_schema in indexes_to_create:
-            try:
-                qdrant_client.create_payload_index(
-                    collection_name=SEGMENTS_COLLECTION,
-                    field_name=field_name,
-                    field_schema=field_schema,
-                    wait=True
-                )
-                print(f"  Created index for '{field_name}'", flush=True)
-            except Exception as e:
-                # Index might already exist, which is fine
-                if "already exists" in str(e).lower():
-                    print(f"  Index for '{field_name}' already exists", flush=True)
-                else:
-                    print(f"  Note: Could not create index for '{field_name}':  {str(e)}", flush=True)
+        headers = {
+            "api-key":  QDRANT_API_KEY,
+            "Content-Type":  "application/json"
+        }
         
-        print("Index check completed", flush=True)
+        for index_config in indexes_to_create:
+            field_name = index_config["field_name"]
+            field_schema = index_config["field_schema"]
+            
+            url = f"{QDRANT_URL}/collections/{SEGMENTS_COLLECTION}/index"
+            
+            payload = {
+                "field_name": field_name,
+                "field_schema": field_schema
+            }
+            
+            try:
+                response = requests.put(url, json=payload, headers=headers, timeout=30)
+                
+                if response.status_code == 200:
+                    print(f"  ✓ Created index for '{field_name}'", flush=True)
+                elif response.status_code == 400 and "already exists" in response. text. lower():
+                    print(f"  ✓ Index for '{field_name}' already exists", flush=True)
+                else:
+                    print(f"  ✗ Failed to create index for '{field_name}':  {response.text}", flush=True)
+                    
+            except Exception as e:
+                print(f"  ✗ Error creating index for '{field_name}': {str(e)}", flush=True)
+        
+        print("Index creation completed", flush=True)
         
     except Exception as e:
-        print(f"Error ensuring indexes: {str(e)}", flush=True)
+        print(f"Error in ensure_indexes_http: {str(e)}", flush=True)
 
 
-# Call this after creating the collection
+# Replace the old ensure_indexes call with this
 create_segments_collection()
 create_legacy_collection()
-ensure_indexes()
+ensure_indexes_http()  # Use HTTP version instead
 
 
 def parse_search_query(query:  str) -> Dict: 
