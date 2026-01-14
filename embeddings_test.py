@@ -19,8 +19,8 @@ print("Warming up model...", flush=True)
 _ = model.encode("warmup text", show_progress_bar=False)
 print("Model warmed up and ready", flush=True)
 
-QDRANT_URL = "https://558d3fea-5962-46da-bffa-94aba210a6c6.eu-west-1-0.aws.cloud.qdrant.io:6333"
-QDRANT_API_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJhY2Nlc3MiOiJtIiwiZXhwIjoxNzY5NjA5NTM4fQ.zKJKxYEPp7JHVxa6DuS4nMgp5Uy6_2NHFeFrJCMjrKY"
+QDRANT_URL = "https://f98698ca-0490-4f21-ae3d-ffa9fbfcd544.ap-southeast-2-0.aws.cloud.qdrant.io:6333"
+QDRANT_API_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJhY2Nlc3MiOiJtIiwiZXhwIjoxNzk5OTM5NjM1fQ.cbiNqYZPD2pqIGuE0VSTvpVcGmocLgLfYMwBtYuak8s"
 
 SEGMENTS_COLLECTION = "video_transcript_segments"
 LEGACY_COLLECTION = "text_embeddings"
