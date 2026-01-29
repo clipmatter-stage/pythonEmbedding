@@ -1,33 +1,263 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends, Security, Request
+from fastapi.security import APIKeyHeader
+from fastapi.middleware.cors import CORSMiddleware
 from sentence_transformers import SentenceTransformer
 from qdrant_client import models, QdrantClient
 from qdrant_client.models import Distance, VectorParams, PointStruct, Filter, FieldCondition, MatchValue, MatchText, SearchParams
 import uuid
 import os
+import logging
 from datetime import datetime
 from typing import Optional, List, Dict
 import re
 import requests
+from rapidfuzz import fuzz, process
+from cachetools import TTLCache
+from functools import lru_cache
+from pydantic import BaseModel, Field, validator
+from contextlib import asynccontextmanager
+import time
+from collections import defaultdict
 
-app = FastAPI()
+# ============== LOGGING CONFIGURATION ==============
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger(__name__)
 
-print("Loading sentence-transformers model...", flush=True)
+# ============== ENVIRONMENT VARIABLES (SECURE) ==============
+QDRANT_URL = os.getenv("QDRANT_URL")
+QDRANT_API_KEY = os.getenv("QDRANT_API_KEY")
+API_KEY = os.getenv("API_KEY")  # Optional API key for authentication
+
+# Validate required environment variables
+if not QDRANT_URL or not QDRANT_API_KEY:
+    logger.error("Missing required environment variables: QDRANT_URL and QDRANT_API_KEY")
+    raise ValueError("QDRANT_URL and QDRANT_API_KEY environment variables are required")
+
+# Rate limiting configuration
+RATE_LIMIT_REQUESTS = int(os.getenv("RATE_LIMIT_REQUESTS", "100"))
+RATE_LIMIT_WINDOW = int(os.getenv("RATE_LIMIT_WINDOW", "60"))
+
+# ============== PYDANTIC MODELS FOR INPUT VALIDATION ==============
+class EmbedVideoRequest(BaseModel):
+    video_id: int = Field(..., gt=0, description="Video ID must be positive")
+    identification_segments: List[dict] = Field(..., min_items=1)
+    video_title: str = Field(default="", max_length=500)
+    video_filename: str = Field(default="", max_length=500)
+    youtube_url: str = Field(default="", max_length=1000)
+    language: str = Field(default="", max_length=50)
+
+class SearchRequest(BaseModel):
+    query: str = Field(default="", max_length=1000)
+    words: List[str] = Field(default=[])
+    word: Optional[str] = Field(default=None, max_length=200)
+    top_k: int = Field(default=10, ge=1, le=100)
+    video_id: Optional[int] = Field(default=None, gt=0)
+    speaker: Optional[str] = Field(default=None, max_length=200)
+    title: Optional[str] = Field(default=None, max_length=500)
+    language: Optional[str] = Field(default=None, max_length=50)
+    min_score: float = Field(default=0.3, ge=0.0, le=1.0)
+    time_range: Optional[dict] = None
+    max_scanned: int = Field(default=10000, ge=100, le=100000)
+
+class SuggestRequest(BaseModel):
+    query: str = Field(..., min_length=2, max_length=200)
+    type: str = Field(default="both", pattern="^(speaker|title|both)$")
+    limit: int = Field(default=10, ge=1, le=50)
+
+class TitleSearchRequest(BaseModel):
+    title: str = Field(..., min_length=1, max_length=500)
+    limit: int = Field(default=10, ge=1, le=100)
+
+# ============== RATE LIMITER ==============
+class RateLimiter:
+    def __init__(self, requests: int = 100, window: int = 60):
+        self.requests = requests
+        self.window = window
+        self.clients: Dict[str, List[float]] = defaultdict(list)
+    
+    def is_allowed(self, client_ip: str) -> bool:
+        now = time.time()
+        # Clean old requests
+        self.clients[client_ip] = [
+            req_time for req_time in self.clients[client_ip]
+            if now - req_time < self.window
+        ]
+        # Check limit
+        if len(self.clients[client_ip]) >= self.requests:
+            return False
+        self.clients[client_ip].append(now)
+        return True
+
+rate_limiter = RateLimiter(RATE_LIMIT_REQUESTS, RATE_LIMIT_WINDOW)
+
+# ============== API KEY AUTHENTICATION ==============
+api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+
+async def verify_api_key(request: Request, api_key: str = Security(api_key_header)):
+    """Verify API key if configured, also check rate limits."""
+    client_ip = request.client.host if request.client else "unknown"
+    
+    # Rate limiting
+    if not rate_limiter.is_allowed(client_ip):
+        raise HTTPException(
+            status_code=429,
+            detail="Rate limit exceeded. Please try again later."
+        )
+    
+    # API key verification (only if API_KEY is configured)
+    if API_KEY:
+        if not api_key or api_key != API_KEY:
+            raise HTTPException(
+                status_code=401,
+                detail="Invalid or missing API key"
+            )
+    return True
+
+# ============== APP INITIALIZATION ==============
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Startup and shutdown events."""
+    logger.info("Starting up Video Transcript Search API...")
+    logger.info(f"Qdrant URL: {QDRANT_URL[:50]}...")
+    yield
+    logger.info("Shutting down...")
+
+app = FastAPI(
+    title="Video Transcript Elastic Search API",
+    description="Secure API for semantic search over video transcripts",
+    version="4.0.0",
+    lifespan=lifespan
+)
+
+# CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=os.getenv("CORS_ORIGINS", "*").split(","),
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Cache for query embeddings (max 1000 queries, 1 hour TTL)
+embedding_cache = TTLCache(maxsize=1000, ttl=3600)
+
+logger.info("Loading sentence-transformers model...")
 model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
-print("Model loaded successfully", flush=True)
+logger.info("Model loaded successfully")
 
-print("Warming up model...", flush=True)
+logger.info("Warming up model...")
 _ = model.encode("warmup text", show_progress_bar=False)
-print("Model warmed up and ready", flush=True)
+logger.info("Model warmed up and ready")
 
-QDRANT_URL = "https://f98698ca-0490-4f21-ae3d-ffa9fbfcd544.ap-southeast-2-0.aws.cloud.qdrant.io:6333"
-QDRANT_API_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJhY2Nlc3MiOiJtIiwiZXhwIjoxNzk5OTM5NjM1fQ.cbiNqYZPD2pqIGuE0VSTvpVcGmocLgLfYMwBtYuak8s"
+# ============== ELASTIC SEARCH HELPERS ==============
+
+def get_cached_embedding(text: str) -> List[float]:
+    """Get embedding with caching for repeated queries."""
+    cache_key = text.strip().lower()[:500]  # Normalize and limit key length
+    if cache_key not in embedding_cache:
+        embedding_cache[cache_key] = model.encode(text, show_progress_bar=False).tolist()
+    return embedding_cache[cache_key]
+
+def fuzzy_match_text(query: str, text: str, threshold: int = 65) -> bool:
+    """
+    Fuzzy match with typo tolerance using rapidfuzz.
+    Returns True if query fuzzy-matches text above threshold.
+    """
+    if not query or not text:
+        return False
+    query_lower = query.lower()
+    text_lower = text.lower()
+    
+    # Exact substring match (fastest)
+    if query_lower in text_lower:
+        return True
+    
+    # Fuzzy partial match (handles typos)
+    return fuzz.partial_ratio(query_lower, text_lower) >= threshold
+
+def fuzzy_match_speaker(query: str, speaker: str, threshold: int = 75) -> bool:
+    """
+    Fuzzy match for speaker names with higher threshold.
+    Handles variations like 'John' vs 'Jon', 'Muhammad' vs 'Mohammad'.
+    """
+    if not query or not speaker:
+        return False
+    
+    query_lower = query.lower().strip()
+    speaker_lower = speaker.lower().strip()
+    
+    # Exact match
+    if query_lower == speaker_lower or query_lower in speaker_lower:
+        return True
+    
+    # Check each word in speaker name
+    speaker_parts = speaker_lower.split()
+    for part in speaker_parts:
+        if fuzz.ratio(query_lower, part) >= threshold:
+            return True
+    
+    # Full fuzzy match
+    return fuzz.ratio(query_lower, speaker_lower) >= threshold
+
+def generate_ngrams(text: str, n: int = 3) -> List[str]:
+    """Generate character n-grams for partial matching."""
+    text = text.lower().strip()
+    if len(text) < n:
+        return [text]
+    return [text[i:i+n] for i in range(len(text) - n + 1)]
+
+def ngram_similarity(query: str, text: str, n: int = 3) -> float:
+    """Calculate n-gram based similarity (0-1)."""
+    query_ngrams = set(generate_ngrams(query, n))
+    text_ngrams = set(generate_ngrams(text, n))
+    
+    if not query_ngrams or not text_ngrams:
+        return 0.0
+    
+    intersection = query_ngrams & text_ngrams
+    return len(intersection) / len(query_ngrams)
+
+def expand_query_variations(query: str) -> List[str]:
+    """
+    Generate query variations for better recall.
+    Handles common typos and variations.
+    """
+    variations = [query]
+    query_lower = query.lower().strip()
+    
+    if query_lower not in [v.lower() for v in variations]:
+        variations.append(query_lower)
+    
+    # Add individual words for multi-word queries
+    words = query.split()
+    if len(words) > 1:
+        variations.extend(words)
+    
+    return list(set(variations))
+
+def calculate_combined_score(semantic_score: float, keyword_match: bool, fuzzy_score: float = 0) -> float:
+    """
+    Calculate combined relevance score.
+    Weights: semantic=0.6, keyword=0.25, fuzzy=0.15
+    """
+    base_score = semantic_score * 0.6
+    if keyword_match:
+        base_score += 0.25
+    if fuzzy_score > 0:
+        base_score += fuzzy_score * 0.15
+    return min(base_score, 1.0)  # Cap at 1.0
+
+# ============== END ELASTIC SEARCH HELPERS ==============
 
 SEGMENTS_COLLECTION = "video_transcript_segments"
 LEGACY_COLLECTION = "text_embeddings"
 
-print("Connecting to Qdrant...", flush=True)
+logger.info("Connecting to Qdrant...")
 qdrant_client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY, timeout=30)
-print("Connected to Qdrant successfully", flush=True)
+logger.info("Connected to Qdrant successfully")
 
 def create_segments_collection():
     try:
@@ -35,7 +265,7 @@ def create_segments_collection():
         collection_names = [c.name for c in collections]
         
         if SEGMENTS_COLLECTION not in collection_names:
-            print(f"Creating collection '{SEGMENTS_COLLECTION}'...", flush=True)
+            logger.info(f"Creating collection '{SEGMENTS_COLLECTION}'...")
             qdrant_client.create_collection(
                 collection_name=SEGMENTS_COLLECTION,
                 vectors_config=VectorParams(size=384, distance=Distance.COSINE),
@@ -62,11 +292,11 @@ def create_segments_collection():
                 field_name="start_time",
                 field_schema=models.PayloadSchemaType.FLOAT
             )
-            print(f"Collection '{SEGMENTS_COLLECTION}' created successfully", flush=True)
+            logger.info(f"Collection '{SEGMENTS_COLLECTION}' created successfully")
         else:
-            print(f"Collection '{SEGMENTS_COLLECTION}' already exists", flush=True)
+            logger.info(f"Collection '{SEGMENTS_COLLECTION}' already exists")
     except Exception as e:
-        print(f"Error managing collection: {str(e)}", flush=True)
+        logger.info(f"Error managing collection: {str(e)}")
         raise
 
 def create_legacy_collection():
@@ -75,21 +305,21 @@ def create_legacy_collection():
         collection_names = [c.name for c in collections]
         
         if LEGACY_COLLECTION not in collection_names:
-            print(f"Creating legacy collection '{LEGACY_COLLECTION}'...", flush=True)
+            logger.info(f"Creating legacy collection '{LEGACY_COLLECTION}'...")
             qdrant_client.create_collection(
                 collection_name=LEGACY_COLLECTION,
                 vectors_config=VectorParams(size=384, distance=Distance. COSINE),
                 optimizers_config=models.OptimizersConfigDiff(indexing_threshold=10000)
             )
-            print(f"Collection '{LEGACY_COLLECTION}' created successfully", flush=True)
+            logger.info(f"Collection '{LEGACY_COLLECTION}' created successfully")
     except Exception as e:
-        print(f"Error managing legacy collection:  {str(e)}", flush=True)
+        logger.info(f"Error managing legacy collection:  {str(e)}")
 
 
 def ensure_indexes_http():
     """Create required indexes using direct HTTP requests to avoid client version issues."""
     try: 
-        print("Creating indexes via HTTP...", flush=True)
+        logger.info("Creating indexes via HTTP...")
         
         indexes_to_create = [
             {"field_name": "video_id", "field_schema": "integer"},
@@ -120,19 +350,19 @@ def ensure_indexes_http():
                 response = requests.put(url, json=payload, headers=headers, timeout=30)
                 
                 if response.status_code == 200:
-                    print(f"  ✓ Created index for '{field_name}'", flush=True)
+                    logger.info(f"  ✓ Created index for '{field_name}'")
                 elif response.status_code == 400 and "already exists" in response. text. lower():
-                    print(f"  ✓ Index for '{field_name}' already exists", flush=True)
+                    logger.info(f"  ✓ Index for '{field_name}' already exists")
                 else:
-                    print(f"  ✗ Failed to create index for '{field_name}':  {response.text}", flush=True)
+                    logger.info(f"  ✗ Failed to create index for '{field_name}':  {response.text}")
                     
             except Exception as e:
-                print(f"  ✗ Error creating index for '{field_name}': {str(e)}", flush=True)
+                logger.info(f"  ✗ Error creating index for '{field_name}': {str(e)}")
         
-        print("Index creation completed", flush=True)
+        logger.info("Index creation completed")
         
     except Exception as e:
-        print(f"Error in ensure_indexes_http: {str(e)}", flush=True)
+        logger.info(f"Error in ensure_indexes_http: {str(e)}")
 
 
 # Replace the old ensure_indexes call with this
@@ -191,22 +421,20 @@ def parse_search_query(query:  str) -> Dict:
     return parsed
     
 @app.post("/embed-video")
-async def embed_video(data: dict):
+async def embed_video(data: EmbedVideoRequest, authorized: bool = Depends(verify_api_key)):
+    """Embed video transcript segments. Requires API key if configured."""
     try:
-        video_id = data.get("video_id")
-        if not video_id:
-            raise HTTPException(status_code=400, detail="video_id is required")
-        
-        identification_segments = data.get("identification_segments", [])
+        video_id = data.video_id
+        identification_segments = data.identification_segments
         if not identification_segments:
             raise HTTPException(status_code=400, detail="identification_segments is required")
         
-        video_title = data.get("video_title", "")
-        video_filename = data.get("video_filename", "")
-        youtube_url = data.get("youtube_url", "")
-        language = data.get("language", "")
+        video_title = data.video_title
+        video_filename = data.video_filename
+        youtube_url = data.youtube_url
+        language = data.language
         
-        print(f"Processing video {video_id} with {len(identification_segments)} segments", flush=True)
+        logger.info(f"Processing video {video_id} with {len(identification_segments)} segments")
         
         delete_existing_embeddings(video_id)
         
@@ -247,12 +475,12 @@ async def embed_video(data: dict):
                 detail=f"No valid segments found to embed.  Total:  {len(identification_segments)}, Without text: {segments_without_text}"
             )
         
-        print(f"Generating embeddings for {len(texts_to_embed)} segments in batch.. .", flush=True)
+        logger.info(f"Generating embeddings for {len(texts_to_embed)} segments in batch.. .")
         batch_start_time = datetime.utcnow()
         vectors = model.encode(texts_to_embed, show_progress_bar=False, batch_size=32).tolist()
         batch_end_time = datetime.utcnow()
         batch_duration = (batch_end_time - batch_start_time).total_seconds()
-        print(f"Batch embedding completed in {batch_duration:.2f} seconds", flush=True)
+        logger.info(f"Batch embedding completed in {batch_duration:.2f} seconds")
         
         for i, metadata in enumerate(segment_metadata):
             vector = vectors[i]
@@ -287,7 +515,7 @@ async def embed_video(data: dict):
                 detail=f"No valid segments found to embed. Total: {len(identification_segments)}, Without text: {segments_without_text}"
             )
         
-        print(f"Inserting {len(points)} points into Qdrant...", flush=True)
+        logger.info(f"Inserting {len(points)} points into Qdrant...")
         
         try:
             qdrant_client.upsert(
@@ -295,9 +523,9 @@ async def embed_video(data: dict):
                 points=points,
                 wait=True
             )
-            print(f"Successfully inserted {len(points)} points", flush=True)
+            logger.info(f"Successfully inserted {len(points)} points")
         except Exception as e:
-            print(f"ERROR:  Qdrant insertion failed: {str(e)}", flush=True)
+            logger.info(f"ERROR:  Qdrant insertion failed: {str(e)}")
             raise HTTPException(status_code=500, detail=f"Qdrant error: {str(e)}")
         
         return {
@@ -311,7 +539,7 @@ async def embed_video(data: dict):
         }
         
     except Exception as e:
-        print(f"Error in embed_video: {str(e)}", flush=True)
+        logger.info(f"Error in embed_video: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 def delete_existing_embeddings(video_id: int):
@@ -329,9 +557,9 @@ def delete_existing_embeddings(video_id: int):
                 )
             )
         )
-        print(f"Deleted existing embeddings for video {video_id}", flush=True)
+        logger.info(f"Deleted existing embeddings for video {video_id}")
     except Exception as e:
-        print(f"Note: Could not delete embeddings (may not exist): {str(e)}", flush=True)
+        logger.info(f"Note: Could not delete embeddings (may not exist): {str(e)}")
 
 @app.post("/embed")
 async def embed(data: dict):
@@ -377,7 +605,7 @@ async def embed(data: dict):
     }
 
 @app.post("/search")
-async def search(data: dict):
+async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)):
     """
     Enhanced search with elastic/fuzzy matching for speaker and title.
     Automatically searches for names in both transcript text AND speaker field.
@@ -391,17 +619,17 @@ async def search(data: dict):
     
     Example: query="junaid" will search for "junaid" in both transcript text AND speaker names
     """
-    query_text = data.get("query", "")
-    words = data.get("words", [])
-    word = data.get("word")
-    top_k = int(data.get("top_k", 10))
-    video_id_filter = data.get("video_id")
-    speaker_filter = data. get("speaker")
-    title_filter = data. get("title")
-    language_filter = data. get("language")
-    min_score = float(data.get("min_score", 0.3))  # Lower default threshold
-    time_range = data. get("time_range")
-    max_scanned = int(data.get("max_scanned", 10000))
+    query_text = data.query
+    words = data.words
+    word = data.word
+    top_k = data.top_k
+    video_id_filter = data.video_id
+    speaker_filter = data.speaker
+    title_filter = data.title
+    language_filter = data.language
+    min_score = data.min_score
+    time_range = data.time_range
+    max_scanned = data.max_scanned
     
     # Check if speaker_filter looks like a search query (contains spaces or is a name to search for)
     speaker_search_in_text = None
@@ -469,62 +697,80 @@ async def search(data: dict):
     semantic_results = []
     keyword_results = []
 
-    # Strategy 1: Semantic search
+    # Strategy 1: Semantic search with caching
     if query_text:
         try:
-            print(f"Semantic search for: '{query_text[: 120]}'", flush=True)
-            query_vector = model. encode(query_text).tolist()
+            logger.info(f"Elastic semantic search for: '{query_text[:120]}'")
+            
+            # Use cached embedding for repeated queries
+            query_vector = get_cached_embedding(query_text)
 
-            sem_search_results = qdrant_client. search(
+            sem_search_results = qdrant_client.search(
                 collection_name=SEGMENTS_COLLECTION,
                 query_vector=query_vector,
-                limit=top_k * 3,
-                score_threshold=min_score,
+                limit=top_k * 4,  # Get more results for fuzzy filtering
+                score_threshold=min_score * 0.8,  # Lower threshold, filter later
                 query_filter=search_filter,
                 with_payload=True,
                 with_vectors=False
             )
 
-            for r in sem_search_results: 
-                # Client-side fuzzy title filter (partial/elastic matching)
-                if title_filter and title_filter.lower() not in r.payload.get("video_title", "").lower():
-                    continue
+            for r in sem_search_results:
+                payload = r.payload or {}
+                video_title = payload.get("video_title", "")
+                speaker = payload.get("speaker", "")
+                text = payload.get("text", "")
                 
-                # Client-side fuzzy speaker filter (partial/elastic matching)
-                if speaker_filter and speaker_filter.lower() not in r.payload.get("speaker", "").lower():
-                    continue
-                
-                # Client-side speaker search (partial match in text or speaker field)
-                if speaker_search_in_text: 
-                    text_content = r.payload. get("text", "").lower()
-                    speaker_field = r.payload. get("speaker", "").lower()
-                    search_term = speaker_search_in_text. lower()
-                    if search_term not in text_content and search_term not in speaker_field: 
+                # ELASTIC title filter with fuzzy matching
+                if title_filter:
+                    if not fuzzy_match_text(title_filter, video_title, threshold=60):
                         continue
+                
+                # ELASTIC speaker filter with fuzzy matching (handles typos)
+                if speaker_filter:
+                    if not fuzzy_match_speaker(speaker_filter, speaker, threshold=70):
+                        continue
+                
+                # ELASTIC speaker search in text with fuzzy matching
+                if speaker_search_in_text:
+                    found_speaker = (
+                        fuzzy_match_text(speaker_search_in_text, text, threshold=65) or
+                        fuzzy_match_speaker(speaker_search_in_text, speaker, threshold=70)
+                    )
+                    if not found_speaker:
+                        continue
+                
+                # Calculate fuzzy boost score
+                fuzzy_boost = 0
+                if title_filter and video_title:
+                    fuzzy_boost = max(fuzzy_boost, fuzz.partial_ratio(title_filter.lower(), video_title.lower()) / 100)
+                if speaker_filter and speaker:
+                    fuzzy_boost = max(fuzzy_boost, fuzz.ratio(speaker_filter.lower(), speaker.lower()) / 100)
                 
                 semantic_results.append({
                     "id": r.id,
-                    "score": float(getattr(r, "score", 0.0)),
-                    "video_id": r. payload.get("video_id"),
-                    "video_title": r.payload. get("video_title", ""),
-                    "speaker": r. payload.get("speaker", ""),
-                    "diarization_speaker": r.payload. get("diarization_speaker", ""),
-                    "start_time": r. payload.get("start_time", 0),
-                    "end_time":  r.payload.get("end_time", 0),
-                    "duration": round((r.payload.get("end_time", 0) - r.payload.get("start_time", 0)), 2),
-                    "text": r.payload.get("text", ""),
-                    "text_length": r.payload.get("text_length", 0),
-                    "youtube_url": r.payload. get("youtube_url", ""),
-                    "language": r.payload.get("language", ""),
-                    "created_at": r. payload.get("created_at"),
-                    "match_types": ["semantic"]
+                    "score": calculate_combined_score(float(getattr(r, "score", 0.0)), False, fuzzy_boost),
+                    "video_id": payload.get("video_id"),
+                    "video_title": video_title,
+                    "speaker": speaker,
+                    "diarization_speaker": payload.get("diarization_speaker", ""),
+                    "start_time": payload.get("start_time", 0),
+                    "end_time": payload.get("end_time", 0),
+                    "duration": round((payload.get("end_time", 0) - payload.get("start_time", 0)), 2),
+                    "text": text,
+                    "text_length": payload.get("text_length", 0),
+                    "youtube_url": payload.get("youtube_url", ""),
+                    "language": payload.get("language", ""),
+                    "created_at": payload.get("created_at"),
+                    "match_types": ["semantic"],
+                    "fuzzy_score": round(fuzzy_boost, 2)
                 })
 
         except Exception as e:
-            print(f"ERROR during semantic search: {str(e)}", flush=True)
+            logger.info(f"ERROR during semantic search: {str(e)}")
             raise HTTPException(status_code=500, detail=f"Semantic search error: {str(e)}")
 
-    # Strategy 2: Keyword search (also search for speaker name in text)
+    # Strategy 2: ELASTIC Keyword search with fuzzy matching
     search_words = list(words) if words else []
     
     # Add query words to keyword search for elastic name matching
@@ -532,13 +778,19 @@ async def search(data: dict):
         query_words = query_text.strip().split()
         search_words.extend(query_words)
     
-    if speaker_search_in_text: 
+    if speaker_search_in_text:
         # Add speaker name words to keyword search
         search_words.extend(speaker_search_in_text.split())
     
+    # Expand search words with variations for better recall
+    expanded_words = []
+    for word in search_words:
+        expanded_words.extend(expand_query_variations(word))
+    search_words = list(set(expanded_words))
+    
     if search_words:
         try:
-            print(f"Keyword search for words: {search_words} (max_scanned={max_scanned})", flush=True)
+            logger.info(f"Elastic keyword search for: {search_words[:10]} (max_scanned={max_scanned})")
             words_lower = [w.lower() for w in search_words]
             page_size = 1000
             scanned = 0
@@ -547,7 +799,7 @@ async def search(data: dict):
             scroll_filter = search_filter
 
             while scanned < max_scanned and len(keyword_results) < top_k * 2:
-                points, next_offset = qdrant_client. scroll(
+                points, next_offset = qdrant_client.scroll(
                     collection_name=SEGMENTS_COLLECTION,
                     scroll_filter=scroll_filter,
                     limit=min(page_size, max_scanned - scanned),
@@ -561,38 +813,58 @@ async def search(data: dict):
 
                 for p in points:
                     scanned += 1
-                    text = (p.payload.get("text") or "").lower()
-                    speaker_field = (p.payload.get("speaker") or "").lower()
-                    combined_text = f"{text} {speaker_field}"
+                    payload = p.payload or {}
+                    text = (payload.get("text") or "").lower()
+                    speaker_field = (payload.get("speaker") or "")
+                    video_title = payload.get("video_title", "")
+                    combined_text = f"{text} {speaker_field.lower()}"
                     
-                    # Check if ANY word matches in text OR speaker field (OR logic for names)
-                    # This enables elastic search for names
-                    if any(w in combined_text for w in words_lower):
-                        # Client-side fuzzy title filter (partial/elastic matching)
-                        if title_filter and title_filter.lower() not in p.payload.get("video_title", "").lower():
+                    # ELASTIC: Check exact match OR fuzzy match for each word
+                    word_matched = False
+                    fuzzy_score = 0
+                    for w in words_lower:
+                        # Exact substring match
+                        if w in combined_text:
+                            word_matched = True
+                            fuzzy_score = 1.0
+                            break
+                        # Fuzzy match with typo tolerance
+                        if len(w) >= 3 and fuzzy_match_text(w, combined_text, threshold=70):
+                            word_matched = True
+                            fuzzy_score = fuzz.partial_ratio(w, combined_text) / 100
+                            break
+                    
+                    if not word_matched:
+                        continue
+                    
+                    # ELASTIC title filter with fuzzy matching
+                    if title_filter:
+                        if not fuzzy_match_text(title_filter, video_title, threshold=60):
                             continue
-                        
-                        # Client-side fuzzy speaker filter (partial/elastic matching)
-                        if speaker_filter and speaker_filter.lower() not in p.payload.get("speaker", "").lower():
+                    
+                    # ELASTIC speaker filter with fuzzy matching
+                    if speaker_filter:
+                        if not fuzzy_match_speaker(speaker_filter, speaker_field, threshold=70):
                             continue
-                        
-                        keyword_results.append({
-                            "id": p.id,
-                            "score": 1.0,
-                            "video_id": p.payload.get("video_id"),
-                            "video_title":  p.payload.get("video_title", ""),
-                            "speaker": p. payload.get("speaker", ""),
-                            "diarization_speaker": p. payload.get("diarization_speaker", ""),
-                            "start_time":  p.payload.get("start_time", 0),
-                            "end_time": p.payload. get("end_time", 0),
-                            "duration":  round((p.payload.get("end_time", 0) - p.payload. get("start_time", 0)), 2),
-                            "text": p. payload.get("text", ""),
-                            "text_length": p.payload. get("text_length", 0),
-                            "youtube_url": p.payload.get("youtube_url", ""),
-                            "language":  p.payload.get("language", ""),
-                            "created_at": p. payload.get("created_at"),
-                            "match_types": ["keyword"]
-                        })
+                    
+                    keyword_results.append({
+                        "id": p.id,
+                        "score": 0.9 + (fuzzy_score * 0.1),  # Score based on match quality
+                        "video_id": payload.get("video_id"),
+                        "video_title": video_title,
+                        "speaker": speaker_field,
+                        "diarization_speaker": payload.get("diarization_speaker", ""),
+                        "start_time": payload.get("start_time", 0),
+                        "end_time": payload.get("end_time", 0),
+                        "duration": round((payload.get("end_time", 0) - payload.get("start_time", 0)), 2),
+                        "text": payload.get("text", ""),
+                        "text_length": payload.get("text_length", 0),
+                        "youtube_url": payload.get("youtube_url", ""),
+                        "language": payload.get("language", ""),
+                        "created_at": payload.get("created_at"),
+                        "match_types": ["keyword"],
+                        "fuzzy_score": round(fuzzy_score, 2)
+                    })
 
                 if len(keyword_results) >= top_k * 2:
                     break
@@ -601,8 +873,8 @@ async def search(data: dict):
                 if not next_offset:
                     break
 
-        except Exception as e: 
-            print(f"ERROR during keyword search: {str(e)}", flush=True)
+        except Exception as e:
+            logger.info(f"ERROR during keyword search: {str(e)}")
             raise HTTPException(status_code=500, detail=f"Keyword search error: {str(e)}")
 
     # Merge results
@@ -665,7 +937,7 @@ async def search(data: dict):
     }
     
 @app.post("/search-by-title")
-async def search_by_title(data: dict):
+async def search_by_title(data: TitleSearchRequest, authorized: bool = Depends(verify_api_key)):
     """
     Search for videos by title (returns unique videos, not segments).
     
@@ -673,17 +945,13 @@ async def search_by_title(data: dict):
       - title: partial or full video title
       - limit: max number of videos to return
     """
-    title = data.get("title", "")
-    limit = int(data.get("limit", 10))
-    
-    if not title:
-        raise HTTPException(status_code=400, detail="title is required")
+    title = data.title
+    limit = data.limit
     
     try:
-        print(f"Searching videos by title: '{title}'", flush=True)
+        logger.info(f"Elastic title search for: '{title}'")
         
-        # Scroll through collection to find matching titles
-        title_lower = title.lower()
+        # Scroll through collection to find matching titles with FUZZY matching
         videos = {}
         offset = None
         scanned = 0
@@ -703,15 +971,19 @@ async def search_by_title(data: dict):
             
             for p in points:
                 scanned += 1
-                video_title = p.payload.get("video_title", "")
-                video_id = p.payload.get("video_id")
+                payload = p.payload or {}
+                video_title = payload.get("video_title", "")
+                video_id = payload.get("video_id")
                 
-                if title_lower in video_title.lower() and video_id not in videos:
+                # ELASTIC: Fuzzy title matching with typo tolerance
+                if video_id not in videos and fuzzy_match_text(title, video_title, threshold=60):
+                    match_score = fuzz.partial_ratio(title.lower(), video_title.lower())
                     videos[video_id] = {
                         "video_id": video_id,
                         "video_title": video_title,
-                        "youtube_url": p.payload.get("youtube_url", ""),
-                        "language": p.payload.get("language", "")
+                        "youtube_url": payload.get("youtube_url", ""),
+                        "language": payload.get("language", ""),
+                        "match_score": match_score
                     }
                 
                 if len(videos) >= limit:
@@ -721,15 +993,18 @@ async def search_by_title(data: dict):
             if not next_offset:
                 break
         
+        # Sort by match score
+        sorted_videos = sorted(videos.values(), key=lambda x: x.get("match_score", 0), reverse=True)
+        
         return {
             "title_query": title,
             "total_videos_found": len(videos),
             "scanned_segments": scanned,
-            "videos": list(videos.values())[:limit]
+            "videos": sorted_videos[:limit]
         }
         
     except Exception as e:
-        print(f"ERROR in search_by_title: {str(e)}", flush=True)
+        logger.info(f"ERROR in search_by_title: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/search-multi-video")
@@ -745,7 +1020,7 @@ async def search_multi_video(data: dict):
     if not video_ids:
         raise HTTPException(status_code=400, detail="video_ids list is required")
     
-    print(f"Searching across {len(video_ids)} videos for: '{query_text[: 100]}'", flush=True)
+    logger.info(f"Searching across {len(video_ids)} videos for: '{query_text[: 100]}'")
     
     query_vector = model.encode(query_text).tolist()
     
@@ -797,7 +1072,7 @@ async def search_multi_video(data: dict):
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/video/{video_id}/segments")
-async def get_video_segments(video_id: int, limit: int = 100, offset: int = 0):
+async def get_video_segments(video_id: int, limit: int = 100, offset: int = 0, authorized: bool = Depends(verify_api_key)):
     try:
         scroll_result = qdrant_client.scroll(
             collection_name=SEGMENTS_COLLECTION,
@@ -822,13 +1097,13 @@ async def get_video_segments(video_id: int, limit: int = 100, offset: int = 0):
             "next_offset": next_offset,
             "segments": [
                 {
-                    "segment_index": p.payload.get("segment_index"),
-                    "speaker": p.payload.get("speaker"),
-                    "start_time":  p.payload.get("start_time"),
-                    "end_time": p.payload.get("end_time"),
-                    "duration": p.payload.get("duration"),
-                    "text": p.payload.get("text"),
-                    "text_length": p.payload.get("text_length"),
+                    "segment_index": (p.payload or {}).get("segment_index"),
+                    "speaker": (p.payload or {}).get("speaker"),
+                    "start_time": (p.payload or {}).get("start_time"),
+                    "end_time": (p.payload or {}).get("end_time"),
+                    "duration": (p.payload or {}).get("duration"),
+                    "text": (p.payload or {}).get("text"),
+                    "text_length": (p.payload or {}).get("text_length"),
                 }
                 for p in points
             ]
@@ -836,15 +1111,95 @@ async def get_video_segments(video_id: int, limit: int = 100, offset: int = 0):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.post("/suggest")
+async def suggest(data: SuggestRequest, authorized: bool = Depends(verify_api_key)):
+    """
+    ELASTIC autocomplete/suggestion endpoint.
+    Returns fuzzy-matched suggestions for speakers and titles.
+    
+    Params:
+      - query: partial text to autocomplete
+      - type: "speaker" or "title" (default: both)
+      - limit: max suggestions (default: 10)
+    """
+    query = data.query.strip()
+    suggest_type = data.type
+    limit = data.limit
+    
+    try:
+        logger.info(f"Generating suggestions for: '{query}' (type={suggest_type})")
+        
+        speakers = {}
+        titles = {}
+        offset = None
+        scanned = 0
+        max_scan = 20000
+        
+        while scanned < max_scan and (len(speakers) < limit or len(titles) < limit):
+            points, next_offset = qdrant_client.scroll(
+                collection_name=SEGMENTS_COLLECTION,
+                limit=1000,
+                offset=offset,
+                with_payload=["speaker", "video_title", "video_id"],
+                with_vectors=False
+            )
+            
+            if not points:
+                break
+            
+            for p in points:
+                scanned += 1
+                payload = p.payload or {}
+                
+                # Collect speaker suggestions
+                if suggest_type in ["speaker", "both"]:
+                    speaker = payload.get("speaker", "")
+                    if speaker and speaker not in speakers:
+                        if fuzzy_match_speaker(query, speaker, threshold=60):
+                            score = fuzz.ratio(query.lower(), speaker.lower())
+                            speakers[speaker] = score
+                
+                # Collect title suggestions
+                if suggest_type in ["title", "both"]:
+                    title = payload.get("video_title", "")
+                    video_id = payload.get("video_id")
+                    if title and video_id not in titles:
+                        if fuzzy_match_text(query, title, threshold=50):
+                            score = fuzz.partial_ratio(query.lower(), title.lower())
+                            titles[video_id] = {"title": title, "video_id": video_id, "score": score}
+            
+            offset = next_offset
+            if not next_offset:
+                break
+        
+        # Sort by score and limit results
+        sorted_speakers = sorted(speakers.items(), key=lambda x: x[1], reverse=True)[:limit]
+        sorted_titles = sorted(titles.values(), key=lambda x: x["score"], reverse=True)[:limit]
+        
+        return {
+            "query": query,
+            "type": suggest_type,
+            "speakers": [{"name": s[0], "score": s[1]} for s in sorted_speakers] if suggest_type in ["speaker", "both"] else [],
+            "titles": [{"video_id": t["video_id"], "title": t["title"], "score": t["score"]} for t in sorted_titles] if suggest_type in ["title", "both"] else [],
+            "scanned": scanned
+        }
+        
+    except Exception as e:
+        logger.info(f"ERROR in suggest: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.delete("/video/{video_id}/embeddings")
-async def delete_video_embeddings(video_id:  int):
+async def delete_video_embeddings(video_id: int, authorized: bool = Depends(verify_api_key)):
+    """Delete all embeddings for a video. Requires API key."""
     try:
         delete_existing_embeddings(video_id)
+        logger.info(f"Deleted embeddings for video {video_id}")
         return {
             "success": True,
-            "message":  f"Deleted all embeddings for video {video_id}"
+            "message": f"Deleted all embeddings for video {video_id}"
         }
     except Exception as e:
+        logger.error(f"Error deleting embeddings: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/health")
@@ -875,13 +1230,13 @@ async def stats():
         return {
             "collection":  SEGMENTS_COLLECTION,
             "points_count": collection_info.points_count,
-            "vectors_count": collection_info. vectors_count,
+            "vectors_count": collection_info.vectors_count,
             "indexed_vectors_count": collection_info.indexed_vectors_count,
             "status": collection_info.status,
             "optimizer_status": collection_info.optimizer_status,
             "config": {
                 "vector_size": collection_info.config.params.vectors.size,
-                "distance": collection_info.config.params.vectors.distance. name
+                "distance": collection_info.config.params.vectors.distance.name
             }
         }
     except Exception as e:
@@ -890,42 +1245,48 @@ async def stats():
 @app.get("/")
 async def root():
     return {
-        "service":  "Video Transcript Semantic Search API",
-        "version":  "3.0",
+        "service": "Video Transcript Elastic Search API",
+        "version": "4.0",
+        "features": "Fuzzy/Typo-tolerant search with rapidfuzz",
         "endpoints": {
             "POST /embed-video": "Embed entire video transcript",
-            "POST /search": "Enhanced semantic + keyword + title search",
-            "POST /search-by-title": "Search videos by title",
+            "POST /search": "ELASTIC semantic + keyword + fuzzy search",
+            "POST /search-by-title": "Fuzzy search videos by title",
             "POST /search-multi-video": "Search across multiple specific videos",
+            "POST /suggest": "Autocomplete suggestions for speakers/titles",
             "GET /video/{video_id}/segments": "Get all segments for a video",
             "DELETE /video/{video_id}/embeddings": "Delete all embeddings for a video",
             "GET /health": "Health check",
             "GET /stats": "Collection statistics"
         },
-        "search_features": [
-            "Semantic search using embeddings",
-            "Multi-keyword search (AND/OR logic)",
-            "Fuzzy/elastic title search (partial, case-insensitive)",
-            "Fuzzy/elastic speaker filtering (partial, case-insensitive)",
+        "elastic_search_features": [
+            "Semantic search using embeddings (cached for performance)",
+            "Fuzzy/typo-tolerant matching (e.g., 'Muhamad' matches 'Muhammad')",
+            "N-gram based partial matching",
+            "Speaker name autocomplete with fuzzy matching",
+            "Title search with typo tolerance",
+            "Combined scoring: semantic + keyword + fuzzy",
+            "Query caching for repeated searches",
+            "Multi-keyword search with OR logic",
             "Time range filtering",
-            "Query parsing (e.g., 'speaker:John title:intro AI')",
-            "Combined search strategies",
-            "Score boosting for keyword matches"
+            "Query parsing (e.g., 'speaker:John title:intro AI')"
         ],
         "example_queries": {
             "semantic": {"query": "machine learning algorithms"},
-            "keyword": {"words": ["neural", "network"], "query": "AI"},
-            "speaker": {"query": "AI", "speaker": "John"},
-            "title": {"query": "python", "title": "introduction"},
+            "fuzzy_speaker": {"query": "AI", "speaker": "Muhamad"},
+            "fuzzy_title": {"query": "python", "title": "introducion"},
+            "keyword_fuzzy": {"words": ["nueral", "netwerk"], "query": "AI"},
+            "autocomplete": {"endpoint": "/suggest", "body": {"query": "joh", "type": "speaker"}},
             "parsed": {"query": "speaker:John title:intro machine learning"},
             "multi_video": {"query": "AI", "video_ids": [1, 2, 3]}
         }
     }
 
-if __name__ == "__main__": 
+if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", 9000))
-    print(f"Starting FastAPI Video Embedding Service on port {port}.. .", flush=True)
-    print(f"Qdrant URL: {QDRANT_URL}", flush=True)
-    print(f"Collections: {SEGMENTS_COLLECTION}, {LEGACY_COLLECTION}", flush=True)
+    logger.info(f"Starting FastAPI Video Elastic Search Service on port {port}...")
+    logger.info(f"Qdrant URL: {QDRANT_URL}")
+    logger.info(f"Collections: {SEGMENTS_COLLECTION}, {LEGACY_COLLECTION}")
+    logger.info("Features: Fuzzy search, typo tolerance, query caching")
     uvicorn.run(app, host="0.0.0.0", port=port)
