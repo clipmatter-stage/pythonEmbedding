@@ -7,7 +7,7 @@ from qdrant_client.models import (
     Distance, VectorParams, PointStruct, Filter, FieldCondition, 
     MatchValue, MatchText, SearchParams, HnswConfigDiff, 
     OptimizersConfigDiff, QuantizationConfig, ScalarQuantization,
-    ScalarType, QuantizationSearchParams
+    ScalarQuantizationConfig, ScalarType, QuantizationSearchParams
 )
 import uuid
 import os
@@ -72,9 +72,11 @@ OPTIMIZERS_CONFIG = OptimizersConfigDiff(
 
 # Quantization Config (reduces memory by ~4x, slight accuracy loss)
 QUANTIZATION_CONFIG = ScalarQuantization(
-    scalar=ScalarType.INT8,  # 8-bit quantization
-    quantile=0.99,  # Use 99th percentile for quantization ranges
-    always_ram=True  # Keep quantized vectors in RAM for speed
+    scalar=ScalarQuantizationConfig(
+        type=ScalarType.INT8,  # 8-bit quantization
+        quantile=0.99,  # Use 99th percentile for quantization ranges
+        always_ram=True  # Keep quantized vectors in RAM for speed
+    )
 )
 
 # ============== PYDANTIC MODELS FOR INPUT VALIDATION ==============
