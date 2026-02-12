@@ -82,7 +82,7 @@ QUANTIZATION_CONFIG = ScalarQuantization(
 # ============== PYDANTIC MODELS FOR INPUT VALIDATION ==============
 class EmbedVideoRequest(BaseModel):
     video_id: int = Field(..., gt=0, description="Video ID must be positive")
-    identification_segments: List[dict] = Field(..., min_items=1)
+    identification_segments: List[dict] = Field(..., min_length=1)
     video_title: str = Field(default="", max_length=500)
     video_filename: str = Field(default="", max_length=500)
     youtube_url: str = Field(default="", max_length=1000)
