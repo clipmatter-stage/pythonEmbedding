@@ -826,42 +826,62 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                     diarization_speaker = (payload.get("diarization_speaker") or "")
                     video_filename = (payload.get("video_filename") or "")
                     
-                    # Combine ALL searchable payload fields for comprehensive search
-                    combined_text = f"{text} {speaker_field.lower()} {video_title.lower()} {diarization_speaker.lower()} {video_filename.lower()}"
-                    
-                    # ELASTIC: Check exact match OR fuzzy match for each word
-                    word_matched = False
-                    fuzzy_score = 0
+                    # Track matched words and their scores
+                    matched_words_count = 0
+                    best_fuzzy_score = 0
                     matched_field = ""
+                    field_weights = {
+                        "video_title": 2.5,      # Highest priority: title matches
+                        "speaker": 1.8,          # High priority: speaker matches  
+                        "diarization_speaker": 1.8,
+                        "text": 1.0,             # Normal priority: text content
+                        "video_filename": 0.8    # Lower priority: filename
+                    }
+                    best_field_weight = 0
                     
+                    # ELASTIC: Check each word and count matches across all fields
                     for w in words_lower:
+                        word_found = False
+                        
                         # Check each field individually to track which field matched
                         fields_to_check = [
-                            ("text", text),
-                            ("speaker", speaker_field.lower()),
                             ("video_title", video_title.lower()),
+                            ("speaker", speaker_field.lower()),
                             ("diarization_speaker", diarization_speaker.lower()),
+                            ("text", text),
                             ("video_filename", video_filename.lower())
                         ]
                         
                         for field_name, field_value in fields_to_check:
+                            field_match_score = 0
+                            
                             # Exact substring match
                             if w in field_value:
-                                word_matched = True
-                                fuzzy_score = 1.0
-                                matched_field = field_name
-                                break
+                                field_match_score = 1.0
                             # Fuzzy match with typo tolerance
-                            if len(w) >= 3 and fuzzy_match_text(w, field_value, threshold=70):
-                                word_matched = True
-                                fuzzy_score = fuzz.partial_ratio(w, field_value) / 100
-                                matched_field = field_name
-                                break
+                            elif len(w) >= 3 and fuzzy_match_text(w, field_value, threshold=70):
+                                field_match_score = fuzz.partial_ratio(w, field_value) / 100
+                            
+                            if field_match_score > 0:
+                                word_found = True
+                                matched_words_count += 1
+                                
+                                # Track best matching field and score
+                                field_weight = field_weights.get(field_name, 1.0)
+                                weighted_score = field_match_score * field_weight
+                                
+                                if weighted_score > best_fuzzy_score:
+                                    best_fuzzy_score = weighted_score
+                                    matched_field = field_name
+                                    best_field_weight = field_weight
+                                
+                                break  # Found match for this word, move to next word
                         
-                        if word_matched:
-                            break
+                        if word_found:
+                            # Don't break - count ALL matched words
+                            pass
                     
-                    if not word_matched:
+                    if matched_words_count == 0:
                         continue
                     
                     # ELASTIC title filter with fuzzy matching
@@ -875,9 +895,27 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                         if not fuzzy_match_speaker(speaker_filter, speaker_check, threshold=70):
                             continue
                     
+                    # Calculate intelligent score based on:
+                    # 1. Field weight (title > speaker > text)
+                    # 2. Match quality (exact vs fuzzy)
+                    # 3. Number of words matched
+                    # 4. Proportion of search query matched
+                    
+                    word_coverage_bonus = min(matched_words_count / max(len(words_lower), 1), 1.0)
+                    base_keyword_score = 0.5  # Lower base for keywords
+                    
+                    # Score = base + (match_quality * field_weight * word_coverage)
+                    final_score = base_keyword_score + (
+                        (best_fuzzy_score / max(best_field_weight, 1.0)) * 0.3 * (1 + word_coverage_bonus)
+                    )
+                    
+                    # Boost for multi-word title matches (very strong signal)
+                    if matched_field == "video_title" and matched_words_count >= 3:
+                        final_score = min(final_score + 0.4, 1.0)
+                    
                     keyword_results.append({
                         "id": p.id,
-                        "score": 0.9 + (fuzzy_score * 0.1),  # Score based on match quality
+                        "score": min(final_score, 1.0),
                         "video_id": payload.get("video_id"),
                         "video_title": video_title,
                         "speaker": speaker_field,
@@ -891,8 +929,10 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                         "language": payload.get("language", ""),
                         "created_at": payload.get("created_at"),
                         "match_types": ["keyword", f"matched_in_{matched_field}"],
-                        "fuzzy_score": round(fuzzy_score, 2),
-                        "matched_field": matched_field
+                        "fuzzy_score": round(best_fuzzy_score / max(best_field_weight, 1.0), 2),
+                        "matched_field": matched_field,
+                        "matched_words_count": matched_words_count,
+                        "field_weight": best_field_weight
                     })
 
                 if len(keyword_results) >= top_k * 2:
@@ -906,27 +946,55 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
             logger.info(f"ERROR during keyword search: {str(e)}")
             raise HTTPException(status_code=500, detail=f"Keyword search error: {str(e)}")
 
-    # Merge results
+    # Merge results - combine semantic and keyword matches
     merged = {}
     
-    for r in semantic_results: 
+    for r in semantic_results:
         merged[r["id"]] = r
 
     for r in keyword_results:
         if r["id"] in merged:
-            if "keyword" not in merged[r["id"]]["match_types"]: 
+            # Already have semantic match - boost score if also keyword match
+            if "keyword" not in merged[r["id"]]["match_types"]:
                 merged[r["id"]]["match_types"].append("keyword")
-            merged[r["id"]]["score"] = max(merged[r["id"]]["score"], 0.95)
+            # Take the better score between semantic and keyword
+            merged[r["id"]]["score"] = max(merged[r["id"]]["score"], r["score"])
         else:
             merged[r["id"]] = r
 
+    # Sort by score, then by start time for stability
     merged_list = sorted(
-        merged. values(),
-        key=lambda x: (x. get("score", 0), -x.get("start_time", 0)),
+        merged.values(),
+        key=lambda x: (x.get("score", 0), -x.get("start_time", 0)),
         reverse=True
-    )[:top_k]
+    )
     
-    logger.info(f"Search completed: {len(semantic_results)} semantic + {len(keyword_results)} keyword = {len(merged_list)} merged results")
+    # Group by video and take top segments per video to diversify results
+    videos_seen = {}
+    final_results = []
+    
+    for result in merged_list:
+        video_id = result.get("video_id")
+        if video_id not in videos_seen:
+            videos_seen[video_id] = []
+        
+        # Keep top 3 segments per video
+        if len(videos_seen[video_id]) < 3:
+            videos_seen[video_id].append(result)
+            final_results.append(result)
+        
+        if len(final_results) >= top_k:
+            break
+    
+    # If we don't have enough results, add more from videos we've already seen
+    if len(final_results) < top_k:
+        for result in merged_list:
+            if result not in final_results:
+                final_results.append(result)
+                if len(final_results) >= top_k:
+                    break
+    
+    logger.info(f"Search completed: {len(semantic_results)} semantic + {len(keyword_results)} keyword = {len(final_results)} merged results from {len(videos_seen)} videos")
 
     return {
         "query": query_text,
@@ -935,7 +1003,8 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
         "collection":  SEGMENTS_COLLECTION,
         "total_semantic_hits": len(semantic_results),
         "total_keyword_hits": len(keyword_results),
-        "returned":  len(merged_list),
+        "returned":  len(final_results),
+        "unique_videos": len(videos_seen),
         "filters_applied": {
             "video_id": video_id_filter,
             "speaker": speaker_filter,
@@ -964,7 +1033,7 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                 "created_at": r.get("created_at"),
                 "youtube_url_timestamped": f"{r. get('youtube_url', '')}?t={int(r.get('start_time', 0))}" if r.get('youtube_url') else ""
             }
-            for r in merged_list
+            for r in final_results
         ]
     }
     
