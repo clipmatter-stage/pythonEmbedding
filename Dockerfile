@@ -27,14 +27,11 @@ RUN chmod +x start.sh
 RUN useradd -m -u 1000 appuser && chown -R appuser:appuser /app
 USER appuser
 
-# Expose port (Railway will override with $PORT)
-EXPOSE 8000
+# Expose port (Railway will provide PORT environment variable)
+EXPOSE 9000
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD python -c "import requests; requests.get('http://localhost:8000/health', timeout=5)"
+# Health check removed - Railway has built-in health monitoring
 
 # Start command - Railway will inject environment variables at runtime
-# DO NOT use ENV or ARG for secrets - they will be provided by Railway at runtime
-# Use startup script to properly handle PORT variable
-CMD ["./start.sh"]
+# Python script will read PORT from environment and default to 9000
+CMD ["python", "embeddings_test.py"]
