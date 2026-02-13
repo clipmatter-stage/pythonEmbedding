@@ -1,1 +1,1 @@
-web: bash start.sh
+web: python embeddings_test.py
