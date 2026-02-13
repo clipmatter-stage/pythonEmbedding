@@ -18,6 +18,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application code
 COPY embeddings_test.py .
+COPY start.sh .
+
+# Make startup script executable
+RUN chmod +x start.sh
 
 # Create non-root user for security
 RUN useradd -m -u 1000 appuser && chown -R appuser:appuser /app
@@ -32,4 +36,5 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
 
 # Start command - Railway will inject environment variables at runtime
 # DO NOT use ENV or ARG for secrets - they will be provided by Railway at runtime
-CMD uvicorn embeddings_test:app --host 0.0.0.0 --port ${PORT:-8000}
+# Use startup script to properly handle PORT variable
+CMD ["./start.sh"]
