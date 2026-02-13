@@ -3,12 +3,7 @@ from fastapi.security import APIKeyHeader
 from fastapi.middleware.cors import CORSMiddleware
 from sentence_transformers import SentenceTransformer
 from qdrant_client import models, QdrantClient
-from qdrant_client.models import (
-    Distance, VectorParams, PointStruct, Filter, FieldCondition, 
-    MatchValue, MatchText, SearchParams, HnswConfigDiff, 
-    OptimizersConfigDiff, QuantizationConfig, ScalarQuantization,
-    ScalarQuantizationConfig, ScalarType, QuantizationSearchParams
-)
+from qdrant_client.models import Distance, VectorParams, PointStruct, Filter, FieldCondition, MatchValue, MatchText, SearchParams
 import uuid
 import os
 import logging
@@ -45,44 +40,10 @@ if not QDRANT_URL or not QDRANT_API_KEY:
 RATE_LIMIT_REQUESTS = int(os.getenv("RATE_LIMIT_REQUESTS", "100"))
 RATE_LIMIT_WINDOW = int(os.getenv("RATE_LIMIT_WINDOW", "60"))
 
-# Qdrant Search Configuration
-QDRANT_SEARCH_PARAMS = SearchParams(
-    hnsw_ef=128,  # Higher = more accurate but slower (default: 64)
-    exact=False,  # Use HNSW index for speed (set True for 100% accuracy)
-    quantization=QuantizationSearchParams(
-        ignore=False,  # Use quantization for faster search
-        rescore=True,  # Rescore top results with full vectors for accuracy
-        oversampling=2.0  # Fetch 2x results before rescoring
-    )
-)
-
-# Qdrant Collection Configuration
-HNSW_CONFIG = HnswConfigDiff(
-    m=16,  # Number of edges per node (higher = better recall, more memory)
-    ef_construct=100,  # Build-time accuracy (higher = better index quality)
-    full_scan_threshold=10000,  # Use full scan for small collections
-    max_indexing_threads=0  # Auto-detect CPU cores
-)
-
-OPTIMIZERS_CONFIG = OptimizersConfigDiff(
-    indexing_threshold=20000,  # Start indexing after 20k points
-    memmap_threshold=50000,  # Use memory mapping for large collections
-    max_optimization_threads=0  # Auto-detect CPU cores
-)
-
-# Quantization Config (reduces memory by ~4x, slight accuracy loss)
-QUANTIZATION_CONFIG = ScalarQuantization(
-    scalar=ScalarQuantizationConfig(
-        type=ScalarType.INT8,  # 8-bit quantization
-        quantile=0.99,  # Use 99th percentile for quantization ranges
-        always_ram=True  # Keep quantized vectors in RAM for speed
-    )
-)
-
 # ============== PYDANTIC MODELS FOR INPUT VALIDATION ==============
 class EmbedVideoRequest(BaseModel):
     video_id: int = Field(..., gt=0, description="Video ID must be positive")
-    identification_segments: List[dict] = Field(..., min_length=1)
+    identification_segments: List[dict] = Field(..., min_items=1)
     video_title: str = Field(default="", max_length=500)
     video_filename: str = Field(default="", max_length=500)
     youtube_url: str = Field(default="", max_length=1000)
@@ -100,10 +61,6 @@ class SearchRequest(BaseModel):
     min_score: float = Field(default=0.3, ge=0.0, le=1.0)
     time_range: Optional[dict] = None
     max_scanned: int = Field(default=10000, ge=100, le=100000)
-    exact_search: bool = Field(default=False, description="Use exact search (slower but 100% accurate)")
-    hnsw_ef: Optional[int] = Field(default=None, ge=64, le=512, description="HNSW search accuracy (higher=slower+accurate)")
-    min_term_coverage: float = Field(default=0.5, ge=0.0, le=1.0, description="Minimum % of query terms that must appear (0.5 = 50%)")
-    strict_mode: bool = Field(default=False, description="Require ALL query terms to be present")
 
 class SuggestRequest(BaseModel):
     query: str = Field(..., min_length=2, max_length=200)
@@ -164,8 +121,7 @@ async def verify_api_key(request: Request, api_key: str = Security(api_key_heade
 async def lifespan(app: FastAPI):
     """Startup and shutdown events."""
     logger.info("Starting up Video Transcript Search API...")
-    if QDRANT_URL:
-        logger.info(f"Qdrant URL: {QDRANT_URL[:50]}...")
+    logger.info(f"Qdrant URL: {QDRANT_URL[:50]}...")
     yield
     logger.info("Shutting down...")
 
@@ -205,11 +161,10 @@ def get_cached_embedding(text: str) -> List[float]:
         embedding_cache[cache_key] = model.encode(text, show_progress_bar=False).tolist()
     return embedding_cache[cache_key]
 
-def fuzzy_match_text(query: str, text: str, threshold: int = 75) -> bool:
+def fuzzy_match_text(query: str, text: str, threshold: int = 65) -> bool:
     """
     Fuzzy match with typo tolerance using rapidfuzz.
     Returns True if query fuzzy-matches text above threshold.
-    NOTE: Increased threshold from 65 to 75 to reduce false positives.
     """
     if not query or not text:
         return False
@@ -220,14 +175,13 @@ def fuzzy_match_text(query: str, text: str, threshold: int = 75) -> bool:
     if query_lower in text_lower:
         return True
     
-    # Fuzzy partial match (handles typos) - stricter threshold
+    # Fuzzy partial match (handles typos)
     return fuzz.partial_ratio(query_lower, text_lower) >= threshold
 
-def fuzzy_match_speaker(query: str, speaker: str, threshold: int = 80) -> bool:
+def fuzzy_match_speaker(query: str, speaker: str, threshold: int = 75) -> bool:
     """
     Fuzzy match for speaker names with higher threshold.
     Handles variations like 'John' vs 'Jon', 'Muhammad' vs 'Mohammad'.
-    NOTE: Increased threshold from 75 to 80 to reduce false positives.
     """
     if not query or not speaker:
         return False
@@ -266,11 +220,10 @@ def ngram_similarity(query: str, text: str, n: int = 3) -> float:
     intersection = query_ngrams & text_ngrams
     return len(intersection) / len(query_ngrams)
 
-def expand_query_variations(query: str, max_variations: int = 5) -> List[str]:
+def expand_query_variations(query: str) -> List[str]:
     """
     Generate query variations for better recall.
     Handles common typos and variations.
-    NOTE: Limited to prevent over-matching unrelated content.
     """
     variations = [query]
     query_lower = query.lower().strip()
@@ -278,59 +231,24 @@ def expand_query_variations(query: str, max_variations: int = 5) -> List[str]:
     if query_lower not in [v.lower() for v in variations]:
         variations.append(query_lower)
     
-    # Only add individual words if they are significant (>3 chars)
-    words = [w for w in query.split() if len(w) > 3]
+    # Add individual words for multi-word queries
+    words = query.split()
     if len(words) > 1:
-        variations.extend(words[:max_variations - len(variations)])
+        variations.extend(words)
     
-    return list(set(variations))[:max_variations]
+    return list(set(variations))
 
-def calculate_query_term_coverage(query: str, text: str) -> float:
+def calculate_combined_score(semantic_score: float, keyword_match: bool, fuzzy_score: float = 0) -> float:
     """
-    Calculate what percentage of query terms appear in the text.
-    Returns value 0.0-1.0 indicating coverage.
-    Prevents results that don't actually contain query terms.
+    Calculate combined relevance score.
+    Weights: semantic=0.6, keyword=0.25, fuzzy=0.15
     """
-    if not query or not text:
-        return 0.0
-    
-    query_terms = set(query.lower().split())
-    text_lower = text.lower()
-    
-    # Filter out very short terms (stop words like 'a', 'is', 'the')
-    significant_terms = {term for term in query_terms if len(term) > 2}
-    
-    if not significant_terms:
-        return 1.0  # No significant terms to check
-    
-    matched_terms = sum(1 for term in significant_terms if term in text_lower)
-    return matched_terms / len(significant_terms)
-
-def calculate_combined_score(
-    semantic_score: float = 0.0,
-    keyword_match: bool = False, 
-    fuzzy_score: float = 0.0,
-    exact_match: bool = False,
-    term_coverage: float = 0.0
-) -> Dict[str, float]:
-    """
-    Calculate combined relevance score with transparency.
-    Weights: semantic=0.45, keyword=0.25, fuzzy=0.12, exact_bonus=0.05, coverage=0.13
-    Returns dict with breakdown for transparency.
-    NOTE: Added term_coverage to ensure query terms are present.
-    """
-    score_breakdown = {
-        "semantic": semantic_score * 0.45,
-        "keyword": 0.25 if keyword_match else 0.0,
-        "fuzzy": fuzzy_score * 0.12,
-        "exact_bonus": 0.05 if exact_match else 0.0,
-        "term_coverage": term_coverage * 0.13  # Penalize missing query terms
-    }
-    
-    total_score = sum(score_breakdown.values())
-    score_breakdown["total"] = min(total_score, 1.0)  # Cap at 1.0
-    
-    return score_breakdown
+    base_score = semantic_score * 0.6
+    if keyword_match:
+        base_score += 0.25
+    if fuzzy_score > 0:
+        base_score += fuzzy_score * 0.15
+    return min(base_score, 1.0)  # Cap at 1.0
 
 # ============== END ELASTIC SEARCH HELPERS ==============
 
@@ -347,20 +265,12 @@ def create_segments_collection():
         collection_names = [c.name for c in collections]
         
         if SEGMENTS_COLLECTION not in collection_names:
-            logger.info(f"Creating collection '{SEGMENTS_COLLECTION}' with optimized configuration...")
+            logger.info(f"Creating collection '{SEGMENTS_COLLECTION}'...")
             qdrant_client.create_collection(
                 collection_name=SEGMENTS_COLLECTION,
-                vectors_config=VectorParams(
-                    size=384, 
-                    distance=Distance.COSINE,
-                    hnsw_config=HNSW_CONFIG,
-                    quantization_config=QUANTIZATION_CONFIG
-                ),
-                optimizers_config=OPTIMIZERS_CONFIG
+                vectors_config=VectorParams(size=384, distance=Distance.COSINE),
+                optimizers_config=models.OptimizersConfigDiff(indexing_threshold=1000)
             )
-            logger.info("  ✓ HNSW index configured (m=16, ef_construct=100)")
-            logger.info("  ✓ Quantization enabled (INT8, ~4x memory reduction)")
-            logger.info("  ✓ Optimizers configured (threshold=20k, auto-threads)")
             # Create indexes for better performance
             qdrant_client. create_payload_index(
                 collection_name=SEGMENTS_COLLECTION,
@@ -794,38 +704,16 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
             
             # Use cached embedding for repeated queries
             query_vector = get_cached_embedding(query_text)
-            
-            # Build custom search params if user overrides
-            search_params = QDRANT_SEARCH_PARAMS
-            if data.exact_search or data.hnsw_ef:
-                search_params = SearchParams(
-                    hnsw_ef=data.hnsw_ef if data.hnsw_ef else 128,
-                    exact=data.exact_search,
-                    quantization=QuantizationSearchParams(
-                        ignore=data.exact_search,  # Disable quantization for exact search
-                        rescore=True,
-                        oversampling=2.0
-                    ) if not data.exact_search else None
-                )
-                logger.info(f"  Custom search params: exact={data.exact_search}, hnsw_ef={data.hnsw_ef or 128}")
-            
-            # Track search performance
-            search_start = time.time()
 
-            # Qdrant search with optimized parameters
             sem_search_results = qdrant_client.search(
                 collection_name=SEGMENTS_COLLECTION,
                 query_vector=query_vector,
                 limit=top_k * 4,  # Get more results for fuzzy filtering
                 score_threshold=min_score * 0.8,  # Lower threshold, filter later
                 query_filter=search_filter,
-                search_params=search_params,  # Use optimized HNSW + quantization
                 with_payload=True,
                 with_vectors=False
             )
-            
-            search_time = time.time() - search_start
-            logger.info(f"  ✓ Qdrant search: {len(sem_search_results)} results in {search_time:.3f}s (hnsw_ef={search_params.hnsw_ef}, exact={search_params.exact})")
 
             for r in sem_search_results:
                 payload = r.payload or {}
@@ -852,45 +740,16 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                     if not found_speaker:
                         continue
                 
-                # Calculate comprehensive scoring
-                semantic_score = float(getattr(r, "score", 0.0))
+                # Calculate fuzzy boost score
                 fuzzy_boost = 0
-                exact_match = False
-                
-                # Check exact word matches in text
-                text_lower = text.lower()
-                if query_text and query_text.lower() in text_lower:
-                    exact_match = True
-                
-                # Calculate query term coverage
-                term_coverage = calculate_query_term_coverage(query_text, text)
-                
-                # Apply strict mode: reject if not enough terms present
-                if data.strict_mode and term_coverage < 1.0:
-                    continue  # Skip this result in strict mode
-                
-                if term_coverage < data.min_term_coverage:
-                    continue  # Skip if below minimum coverage threshold
-                
-                # Calculate fuzzy scores for filters
                 if title_filter and video_title:
                     fuzzy_boost = max(fuzzy_boost, fuzz.partial_ratio(title_filter.lower(), video_title.lower()) / 100)
                 if speaker_filter and speaker:
                     fuzzy_boost = max(fuzzy_boost, fuzz.ratio(speaker_filter.lower(), speaker.lower()) / 100)
                 
-                # Calculate combined score with breakdown
-                score_breakdown = calculate_combined_score(
-                    semantic_score=semantic_score,
-                    keyword_match=False,
-                    fuzzy_score=fuzzy_boost,
-                    exact_match=exact_match,
-                    term_coverage=term_coverage
-                )
-                
                 semantic_results.append({
                     "id": r.id,
-                    "score": score_breakdown["total"],
-                    "score_breakdown": score_breakdown,
+                    "score": calculate_combined_score(float(getattr(r, "score", 0.0)), False, fuzzy_boost),
                     "video_id": payload.get("video_id"),
                     "video_title": video_title,
                     "speaker": speaker,
@@ -933,9 +792,7 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
         try:
             logger.info(f"Elastic keyword search for: {search_words[:10]} (max_scanned={max_scanned})")
             words_lower = [w.lower() for w in search_words]
-            
-            # Optimize page size based on collection size
-            page_size = min(1000, max_scanned // 10)  # Adaptive batch size
+            page_size = 1000
             scanned = 0
             offset = None
 
@@ -965,38 +822,19 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                     # ELASTIC: Check exact match OR fuzzy match for each word
                     word_matched = False
                     fuzzy_score = 0
-                    exact_match = False
-                    matched_words = []
-                    
                     for w in words_lower:
-                        # Skip very short words that cause false matches
-                        if len(w) <= 2:
-                            continue
-                        
                         # Exact substring match
                         if w in combined_text:
                             word_matched = True
-                            exact_match = True
                             fuzzy_score = 1.0
-                            matched_words.append(w)
-                        # Fuzzy match with typo tolerance - stricter threshold
-                        elif len(w) >= 4 and fuzzy_match_text(w, combined_text, threshold=75):
+                            break
+                        # Fuzzy match with typo tolerance
+                        if len(w) >= 3 and fuzzy_match_text(w, combined_text, threshold=70):
                             word_matched = True
-                            current_fuzzy = fuzz.partial_ratio(w, combined_text) / 100
-                            # Only accept if fuzzy score is reasonably high
-                            if current_fuzzy >= 0.75:
-                                fuzzy_score = max(fuzzy_score, current_fuzzy)
-                                matched_words.append(w)
+                            fuzzy_score = fuzz.partial_ratio(w, combined_text) / 100
+                            break
                     
                     if not word_matched:
-                        continue
-                    
-                    # Calculate term coverage for keyword results
-                    full_text = payload.get("text", "")
-                    term_coverage = calculate_query_term_coverage(" ".join(search_words), full_text)
-                    
-                    # Skip if term coverage is too low
-                    if term_coverage < data.min_term_coverage:
                         continue
                     
                     # ELASTIC title filter with fuzzy matching
@@ -1009,19 +847,9 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                         if not fuzzy_match_speaker(speaker_filter, speaker_field, threshold=70):
                             continue
                     
-                    # Calculate proper combined score for keyword results
-                    score_breakdown = calculate_combined_score(
-                        semantic_score=0.0,  # No semantic search for keyword-only
-                        keyword_match=True,
-                        fuzzy_score=fuzzy_score,
-                        exact_match=exact_match,
-                        term_coverage=term_coverage
-                    )
-                    
                     keyword_results.append({
                         "id": p.id,
-                        "score": score_breakdown["total"],
-                        "score_breakdown": score_breakdown,
+                        "score": 0.9 + (fuzzy_score * 0.1),  # Score based on match quality
                         "video_id": payload.get("video_id"),
                         "video_title": video_title,
                         "speaker": speaker_field,
@@ -1035,7 +863,6 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                         "language": payload.get("language", ""),
                         "created_at": payload.get("created_at"),
                         "match_types": ["keyword"],
-                        "matched_words": matched_words,
                         "fuzzy_score": round(fuzzy_score, 2)
                     })
 
@@ -1050,7 +877,7 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
             logger.info(f"ERROR during keyword search: {str(e)}")
             raise HTTPException(status_code=500, detail=f"Keyword search error: {str(e)}")
 
-    # Merge results with intelligent score combination
+    # Merge results
     merged = {}
     
     for r in semantic_results: 
@@ -1058,34 +885,9 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
 
     for r in keyword_results:
         if r["id"] in merged:
-            # Result appears in both semantic and keyword - combine scores intelligently
-            existing = merged[r["id"]]
-            
-            # Add keyword to match types
-            if "keyword" not in existing["match_types"]: 
-                existing["match_types"].append("keyword")
-            
-            # Combine score breakdowns for hybrid results
-            existing_breakdown = existing.get("score_breakdown", {})
-            keyword_breakdown = r.get("score_breakdown", {})
-            
-            combined_breakdown = {
-                "semantic": existing_breakdown.get("semantic", 0),
-                "keyword": max(existing_breakdown.get("keyword", 0), keyword_breakdown.get("keyword", 0)),
-                "fuzzy": max(existing_breakdown.get("fuzzy", 0), keyword_breakdown.get("fuzzy", 0)),
-                "exact_bonus": max(existing_breakdown.get("exact_bonus", 0), keyword_breakdown.get("exact_bonus", 0)),
-                "term_coverage": max(existing_breakdown.get("term_coverage", 0), keyword_breakdown.get("term_coverage", 0))
-            }
-            combined_breakdown["total"] = min(sum(combined_breakdown.values()), 1.0)
-            
-            # Update with combined score
-            existing["score"] = combined_breakdown["total"]
-            existing["score_breakdown"] = combined_breakdown
-            existing["match_types"] = sorted(existing["match_types"])
-            
-            # Merge matched words if present
-            if "matched_words" in r:
-                existing["matched_words"] = r["matched_words"]
+            if "keyword" not in merged[r["id"]]["match_types"]: 
+                merged[r["id"]]["match_types"].append("keyword")
+            merged[r["id"]]["score"] = max(merged[r["id"]]["score"], 0.95)
         else:
             merged[r["id"]] = r
 
@@ -1097,17 +899,12 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
 
     return {
         "query": query_text,
-        "words": words,
+        "words":  words,
         "speaker_searched_in_text": speaker_search_in_text,
-        "collection": SEGMENTS_COLLECTION,
+        "collection":  SEGMENTS_COLLECTION,
         "total_semantic_hits": len(semantic_results),
         "total_keyword_hits": len(keyword_results),
-        "returned": len(merged_list),
-        "search_params": {
-            "hnsw_ef": data.hnsw_ef or QDRANT_SEARCH_PARAMS.hnsw_ef,
-            "exact_search": data.exact_search,
-            "quantization_enabled": not data.exact_search
-        },
+        "returned":  len(merged_list),
         "filters_applied": {
             "video_id": video_id_filter,
             "speaker": speaker_filter,
@@ -1115,35 +912,25 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
             "language": language_filter,
             "time_range": time_range,
             "min_score": min_score,
-            "min_term_coverage": data.min_term_coverage,
-            "strict_mode": data.strict_mode
         },
         "results": [
             {
                 "id": r["id"],
                 "score": round(r["score"], 4),
-                "score_breakdown": {
-                    "semantic": round(r.get("score_breakdown", {}).get("semantic", 0), 3),
-                    "keyword": round(r.get("score_breakdown", {}).get("keyword", 0), 3),
-                    "fuzzy": round(r.get("score_breakdown", {}).get("fuzzy", 0), 3),
-                    "exact_bonus": round(r.get("score_breakdown", {}).get("exact_bonus", 0), 3),
-                    "term_coverage": round(r.get("score_breakdown", {}).get("term_coverage", 0), 3)
-                },
-                "match_types": r.get("match_types", []),
-                "matched_words": r.get("matched_words", []),
+                "match_types": r. get("match_types", []),
                 "video_id": r.get("video_id"),
                 "video_title": r.get("video_title", ""),
                 "speaker": r.get("speaker", ""),
-                "diarization_speaker": r.get("diarization_speaker", ""),
+                "diarization_speaker": r. get("diarization_speaker", ""),
                 "start_time": r.get("start_time", 0),
-                "end_time": r.get("end_time", 0),
+                "end_time":  r.get("end_time", 0),
                 "duration": r.get("duration", 0),
-                "text": r.get("text", ""),
-                "text_length": r.get("text_length", 0),
+                "text": r. get("text", ""),
+                "text_length": r. get("text_length", 0),
                 "youtube_url": r.get("youtube_url", ""),
                 "language": r.get("language", ""),
                 "created_at": r.get("created_at"),
-                "youtube_url_timestamped": f"{r.get('youtube_url', '')}?t={int(r.get('start_time', 0))}" if r.get('youtube_url') else ""
+                "youtube_url_timestamped": f"{r. get('youtube_url', '')}?t={int(r.get('start_time', 0))}" if r.get('youtube_url') else ""
             }
             for r in merged_list
         ]
@@ -1419,35 +1206,16 @@ async def delete_video_embeddings(video_id: int, authorized: bool = Depends(veri
 async def health():
     try:
         collection_info = qdrant_client.get_collection(collection_name=SEGMENTS_COLLECTION)
-        
-        # Get HNSW and quantization status
-        hnsw_config = collection_info.config.hnsw_config if hasattr(collection_info.config, 'hnsw_config') else None
-        quantization_enabled = hasattr(collection_info.config, 'quantization_config') and collection_info.config.quantization_config is not None
-        
-        health_response = {
+        return {
             "status": "healthy",
             "qdrant_connected": True,
             "collections": {
-                "segments": SEGMENTS_COLLECTION,
-                "legacy": LEGACY_COLLECTION
+                "segments":  SEGMENTS_COLLECTION,
+                "legacy":  LEGACY_COLLECTION
             },
             "points_count": collection_info.points_count,
-            "vectors_count": getattr(collection_info, 'vectors_count', 0)
+            "vectors_count": collection_info.vectors_count
         }
-        
-        # Add HNSW config if available
-        if hnsw_config:
-            health_response["qdrant_config"] = {
-                "hnsw": {
-                    "m": getattr(hnsw_config, 'm', 16),
-                    "ef_construct": getattr(hnsw_config, 'ef_construct', 100),
-                    "full_scan_threshold": getattr(hnsw_config, 'full_scan_threshold', 10000)
-                },
-                "quantization_enabled": quantization_enabled,
-                "optimizer_status": str(getattr(collection_info, 'optimizer_status', 'unknown'))
-            }
-        
-        return health_response
     except Exception as e:
         return {
             "status": "unhealthy",
@@ -1459,59 +1227,18 @@ async def health():
 async def stats():
     try:
         collection_info = qdrant_client.get_collection(collection_name=SEGMENTS_COLLECTION)
-        hnsw_config = getattr(collection_info.config, 'hnsw_config', None)
-        quantization_config = getattr(collection_info.config, 'quantization_config', None)
-        
-        # Safely get vector params
-        vectors_param = collection_info.config.params.vectors
-        if isinstance(vectors_param, dict):
-            # Named vectors
-            first_vector = next(iter(vectors_param.values()), None)
-            vector_size = getattr(first_vector, 'size', 384) if first_vector else 384
-            distance = getattr(getattr(first_vector, 'distance', None), 'name', 'COSINE') if first_vector else 'COSINE'
-        else:
-            # Single vector
-            vector_size = getattr(vectors_param, 'size', 384)
-            distance = getattr(getattr(vectors_param, 'distance', None), 'name', 'COSINE')
-        
-        stats_response = {
-            "collection": SEGMENTS_COLLECTION,
+        return {
+            "collection":  SEGMENTS_COLLECTION,
             "points_count": collection_info.points_count,
-            "vectors_count": getattr(collection_info, 'vectors_count', 0),
-            "indexed_vectors_count": getattr(collection_info, 'indexed_vectors_count', 0),
-            "status": str(collection_info.status),
-            "optimizer_status": str(getattr(collection_info, 'optimizer_status', 'unknown')),
+            "vectors_count": collection_info.vectors_count,
+            "indexed_vectors_count": collection_info.indexed_vectors_count,
+            "status": collection_info.status,
+            "optimizer_status": collection_info.optimizer_status,
             "config": {
-                "vector_size": vector_size,
-                "distance": distance
-            },
-            "search_params": {
-                "default_hnsw_ef": QDRANT_SEARCH_PARAMS.hnsw_ef,
-                "default_exact": QDRANT_SEARCH_PARAMS.exact,
-                "quantization_rescore": True,
-                "cache_enabled": True,
-                "cache_size": len(embedding_cache),
-                "cache_max_size": embedding_cache.maxsize
+                "vector_size": collection_info.config.params.vectors.size,
+                "distance": collection_info.config.params.vectors.distance.name
             }
         }
-        
-        # Add HNSW config if available
-        if hnsw_config:
-            stats_response["config"]["hnsw"] = {
-                "m": getattr(hnsw_config, 'm', 16),
-                "ef_construct": getattr(hnsw_config, 'ef_construct', 100),
-                "full_scan_threshold": getattr(hnsw_config, 'full_scan_threshold', 10000),
-                "max_indexing_threads": getattr(hnsw_config, 'max_indexing_threads', 0)
-            }
-        
-        # Add quantization config if available
-        stats_response["config"]["quantization"] = {
-            "enabled": quantization_config is not None,
-            "type": "INT8" if quantization_config else None,
-            "memory_reduction": "~75%" if quantization_config else "0%"
-        }
-        
-        return stats_response
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -1523,65 +1250,36 @@ async def root():
         "features": "Fuzzy/Typo-tolerant search with rapidfuzz",
         "endpoints": {
             "POST /embed-video": "Embed entire video transcript",
-            "POST /search": "ELASTIC semantic + keyword + fuzzy search (with Qdrant optimizations)",
+            "POST /search": "ELASTIC semantic + keyword + fuzzy search",
             "POST /search-by-title": "Fuzzy search videos by title",
             "POST /search-multi-video": "Search across multiple specific videos",
             "POST /suggest": "Autocomplete suggestions for speakers/titles",
             "GET /video/{video_id}/segments": "Get all segments for a video",
             "DELETE /video/{video_id}/embeddings": "Delete all embeddings for a video",
-            "GET /health": "Health check with Qdrant config",
-            "GET /stats": "Collection statistics + HNSW/quantization info"
+            "GET /health": "Health check",
+            "GET /stats": "Collection statistics"
         },
-        "qdrant_optimizations": [
-            "HNSW indexing (m=16, ef_construct=100) for fast approximate search",
-            "INT8 scalar quantization (~75% memory reduction)",
-            "Quantization rescoring for accuracy recovery",
-            "Configurable search accuracy (hnsw_ef parameter)",
-            "Optional exact search mode (exact=true)",
-            "Auto-threaded indexing and optimization",
-            "Memory-mapped storage for large collections (>50k points)"
-        ],
         "elastic_search_features": [
             "Semantic search using embeddings (cached for performance)",
-            "Fuzzy/typo-tolerant matching (stricter thresholds to reduce false positives)",
-            "Query term coverage validation (ensures query terms are actually present)",
-            "Strict mode option (requires ALL query terms to be present)",
-            "Minimum term coverage threshold (default 50% of query terms)",
+            "Fuzzy/typo-tolerant matching (e.g., 'Muhamad' matches 'Muhammad')",
             "N-gram based partial matching",
             "Speaker name autocomplete with fuzzy matching",
             "Title search with typo tolerance",
-            "Combined scoring: semantic + keyword + fuzzy + coverage",
+            "Combined scoring: semantic + keyword + fuzzy",
             "Query caching for repeated searches",
             "Multi-keyword search with OR logic",
             "Time range filtering",
-            "Query parsing (e.g., 'speaker:John title:intro AI')",
-            "Short word filtering (prevents 'a', 'is', 'the' false matches)"
+            "Query parsing (e.g., 'speaker:John title:intro AI')"
         ],
         "example_queries": {
             "semantic": {"query": "machine learning algorithms"},
-            "strict_mode": {"query": "deep neural networks", "strict_mode": True},
-            "relaxed_mode": {"query": "AI concepts", "min_term_coverage": 0.3},
-            "fast_search": {"query": "AI", "hnsw_ef": 64},
-            "accurate_search": {"query": "AI", "hnsw_ef": 256},
-            "exact_search": {"query": "AI", "exact_search": True},
             "fuzzy_speaker": {"query": "AI", "speaker": "Muhamad"},
             "fuzzy_title": {"query": "python", "title": "introducion"},
             "keyword_fuzzy": {"words": ["nueral", "netwerk"], "query": "AI"},
             "autocomplete": {"endpoint": "/suggest", "body": {"query": "joh", "type": "speaker"}},
             "parsed": {"query": "speaker:John title:intro machine learning"},
             "multi_video": {"query": "AI", "video_ids": [1, 2, 3]}
-        },
-        "performance_tips": [
-            "Use hnsw_ef=64 for fast searches (~2x faster)",
-            "Use hnsw_ef=256 for high accuracy (~2x slower)",
-            "Use exact_search=true only when 100% accuracy required",
-            "Quantization saves ~75% memory with <3% accuracy loss",
-            "Query cache handles repeated searches instantly",
-            "Collection auto-optimizes after 20k points",
-            "Use strict_mode=true to eliminate all irrelevant results",
-            "Adjust min_term_coverage (0.3-1.0) to control precision vs recall",
-            "Default min_term_coverage=0.5 prevents most false positives"
-        ]
+        }
     }
 
 if __name__ == "__main__":
@@ -1590,12 +1288,5 @@ if __name__ == "__main__":
     logger.info(f"Starting FastAPI Video Elastic Search Service on port {port}...")
     logger.info(f"Qdrant URL: {QDRANT_URL}")
     logger.info(f"Collections: {SEGMENTS_COLLECTION}, {LEGACY_COLLECTION}")
-    logger.info("="*60)
-    logger.info("Qdrant Optimizations:")
-    logger.info(f"  ✓ HNSW Index: m={HNSW_CONFIG.m}, ef_construct={HNSW_CONFIG.ef_construct}")
-    logger.info(f"  ✓ Search Params: hnsw_ef={QDRANT_SEARCH_PARAMS.hnsw_ef}, exact={QDRANT_SEARCH_PARAMS.exact}")
-    logger.info(f"  ✓ Quantization: INT8 (saves ~75% memory)")
-    logger.info(f"  ✓ Query Cache: {embedding_cache.maxsize} queries, {embedding_cache.ttl}s TTL")
-    logger.info("="*60)
-    logger.info("Features: Fuzzy search, typo tolerance, HNSW+quantization, query caching")
+    logger.info("Features: Fuzzy search, typo tolerance, query caching")
     uvicorn.run(app, host="0.0.0.0", port=port)
