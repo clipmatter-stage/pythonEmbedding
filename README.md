@@ -79,10 +79,81 @@ curl -X POST https://your-api.railway.app/search \
 
 ## Railway Deployment
 
-1. Push to GitHub
-2. Connect repo to Railway
-3. Add environment variables in Railway dashboard
-4. Deploy!
+### Secure Secret Management
+
+This project uses a custom Dockerfile (not Nixpacks) to avoid embedding secrets in the Docker image.
+
+**⚠️ IMPORTANT: Secrets are injected at runtime by Railway, NOT baked into the Docker image.**
+
+### Deployment Steps
+
+1. **Push to GitHub**
+   ```bash
+   git add .
+   git commit -m "Add secure Dockerfile"
+   git push origin main
+   ```
+
+2. **Connect to Railway**
+   - Go to [railway.app](https://railway.app)
+   - Create new project from GitHub repo
+   - Railway will detect the Dockerfile automatically
+
+3. **Configure Environment Variables in Railway Dashboard**
+   
+   Go to your project → Variables tab and add:
+   
+   | Variable | Value | Required |
+   |----------|-------|----------|
+   | `QDRANT_URL` | Your Qdrant instance URL | ✅ Yes |
+   | `QDRANT_API_KEY` | Your Qdrant API key | ✅ Yes |
+   | `API_KEY` | Your custom API key | ⚠️ Recommended |
+   | `PORT` | Auto-set by Railway | ✅ Auto |
+   | `LOG_LEVEL` | INFO | Optional |
+   | `RATE_LIMIT_REQUESTS` | 100 | Optional |
+   | `RATE_LIMIT_WINDOW` | 60 | Optional |
+   | `CORS_ORIGINS` | * or your domains | Optional |
+
+4. **Deploy**
+   - Railway will automatically build and deploy
+   - Check logs for any errors
+   - Test with: `https://your-app.railway.app/health`
+
+### Why Custom Dockerfile?
+
+The custom Dockerfile:
+- ✅ Does NOT use `ARG` or `ENV` for secrets (Docker security best practice)
+- ✅ Expects secrets from Railway environment variables at runtime
+- ✅ Uses multi-stage builds for smaller image size
+- ✅ Runs as non-root user for security
+- ✅ Includes health checks
+
+### Troubleshooting
+
+**Error: "Missing required environment variables"**
+- Ensure `QDRANT_URL` and `QDRANT_API_KEY` are set in Railway Variables tab
+
+**Error: "401 Unauthorized"**
+- If `API_KEY` is set, include `X-API-Key` header in requests
+- To disable auth, remove `API_KEY` variable
+
+**Build fails**
+- Check Railway build logs
+- Ensure `requirements.txt` is up to date
+- Verify Dockerfile syntax
+
+### Testing Your Deployment
+
+```bash
+# Health check
+curl https://your-app.railway.app/health
+
+# Search (with API key)
+curl -X POST https://your-app.railway.app/search \
+  -H "X-API-Key: your-api-key" \
+  -H "Content-Type: application/json" \
+  -d '{"query": "machine learning", "top_k": 5}'
+```
 
 ## License
 
