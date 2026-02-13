@@ -719,6 +719,7 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                 payload = r.payload or {}
                 video_title = payload.get("video_title", "")
                 speaker = payload.get("speaker", "")
+                diarization_speaker = payload.get("diarization_speaker", "")
                 text = payload.get("text", "")
                 
                 # ELASTIC title filter with fuzzy matching
@@ -726,16 +727,18 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                     if not fuzzy_match_text(title_filter, video_title, threshold=60):
                         continue
                 
-                # ELASTIC speaker filter with fuzzy matching (handles typos)
+                # ELASTIC speaker filter with fuzzy matching (checks both speaker fields)
                 if speaker_filter:
-                    if not fuzzy_match_speaker(speaker_filter, speaker, threshold=70):
+                    speaker_combined = f"{speaker} {diarization_speaker}"
+                    if not fuzzy_match_speaker(speaker_filter, speaker_combined, threshold=70):
                         continue
                 
                 # ELASTIC speaker search in text with fuzzy matching
                 if speaker_search_in_text:
+                    speaker_combined = f"{speaker} {diarization_speaker}"
                     found_speaker = (
                         fuzzy_match_text(speaker_search_in_text, text, threshold=65) or
-                        fuzzy_match_speaker(speaker_search_in_text, speaker, threshold=70)
+                        fuzzy_match_speaker(speaker_search_in_text, speaker_combined, threshold=70)
                     )
                     if not found_speaker:
                         continue
@@ -744,8 +747,10 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                 fuzzy_boost = 0
                 if title_filter and video_title:
                     fuzzy_boost = max(fuzzy_boost, fuzz.partial_ratio(title_filter.lower(), video_title.lower()) / 100)
-                if speaker_filter and speaker:
-                    fuzzy_boost = max(fuzzy_boost, fuzz.ratio(speaker_filter.lower(), speaker.lower()) / 100)
+                if speaker_filter:
+                    speaker_combined = f"{speaker} {diarization_speaker}"
+                    if speaker or diarization_speaker:
+                        fuzzy_boost = max(fuzzy_boost, fuzz.ratio(speaker_filter.lower(), speaker_combined.lower()) / 100)
                 
                 semantic_results.append({
                     "id": r.id,
@@ -753,7 +758,7 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                     "video_id": payload.get("video_id"),
                     "video_title": video_title,
                     "speaker": speaker,
-                    "diarization_speaker": payload.get("diarization_speaker", ""),
+                    "diarization_speaker": diarization_speaker,
                     "start_time": payload.get("start_time", 0),
                     "end_time": payload.get("end_time", 0),
                     "duration": round((payload.get("end_time", 0) - payload.get("start_time", 0)), 2),
@@ -763,7 +768,8 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                     "language": payload.get("language", ""),
                     "created_at": payload.get("created_at"),
                     "match_types": ["semantic"],
-                    "fuzzy_score": round(fuzzy_boost, 2)
+                    "fuzzy_score": round(fuzzy_boost, 2),
+                    "matched_field": "semantic_vector"
                 })
 
         except Exception as e:
@@ -817,21 +823,42 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                     text = (payload.get("text") or "").lower()
                     speaker_field = (payload.get("speaker") or "")
                     video_title = payload.get("video_title", "")
-                    combined_text = f"{text} {speaker_field.lower()}"
+                    diarization_speaker = (payload.get("diarization_speaker") or "")
+                    video_filename = (payload.get("video_filename") or "")
+                    
+                    # Combine ALL searchable payload fields for comprehensive search
+                    combined_text = f"{text} {speaker_field.lower()} {video_title.lower()} {diarization_speaker.lower()} {video_filename.lower()}"
                     
                     # ELASTIC: Check exact match OR fuzzy match for each word
                     word_matched = False
                     fuzzy_score = 0
+                    matched_field = ""
+                    
                     for w in words_lower:
-                        # Exact substring match
-                        if w in combined_text:
-                            word_matched = True
-                            fuzzy_score = 1.0
-                            break
-                        # Fuzzy match with typo tolerance
-                        if len(w) >= 3 and fuzzy_match_text(w, combined_text, threshold=70):
-                            word_matched = True
-                            fuzzy_score = fuzz.partial_ratio(w, combined_text) / 100
+                        # Check each field individually to track which field matched
+                        fields_to_check = [
+                            ("text", text),
+                            ("speaker", speaker_field.lower()),
+                            ("video_title", video_title.lower()),
+                            ("diarization_speaker", diarization_speaker.lower()),
+                            ("video_filename", video_filename.lower())
+                        ]
+                        
+                        for field_name, field_value in fields_to_check:
+                            # Exact substring match
+                            if w in field_value:
+                                word_matched = True
+                                fuzzy_score = 1.0
+                                matched_field = field_name
+                                break
+                            # Fuzzy match with typo tolerance
+                            if len(w) >= 3 and fuzzy_match_text(w, field_value, threshold=70):
+                                word_matched = True
+                                fuzzy_score = fuzz.partial_ratio(w, field_value) / 100
+                                matched_field = field_name
+                                break
+                        
+                        if word_matched:
                             break
                     
                     if not word_matched:
@@ -844,7 +871,8 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                     
                     # ELASTIC speaker filter with fuzzy matching
                     if speaker_filter:
-                        if not fuzzy_match_speaker(speaker_filter, speaker_field, threshold=70):
+                        speaker_check = f"{speaker_field} {diarization_speaker}"
+                        if not fuzzy_match_speaker(speaker_filter, speaker_check, threshold=70):
                             continue
                     
                     keyword_results.append({
@@ -853,7 +881,7 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                         "video_id": payload.get("video_id"),
                         "video_title": video_title,
                         "speaker": speaker_field,
-                        "diarization_speaker": payload.get("diarization_speaker", ""),
+                        "diarization_speaker": diarization_speaker,
                         "start_time": payload.get("start_time", 0),
                         "end_time": payload.get("end_time", 0),
                         "duration": round((payload.get("end_time", 0) - payload.get("start_time", 0)), 2),
@@ -862,8 +890,9 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                         "youtube_url": payload.get("youtube_url", ""),
                         "language": payload.get("language", ""),
                         "created_at": payload.get("created_at"),
-                        "match_types": ["keyword"],
-                        "fuzzy_score": round(fuzzy_score, 2)
+                        "match_types": ["keyword", f"matched_in_{matched_field}"],
+                        "fuzzy_score": round(fuzzy_score, 2),
+                        "matched_field": matched_field
                     })
 
                 if len(keyword_results) >= top_k * 2:
@@ -896,6 +925,8 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
         key=lambda x: (x. get("score", 0), -x.get("start_time", 0)),
         reverse=True
     )[:top_k]
+    
+    logger.info(f"Search completed: {len(semantic_results)} semantic + {len(keyword_results)} keyword = {len(merged_list)} merged results")
 
     return {
         "query": query_text,
@@ -918,6 +949,7 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                 "id": r["id"],
                 "score": round(r["score"], 4),
                 "match_types": r. get("match_types", []),
+                "matched_field": r.get("matched_field", ""),
                 "video_id": r.get("video_id"),
                 "video_title": r.get("video_title", ""),
                 "speaker": r.get("speaker", ""),
