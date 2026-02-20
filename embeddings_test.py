@@ -802,23 +802,15 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
     use_query_expansion = os.getenv("USE_QUERY_EXPANSION", "true").lower() == "true"
     use_reranking = os.getenv("USE_RERANKING", "true").lower() == "true"
     
-    # Check if speaker_filter looks like a search query (contains spaces or is a name to search for)
-    speaker_search_in_text = None
-    if speaker_filter and " " in speaker_filter: 
-        # This looks like a name to search IN the text, not a filter
-        speaker_search_in_text = speaker_filter
-        speaker_filter = None  # Don't use as exact filter
-        # Add to semantic query
-        if query_text:
-            query_text = f"{query_text} {speaker_search_in_text}"
-        else: 
-            query_text = speaker_search_in_text
+    # Speaker filter is ALWAYS used as a filter on the speaker/diarization_speaker fields.
+    # Never convert it to a text search - "Hafiz Naeem" is a valid speaker name.
+    speaker_search_in_text = None  # Not used anymore
     
     # Handle backward compatibility for single word
     if word: 
         words = [word] if isinstance(word, str) else word
     
-    # Parse query for embedded filters
+    # Parse query for embedded filters (e.g. "speaker:John title:intro AI")
     if query_text and not any([video_id_filter, speaker_filter, title_filter]):
         parsed = parse_search_query(query_text)
         if parsed["video_id"]:
@@ -829,10 +821,11 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
             title_filter = parsed["title"]
         query_text = parsed["semantic_query"]
     
-    if not query_text and not words and not title_filter:
+    # Allow search with: query, words, title, OR speaker (speaker-only search is valid)
+    if not query_text and not words and not title_filter and not speaker_filter:
         raise HTTPException(
             status_code=400,
-            detail="Either 'query', 'words', or 'title' is required"
+            detail="Either 'query', 'words', 'title', or 'speaker' is required"
         )
 
     # Build Qdrant filter - only use exact filters (video_id, language)
@@ -853,13 +846,13 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
     
     if time_range:
         start_time = time_range.get("start")
-        end_time = time_range. get("end")
+        end_time = time_range.get("end")
         if start_time is not None: 
             filter_conditions.append(
                 FieldCondition(key="start_time", range=models.Range(gte=start_time))
             )
         if end_time is not None: 
-            filter_conditions. append(
+            filter_conditions.append(
                 FieldCondition(key="end_time", range=models.Range(lte=end_time))
             )
 
@@ -867,6 +860,84 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
 
     semantic_results = []
     keyword_results = []
+    speaker_results = []  # New: results from speaker-only scroll search
+    
+    # Strategy 0: Speaker-only search (no query, no words - just find all segments by speaker)
+    # This handles the case where user clicks "Speaker Search" toggle without typing anything,
+    # or types a speaker name to find all their segments.
+    speaker_only_search = speaker_filter and not query_text and not words
+    
+    if speaker_only_search:
+        try:
+            logger.info(f"Speaker-only search for: '{speaker_filter}'")
+            offset = None
+            scanned = 0
+            max_scan_speaker = min(max_scanned, 50000)
+            
+            while scanned < max_scan_speaker and len(speaker_results) < top_k:
+                points, next_offset = qdrant_client.scroll(
+                    collection_name=SEGMENTS_COLLECTION,
+                    scroll_filter=search_filter,
+                    limit=min(1000, max_scan_speaker - scanned),
+                    offset=offset,
+                    with_payload=True,
+                    with_vectors=False
+                )
+                
+                if not points:
+                    break
+                
+                for p in points:
+                    scanned += 1
+                    payload = p.payload or {}
+                    spk = payload.get("speaker", "")
+                    diar_spk = payload.get("diarization_speaker", "")
+                    speaker_combined = f"{spk} {diar_spk}".strip()
+                    video_title = payload.get("video_title", "")
+                    
+                    # Fuzzy match speaker name against speaker fields
+                    if not fuzzy_match_speaker(speaker_filter, speaker_combined, threshold=70):
+                        continue
+                    
+                    # Apply title filter if present
+                    if title_filter and not fuzzy_match_text(title_filter, video_title, threshold=60):
+                        continue
+                    
+                    # Calculate score based on speaker match quality
+                    match_score = fuzz.ratio(speaker_filter.lower(), speaker_combined.lower()) / 100
+                    
+                    speaker_results.append({
+                        "id": p.id,
+                        "score": round(max(match_score, 0.5), 4),  # Speaker matches get decent score
+                        "video_id": payload.get("video_id"),
+                        "video_title": video_title,
+                        "speaker": spk,
+                        "diarization_speaker": diar_spk,
+                        "start_time": payload.get("start_time", 0),
+                        "end_time": payload.get("end_time", 0),
+                        "duration": round((payload.get("end_time", 0) - payload.get("start_time", 0)), 2),
+                        "text": payload.get("text", ""),
+                        "text_length": payload.get("text_length", 0),
+                        "youtube_url": payload.get("youtube_url", ""),
+                        "language": payload.get("language", ""),
+                        "created_at": payload.get("created_at"),
+                        "match_types": ["speaker_filter"],
+                        "fuzzy_score": round(match_score, 2),
+                        "matched_field": "speaker",
+                    })
+                
+                if len(speaker_results) >= top_k:
+                    break
+                    
+                offset = next_offset
+                if not next_offset:
+                    break
+            
+            logger.info(f"Speaker-only search found {len(speaker_results)} results (scanned {scanned})")
+            
+        except Exception as e:
+            logger.error(f"ERROR during speaker-only search: {str(e)}")
+            raise HTTPException(status_code=500, detail=f"Speaker search error: {str(e)}")
 
     # Strategy 1: Semantic search with optional query expansion
     if query_text:
@@ -940,16 +1011,6 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                         if not fuzzy_match_speaker(speaker_filter, speaker_combined, threshold=70):
                             continue
                     
-                    # ELASTIC speaker search in text with fuzzy matching
-                    if speaker_search_in_text:
-                        speaker_combined = f"{speaker} {diarization_speaker}"
-                        found_speaker = (
-                            fuzzy_match_text(speaker_search_in_text, text, threshold=65) or
-                            fuzzy_match_speaker(speaker_search_in_text, speaker_combined, threshold=70)
-                        )
-                        if not found_speaker:
-                            continue
-                    
                     # Calculate fuzzy boost score
                     fuzzy_boost = 0
                     if title_filter and video_title:
@@ -995,10 +1056,6 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
     # Strategy 2: Keyword search - only when explicit words are provided
     # DO NOT mix semantic query words into keyword search to avoid false matches
     search_words = list(words) if words else []
-    
-    if speaker_search_in_text:
-        # Add speaker name words to keyword search
-        search_words.extend(speaker_search_in_text.split())
     
     # Only use exact words - no expansion to avoid false matches
     search_words = list(set(w for w in search_words if len(w) >= 2))
@@ -1164,18 +1221,23 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
             logger.info(f"ERROR during keyword search: {str(e)}")
             raise HTTPException(status_code=500, detail=f"Keyword search error: {str(e)}")
 
-    # Merge results - combine semantic and keyword matches
+    # Merge results - combine semantic, keyword, and speaker matches
     merged = {}
     
-    for r in semantic_results:
+    for r in speaker_results:
         merged[r["id"]] = r
+    
+    for r in semantic_results:
+        if r["id"] in merged:
+            merged[r["id"]]["match_types"].append("semantic")
+            merged[r["id"]]["score"] = max(merged[r["id"]]["score"], r["score"])
+        else:
+            merged[r["id"]] = r
 
     for r in keyword_results:
         if r["id"] in merged:
-            # Already have semantic match - boost score if also keyword match
             if "keyword" not in merged[r["id"]]["match_types"]:
                 merged[r["id"]]["match_types"].append("keyword")
-            # Take the better score between semantic and keyword
             merged[r["id"]]["score"] = max(merged[r["id"]]["score"], r["score"])
         else:
             merged[r["id"]] = r
@@ -1210,13 +1272,14 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
         if len(final_results) >= top_k:
             break
     
-    logger.info(f"Search completed: {len(semantic_results)} semantic + {len(keyword_results)} keyword = {len(final_results)} merged results from {len(videos_seen)} videos")
+    logger.info(f"Search completed: {len(speaker_results)} speaker + {len(semantic_results)} semantic + {len(keyword_results)} keyword = {len(final_results)} merged results from {len(videos_seen)} videos")
 
     return {
         "query": query_text,
         "words":  words,
-        "speaker_searched_in_text": speaker_search_in_text,
+        "speaker_filter": speaker_filter,
         "collection":  SEGMENTS_COLLECTION,
+        "total_speaker_hits": len(speaker_results),
         "total_semantic_hits": len(semantic_results),
         "total_keyword_hits": len(keyword_results),
         "returned":  len(final_results),
