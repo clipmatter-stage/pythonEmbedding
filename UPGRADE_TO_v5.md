@@ -287,3 +287,5 @@ Questions? Issues?
 ---
 
 **Ready to upgrade?** Follow the steps above and enjoy TOP LEVEL search accuracy! 🚀
+
+**Ready to upgrade?** Follow the steps above and enjoy TOP LEVEL search accuracy! 🚀
