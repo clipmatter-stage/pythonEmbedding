@@ -73,12 +73,12 @@ class SearchRequest(BaseModel):
     query: str = Field(default="", max_length=1000)
     words: List[str] = Field(default=[])
     word: Optional[str] = Field(default=None, max_length=200)
-    top_k: int = Field(default=10, ge=1, le=100)
+    top_k: int = Field(default=20, ge=1, le=500)
     video_id: Optional[int] = Field(default=None, gt=0)
     speaker: Optional[str] = Field(default=None, max_length=200)
     title: Optional[str] = Field(default=None, max_length=500)
     language: Optional[str] = Field(default=None, max_length=50)
-    min_score: float = Field(default=0.3, ge=0.0, le=1.0)
+    min_score: float = Field(default=0.35, ge=0.0, le=1.0)
     time_range: Optional[dict] = None
     max_scanned: int = Field(default=10000, ge=100, le=100000)
 
@@ -172,9 +172,12 @@ logger.info("Warming up model...")
 _ = model.encode("warmup text", show_progress_bar=False)
 logger.info("Model warmed up and ready")
 
+# Store reference to sentence-transformer model for fallback in get_openai_embedding
+_st_model = model
+
 # ============== ADVANCED EMBEDDING FUNCTIONS ==============
 
-def get_openai_embedding(text: str, model: str = None) -> List[float]:
+def get_openai_embedding(text: str, model_name: str = None) -> List[float]:
     """
     Get embedding from OpenAI API with advanced text-embedding-3 models.
     These models provide significantly better semantic understanding.
@@ -182,7 +185,7 @@ def get_openai_embedding(text: str, model: str = None) -> List[float]:
     if not openai_client:
         raise ValueError("OpenAI client not initialized")
     
-    model = model or OPENAI_EMBEDDING_MODEL
+    model_name = model_name or OPENAI_EMBEDDING_MODEL
     
     try:
         # Replace newlines to avoid API issues
@@ -190,15 +193,18 @@ def get_openai_embedding(text: str, model: str = None) -> List[float]:
         
         response = openai_client.embeddings.create(
             input=text,
-            model=model,
+            model=model_name,
             dimensions=EMBEDDING_DIMENSION  # Can reduce dimensions for faster search
         )
         
         return response.data[0].embedding
     except Exception as e:
         logger.error(f"OpenAI embedding error: {str(e)}")
-        # Fallback to sentence-transformers
-        return model.encode(text, show_progress_bar=False).tolist()
+        # Fallback to sentence-transformers (use the global _st_model, not the shadowed param)
+        global _st_model
+        if _st_model is not None:
+            return _st_model.encode(text, show_progress_bar=False).tolist()
+        raise
 
 def get_openai_embeddings_batch(texts: List[str], model_name: str = None) -> List[List[float]]:
     """
@@ -862,19 +868,23 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
     semantic_results = []
     keyword_results = []
 
-    # Strategy 1: ADVANCED Semantic search with query expansion and caching
+    # Strategy 1: Semantic search with optional query expansion
     if query_text:
         try:
-            logger.info(f"Advanced semantic search for: '{query_text[:120]}'")
+            logger.info(f"Semantic search for: '{query_text[:120]}'")
             
-            # Query expansion using GPT (if enabled)
-            query_variations = []
-            if use_query_expansion and openai_client:
-                logger.info("Expanding query with GPT...")
-                query_variations = expand_query_with_gpt(query_text)
-                logger.info(f"Query expanded to {len(query_variations)} variations: {query_variations}")
-            else:
-                query_variations = [query_text]
+            # Query expansion using GPT (only for longer queries where it helps)
+            query_variations = [query_text]
+            if use_query_expansion and openai_client and len(query_text.split()) >= 3:
+                try:
+                    logger.info("Expanding query with GPT...")
+                    expanded = expand_query_with_gpt(query_text)
+                    # Only keep expansions, limit to 3 total
+                    query_variations = expanded[:3]
+                    logger.info(f"Query expanded to {len(query_variations)} variations")
+                except Exception as e:
+                    logger.warning(f"Query expansion failed, using original: {e}")
+                    query_variations = [query_text]
             
             # Search with all query variations
             all_semantic_results = {}  # Use dict to deduplicate by ID
@@ -885,26 +895,16 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                 
                 # Adjust search parameters for better results
                 search_params = SearchParams(
-                    hnsw_ef=128,  # Higher ef for better recall (default is 64)
+                    hnsw_ef=128,  # Higher ef for better recall
                     exact=False   # Use approximate search for speed
                 )
 
+                # Use STRICT score threshold - no lowering
                 sem_search_results = qdrant_client.search(
                     collection_name=SEGMENTS_COLLECTION,
                     query_vector=query_vector,
-                    limit=top_k * 6 if idx == 0 else top_k * 2,  # Get more results for main query
-                    score_threshold=min_score * 0.7,  # Lower threshold for better recall
-                    query_filter=search_filter,
-                    with_payload=True,
-                    with_vectors=False,
-                    search_params=search_params
-                )
-
-                sem_search_results = qdrant_client.search(
-                    collection_name=SEGMENTS_COLLECTION,
-                    query_vector=query_vector,
-                    limit=top_k * 6 if idx == 0 else top_k * 2,  # Get more results for main query
-                    score_threshold=min_score * 0.7,  # Lower threshold for better recall
+                    limit=top_k * 3 if idx == 0 else top_k,  # Primary query gets more
+                    score_threshold=min_score,  # Use exact min_score, no reduction
                     query_filter=search_filter,
                     with_payload=True,
                     with_vectors=False,
@@ -992,23 +992,16 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
             logger.info(f"ERROR during semantic search: {str(e)}")
             raise HTTPException(status_code=500, detail=f"Semantic search error: {str(e)}")
 
-    # Strategy 2: ELASTIC Keyword search with fuzzy matching
+    # Strategy 2: Keyword search - only when explicit words are provided
+    # DO NOT mix semantic query words into keyword search to avoid false matches
     search_words = list(words) if words else []
-    
-    # Add query words to keyword search for elastic name matching
-    if query_text:
-        query_words = query_text.strip().split()
-        search_words.extend(query_words)
     
     if speaker_search_in_text:
         # Add speaker name words to keyword search
         search_words.extend(speaker_search_in_text.split())
     
-    # Expand search words with variations for better recall
-    expanded_words = []
-    for word in search_words:
-        expanded_words.extend(expand_query_variations(word))
-    search_words = list(set(expanded_words))
+    # Only use exact words - no expansion to avoid false matches
+    search_words = list(set(w for w in search_words if len(w) >= 2))
     
     if search_words:
         try:
@@ -1055,27 +1048,29 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                     }
                     best_field_weight = 0
                     
-                    # ELASTIC: Check each word and count matches across all fields
+                    # STRICT keyword matching: check each word across fields
                     for w in words_lower:
                         word_found = False
                         
                         # Check each field individually to track which field matched
                         fields_to_check = [
-                            ("video_title", video_title.lower()),
+                            ("text", text),
                             ("speaker", speaker_field.lower()),
                             ("diarization_speaker", diarization_speaker.lower()),
-                            ("text", text),
-                            ("video_filename", video_filename.lower())
+                            ("video_title", video_title.lower()),
                         ]
                         
                         for field_name, field_value in fields_to_check:
+                            if not field_value:
+                                continue
+                            
                             field_match_score = 0
                             
-                            # Exact substring match
+                            # Exact substring match (primary matching method)
                             if w in field_value:
                                 field_match_score = 1.0
-                            # Fuzzy match with typo tolerance
-                            elif len(w) >= 3 and fuzzy_match_text(w, field_value, threshold=70):
+                            # Fuzzy match ONLY for longer words (4+ chars) with HIGH threshold
+                            elif len(w) >= 4 and fuzz.partial_ratio(w, field_value) >= 85:
                                 field_match_score = fuzz.partial_ratio(w, field_value) / 100
                             
                             if field_match_score > 0:
@@ -1092,12 +1087,12 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                                     best_field_weight = field_weight
                                 
                                 break  # Found match for this word, move to next word
-                        
-                        if word_found:
-                            # Don't break - count ALL matched words
-                            pass
                     
                     if matched_words_count == 0:
+                        continue
+                    
+                    # STRICT: For multi-word searches, require ALL words to match
+                    if len(words_lower) > 1 and matched_words_count < len(words_lower):
                         continue
                     
                     # ELASTIC title filter with fuzzy matching
@@ -1117,17 +1112,24 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                     # 3. Number of words matched
                     # 4. Proportion of search query matched
                     
-                    word_coverage_bonus = min(matched_words_count / max(len(words_lower), 1), 1.0)
-                    base_keyword_score = 0.5  # Lower base for keywords
+                    # Calculate score based on match quality
+                    word_coverage = matched_words_count / max(len(words_lower), 1)
+                    match_quality = best_fuzzy_score / max(best_field_weight, 1.0)
                     
-                    # Score = base + (match_quality * field_weight * word_coverage)
-                    final_score = base_keyword_score + (
-                        (best_fuzzy_score / max(best_field_weight, 1.0)) * 0.3 * (1 + word_coverage_bonus)
-                    )
+                    # Score formula: quality * coverage * field_weight
+                    final_score = match_quality * word_coverage * 0.7
                     
-                    # Boost for multi-word title matches (very strong signal)
-                    if matched_field == "video_title" and matched_words_count >= 3:
-                        final_score = min(final_score + 0.4, 1.0)
+                    # Boost for exact text matches
+                    if match_quality >= 1.0:
+                        final_score += 0.15
+                    
+                    # Boost for title matches
+                    if matched_field == "video_title":
+                        final_score = min(final_score + 0.15, 1.0)
+                    
+                    # Must meet minimum score threshold
+                    if final_score < min_score:
+                        continue
                     
                     keyword_results.append({
                         "id": p.id,
@@ -1191,30 +1193,22 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
         merged_list = rerank_with_cohere(query_text, merged_list, top_k=min(len(merged_list), top_k * 3))
         logger.info(f"Reranking complete, top score: {merged_list[0].get('score', 0):.4f}")
     
-    # Group by video and take top segments per video to diversify results
+    # Group by video and collect ALL matching segments per video
     videos_seen = {}
     final_results = []
     
     for result in merged_list:
-        video_id = result.get("video_id")
-        if video_id not in videos_seen:
-            videos_seen[video_id] = []
+        vid = result.get("video_id")
+        if vid not in videos_seen:
+            videos_seen[vid] = 0
         
-        # Keep top 3 segments per video
-        if len(videos_seen[video_id]) < 3:
-            videos_seen[video_id].append(result)
+        # Keep up to 10 segments per video for better context
+        if videos_seen[vid] < 10:
+            videos_seen[vid] += 1
             final_results.append(result)
         
         if len(final_results) >= top_k:
             break
-    
-    # If we don't have enough results, add more from videos we've already seen
-    if len(final_results) < top_k:
-        for result in merged_list:
-            if result not in final_results:
-                final_results.append(result)
-                if len(final_results) >= top_k:
-                    break
     
     logger.info(f"Search completed: {len(semantic_results)} semantic + {len(keyword_results)} keyword = {len(final_results)} merged results from {len(videos_seen)} videos")
 
