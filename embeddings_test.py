@@ -43,8 +43,8 @@ if not QDRANT_URL or not QDRANT_API_KEY:
 
 # Configure embedding strategy
 USE_OPENAI_EMBEDDINGS = os.getenv("USE_OPENAI_EMBEDDINGS", "true").lower() == "true"
-OPENAI_EMBEDDING_MODEL = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-large")  # or text-embedding-3-small
-EMBEDDING_DIMENSION = int(os.getenv("EMBEDDING_DIMENSION", "3072" if OPENAI_EMBEDDING_MODEL == "text-embedding-3-large" else "1536"))
+OPENAI_EMBEDDING_MODEL = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-large")  # Using large model for best quality
+EMBEDDING_DIMENSION = int(os.getenv("EMBEDDING_DIMENSION", "3072"))  # 3072 dimensions for text-embedding-3-large
 
 # Initialize OpenAI client if enabled
 openai_client = None

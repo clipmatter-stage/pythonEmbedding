@@ -18,6 +18,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application code
 COPY embeddings_test.py .
+COPY migrate_to_3072.py .
 COPY start.sh .
 
 # Make startup script executable
