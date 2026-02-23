@@ -1073,6 +1073,7 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
     semantic_results = []
     keyword_results = []
     speaker_results = []  # New: results from speaker-only scroll search
+    title_results = []    # Results from title fuzzy matching
     
     # Strategy 0: Speaker-only search (no query, no words - just find all segments by speaker)
     # This handles the case where user clicks "Speaker Search" toggle without typing anything,
@@ -1448,11 +1449,179 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
             logger.info(f"ERROR during keyword search: {str(e)}")
             raise HTTPException(status_code=500, detail=f"Keyword search error: {str(e)}")
 
-    # Merge results - combine semantic, keyword, and speaker matches
+    # Strategy 3: Title matching — fuzzy-match the query text against video titles
+    # This ensures that searching for a video title always returns results even when
+    # the semantic vector of the title text doesn't match transcript embeddings.
+    # Runs for EVERY search that has a query, words, or title_filter.
+    title_query = query_text or (" ".join(words) if words else "") or title_filter or ""
+    if title_query and len(title_query.strip()) >= 3:
+        try:
+            logger.info(f"Title matching search for: '{title_query[:120]}'")
+            
+            # Also check the translated query from LLM understanding
+            title_queries = [title_query]
+            if query_intent:
+                translated = query_intent.get("semantic_query_translated", "")
+                if translated and translated.strip().lower() != title_query.strip().lower():
+                    title_queries.append(translated)
+            
+            # Collect video_ids already in semantic/keyword results to avoid duplicating low-value segments
+            existing_ids = set()
+            for r in semantic_results:
+                existing_ids.add(r["id"])
+            for r in keyword_results:
+                existing_ids.add(r["id"])
+            for r in speaker_results:
+                existing_ids.add(r["id"])
+            
+            # Track which videos matched by title to collect their segments
+            matched_video_ids = set()
+            matched_video_scores = {}  # video_id -> best title match score
+            
+            offset = None
+            scanned = 0
+            max_scan_title = min(max_scanned, 50000)
+            seen_titles = {}  # video_id -> video_title (to avoid re-checking same video)
+            
+            while scanned < max_scan_title:
+                points, next_offset = qdrant_client.scroll(
+                    collection_name=SEGMENTS_COLLECTION,
+                    scroll_filter=search_filter,
+                    limit=min(1000, max_scan_title - scanned),
+                    offset=offset,
+                    with_payload=True,
+                    with_vectors=False
+                )
+                
+                if not points:
+                    break
+                
+                for p in points:
+                    scanned += 1
+                    payload = p.payload or {}
+                    vid = payload.get("video_id")
+                    video_title = payload.get("video_title", "")
+                    
+                    # Skip if we've already determined this video's title match status
+                    if vid in seen_titles:
+                        # If this video already matched, collect the segment
+                        if vid in matched_video_ids and p.id not in existing_ids:
+                            spk = payload.get("speaker", "")
+                            diar_spk = payload.get("diarization_speaker", "")
+                            
+                            # Apply speaker filter if present
+                            if speaker_filter:
+                                speaker_combined = f"{spk} {diar_spk}".strip()
+                                if not fuzzy_match_speaker(speaker_filter, speaker_combined, threshold=70):
+                                    continue
+                            
+                            title_results.append({
+                                "id": p.id,
+                                "score": round(matched_video_scores.get(vid, 0.7), 4),
+                                "video_id": vid,
+                                "video_title": video_title,
+                                "speaker": spk,
+                                "diarization_speaker": diar_spk,
+                                "start_time": payload.get("start_time", 0),
+                                "end_time": payload.get("end_time", 0),
+                                "duration": round((payload.get("end_time", 0) - payload.get("start_time", 0)), 2),
+                                "text": payload.get("text", ""),
+                                "text_length": payload.get("text_length", 0),
+                                "youtube_url": payload.get("youtube_url", ""),
+                                "language": payload.get("language", ""),
+                                "created_at": payload.get("created_at"),
+                                "match_types": ["title_match"],
+                                "fuzzy_score": round(matched_video_scores.get(vid, 0.7), 2),
+                                "matched_field": "video_title",
+                            })
+                        continue
+                    
+                    # First time seeing this video — check title match
+                    seen_titles[vid] = video_title
+                    
+                    if not video_title:
+                        continue
+                    
+                    # Check each title query variation
+                    best_title_score = 0
+                    for tq in title_queries:
+                        tq_lower = tq.lower().strip()
+                        vt_lower = video_title.lower().strip()
+                        
+                        # Exact substring
+                        if tq_lower in vt_lower or vt_lower in tq_lower:
+                            best_title_score = max(best_title_score, 0.95)
+                        else:
+                            # Fuzzy match
+                            partial = fuzz.partial_ratio(tq_lower, vt_lower) / 100
+                            ratio = fuzz.ratio(tq_lower, vt_lower) / 100
+                            token_sort = fuzz.token_sort_ratio(tq_lower, vt_lower) / 100
+                            score = max(partial, ratio, token_sort)
+                            best_title_score = max(best_title_score, score)
+                    
+                    # Threshold for title match — 55% for longer queries, 70% for short ones
+                    threshold = 0.55 if len(title_query) >= 8 else 0.70
+                    
+                    if best_title_score >= threshold:
+                        matched_video_ids.add(vid)
+                        matched_video_scores[vid] = min(best_title_score, 0.98)
+                        
+                        # Add this segment if not already in other results
+                        if p.id not in existing_ids:
+                            spk = payload.get("speaker", "")
+                            diar_spk = payload.get("diarization_speaker", "")
+                            
+                            if speaker_filter:
+                                speaker_combined = f"{spk} {diar_spk}".strip()
+                                if not fuzzy_match_speaker(speaker_filter, speaker_combined, threshold=70):
+                                    continue
+                            
+                            title_results.append({
+                                "id": p.id,
+                                "score": round(matched_video_scores[vid], 4),
+                                "video_id": vid,
+                                "video_title": video_title,
+                                "speaker": spk,
+                                "diarization_speaker": diar_spk,
+                                "start_time": payload.get("start_time", 0),
+                                "end_time": payload.get("end_time", 0),
+                                "duration": round((payload.get("end_time", 0) - payload.get("start_time", 0)), 2),
+                                "text": payload.get("text", ""),
+                                "text_length": payload.get("text_length", 0),
+                                "youtube_url": payload.get("youtube_url", ""),
+                                "language": payload.get("language", ""),
+                                "created_at": payload.get("created_at"),
+                                "match_types": ["title_match"],
+                                "fuzzy_score": round(best_title_score, 2),
+                                "matched_field": "video_title",
+                            })
+                
+                # Stop early if we found enough title-matched segments
+                if len(title_results) >= top_k * 2:
+                    break
+                    
+                offset = next_offset
+                if not next_offset:
+                    break
+            
+            logger.info(f"Title matching found {len(title_results)} segments from {len(matched_video_ids)} videos (scanned {scanned} points, checked {len(seen_titles)} unique videos)")
+            
+        except Exception as e:
+            logger.warning(f"Title matching search error (non-fatal): {e}")
+
+    # Merge results - combine semantic, keyword, speaker, and title matches
     merged = {}
     
     for r in speaker_results:
         merged[r["id"]] = r
+    
+    for r in title_results:
+        if r["id"] in merged:
+            if "title_match" not in merged[r["id"]]["match_types"]:
+                merged[r["id"]]["match_types"].append("title_match")
+            merged[r["id"]]["score"] = max(merged[r["id"]]["score"], r["score"])
+        else:
+            merged[r["id"]] = r
     
     for r in semantic_results:
         if r["id"] in merged:
@@ -1502,7 +1671,7 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
         if len(final_results) >= top_k:
             break
     
-    logger.info(f"Search completed: {len(speaker_results)} speaker + {len(semantic_results)} semantic + {len(keyword_results)} keyword = {len(final_results)} merged results from {len(videos_seen)} videos")
+    logger.info(f"Search completed: {len(speaker_results)} speaker + {len(semantic_results)} semantic + {len(keyword_results)} keyword + {len(title_results)} title = {len(final_results)} merged results from {len(videos_seen)} videos")
 
     return {
         "query": query_text,
@@ -1512,6 +1681,7 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
         "total_speaker_hits": len(speaker_results),
         "total_semantic_hits": len(semantic_results),
         "total_keyword_hits": len(keyword_results),
+        "total_title_hits": len(title_results),
         "returned":  len(final_results),
         "unique_videos": len(videos_seen),
         "filters_applied": {
