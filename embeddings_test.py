@@ -1722,23 +1722,25 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
             {
                 "id": r["id"],
                 "score": round(r["score"], 4),
-                "match_types": r. get("match_types", []),
+                "match_types": r.get("match_types", []),
                 "matched_field": r.get("matched_field", ""),
+                "fuzzy_score": round(r.get("fuzzy_score", 0), 4),
+                "matched_words_count": r.get("matched_words_count", 0),
                 "video_id": r.get("video_id"),
                 "video_title": r.get("video_title", ""),
                 "speaker": r.get("speaker", ""),
-                "diarization_speaker": r. get("diarization_speaker", ""),
+                "diarization_speaker": r.get("diarization_speaker", ""),
                 "start_time": r.get("start_time", 0),
-                "end_time":  r.get("end_time", 0),
+                "end_time": r.get("end_time", 0),
                 "duration": r.get("duration", 0),
-                "text": r. get("text", ""),
-                "text_length": r. get("text_length", 0),
+                "text": r.get("text", ""),
+                "text_length": r.get("text_length", 0),
                 "summary_en": r.get("summary_en", ""),
                 "youtube_url": r.get("youtube_url", ""),
                 "language": r.get("language", ""),
                 "created_at": r.get("created_at"),
                 "llm_relevance_score": r.get("llm_relevance_score"),
-                "youtube_url_timestamped": f"{r. get('youtube_url', '')}?t={int(r.get('start_time', 0))}" if r.get('youtube_url') else ""
+                "youtube_url_timestamped": f"{r.get('youtube_url', '')}?t={int(r.get('start_time', 0))}" if r.get('youtube_url') else ""
             }
             for r in final_results
         ]
