@@ -1,7 +1,7 @@
 from fastapi import FastAPI, HTTPException, Depends, Security, Request
 from fastapi.security import APIKeyHeader
 from fastapi.middleware.cors import CORSMiddleware
-from sentence_transformers import SentenceTransformer
+from fastembed import TextEmbedding
 from qdrant_client import models, QdrantClient
 from qdrant_client.models import Distance, VectorParams, PointStruct, Filter, FieldCondition, MatchValue, MatchText, SearchParams, ScoredPoint
 import uuid
@@ -22,6 +22,7 @@ import openai
 from openai import OpenAI
 import tiktoken
 import asyncio
+import json as json_module
 
 # ============== LOGGING CONFIGURATION ==============
 logging.basicConfig(
@@ -164,16 +165,23 @@ app.add_middleware(
 # Cache for query embeddings (max 1000 queries, 1 hour TTL)
 embedding_cache = TTLCache(maxsize=1000, ttl=3600)
 
-logger.info("Loading sentence-transformers model...")
-model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
-logger.info("Model loaded successfully")
+# ============== FASTEMBED MODEL (lightweight CPU fallback) ==============
+# FastEmbed: ~200MB RAM vs ~2GB for sentence-transformers+PyTorch
+# BAAI/bge-small-en-v1.5 is fast and English-focused (384-dim)
+# Used ONLY as fallback when OpenAI API is unavailable
+FASTEMBED_MODEL_NAME = os.getenv("FASTEMBED_MODEL", "BAAI/bge-small-en-v1.5")
+FASTEMBED_DIMENSION = 384  # Dimension for bge-small-en-v1.5
 
-logger.info("Warming up model...")
-_ = model.encode("warmup text", show_progress_bar=False)
-logger.info("Model warmed up and ready")
+logger.info(f"Loading FastEmbed model: {FASTEMBED_MODEL_NAME}...")
+fastembed_model = TextEmbedding(model_name=FASTEMBED_MODEL_NAME)
+logger.info("FastEmbed model loaded successfully")
 
-# Store reference to sentence-transformer model for fallback in get_openai_embedding
-_st_model = model
+logger.info("Warming up FastEmbed model...")
+_ = list(fastembed_model.embed(["warmup text"]))
+logger.info("FastEmbed model warmed up and ready")
+
+# Reference for fallback in get_openai_embedding
+_fallback_model = fastembed_model
 
 # ============== ADVANCED EMBEDDING FUNCTIONS ==============
 
@@ -200,10 +208,12 @@ def get_openai_embedding(text: str, model_name: str = None) -> List[float]:
         return response.data[0].embedding
     except Exception as e:
         logger.error(f"OpenAI embedding error: {str(e)}")
-        # Fallback to sentence-transformers (use the global _st_model, not the shadowed param)
-        global _st_model
-        if _st_model is not None:
-            return _st_model.encode(text, show_progress_bar=False).tolist()
+        # Fallback to FastEmbed (lightweight CPU model)
+        global _fallback_model
+        if _fallback_model is not None:
+            logger.warning("Falling back to FastEmbed for embedding")
+            result = list(_fallback_model.embed([text]))
+            return result[0].tolist() if hasattr(result[0], 'tolist') else list(result[0])
         raise
 
 def get_openai_embeddings_batch(texts: List[str], model_name: str = None) -> List[List[float]]:
@@ -230,77 +240,198 @@ def get_openai_embeddings_batch(texts: List[str], model_name: str = None) -> Lis
         return embeddings
     except Exception as e:
         logger.error(f"OpenAI batch embedding error: {str(e)}")
-        # Fallback to sentence-transformers
-        return model.encode(texts, show_progress_bar=False, batch_size=32).tolist()
+        # Fallback to FastEmbed
+        logger.warning("Falling back to FastEmbed for batch embedding")
+        results = list(fastembed_model.embed(texts))
+        return [r.tolist() if hasattr(r, 'tolist') else list(r) for r in results]
 
 def expand_query_with_gpt(query: str) -> List[str]:
     """
-    Use GPT to expand search query with synonyms and related terms.
-    This dramatically improves search recall.
+    DEPRECATED: Use understand_query() instead.
+    Kept for backward compatibility.
     """
     if not openai_client or not query.strip():
         return [query]
+    result = understand_query(query)
+    variations = [result.get("semantic_query", query)]
+    if result.get("semantic_query_translated"):
+        variations.append(result["semantic_query_translated"])
+    variations.extend(result.get("expanded_terms", [])[:3])
+    return variations[:5]
+
+
+def understand_query(query: str) -> Dict:
+    """
+    LLM-powered query understanding using GPT-4o-mini.
+    Replaces simple query expansion with structured intent parsing.
+    Handles Urdu, English, and mixed queries.
+    """
+    # Check cache first
+    cache_key = f"intent_{query.strip().lower()[:500]}"
+    if cache_key in embedding_cache:
+        return embedding_cache[cache_key]
+    
+    default_result = {
+        "semantic_query": query,
+        "semantic_query_translated": "",
+        "detected_language": "unknown",
+        "extracted_speaker": None,
+        "extracted_keywords": query.split(),
+        "expanded_terms": [],
+        "query_type": "general"
+    }
+    
+    if not openai_client or not query.strip():
+        return default_result
     
     try:
-        # Quick query expansion
         response = openai_client.chat.completions.create(
-            model="gpt-3.5-turbo",
+            model="gpt-4o-mini",
             messages=[
-                {"role": "system", "content": "You are a search query expansion assistant. Given a search query, provide 3-5 alternative phrasings, synonyms, and related terms that would help find relevant content. Return ONLY the alternatives, one per line, no explanations."},
-                {"role": "user", "content": f"Expand this search query: {query}"}
-            ],
-            max_tokens=100,
-            temperature=0.3
-        )
-        
-        expanded = response.choices[0].message.content.strip().split("\n")
-        expanded = [q.strip() for q in expanded if q.strip()]
-        
-        # Include original query
-        all_queries = [query] + expanded
-        return all_queries[:5]  # Limit to 5 total
-    except Exception as e:
-        logger.warning(f"Query expansion error: {str(e)}")
-        return [query]
+                {"role": "system", "content": """You are a multilingual search query analyzer for a video transcript search engine.
+Content is primarily in Urdu with some English. Given a user query (may be Urdu, English, Roman Urdu, or mixed), extract structured search intent.
 
-def rerank_with_cohere(query: str, results: List[Dict], top_k: int = 10) -> List[Dict]:
-    """
-    Use Cohere's reranking API to improve result relevance.
-    This is one of the most powerful ways to improve search accuracy.
-    """
-    try:
-        import cohere
-        cohere_api_key = os.getenv("COHERE_API_KEY")
-        
-        if not cohere_api_key or not results:
-            return results[:top_k]
-        
-        co = cohere.Client(cohere_api_key)
-        
-        # Prepare documents for reranking
-        documents = [r.get("text", "") for r in results]
-        
-        # Rerank
-        rerank_response = co.rerank(
-            query=query,
-            documents=documents,
-            top_n=top_k,
-            model="rerank-english-v3.0"
+Return ONLY valid JSON with these fields:
+- semantic_query: the core search meaning (keep original language)
+- semantic_query_translated: translate to the OTHER language (Urdu→English, English→Urdu transliteration, if same language leave empty)
+- detected_language: "urdu" | "english" | "roman_urdu" | "mixed"
+- extracted_speaker: person name if mentioned, else null
+- extracted_keywords: array of key terms for keyword matching
+- expanded_terms: 3-5 synonyms/related terms in BOTH languages (mix of Urdu and English)
+- query_type: "speaker_search" | "topic_search" | "quote_search" | "general"
+
+Examples:
+Query: "Hafiz Naeem election speech"
+{"semantic_query": "Hafiz Naeem election speech", "semantic_query_translated": "حافظ نعیم الیکشن تقریر", "detected_language": "english", "extracted_speaker": "Hafiz Naeem", "extracted_keywords": ["election", "speech"], "expanded_terms": ["انتخابات", "vote", "ووٹ", "political rally", "سیاسی جلسہ"], "query_type": "speaker_search"}
+
+Query: "ملک کے حالات"
+{"semantic_query": "ملک کے حالات", "semantic_query_translated": "situation of the country", "detected_language": "urdu", "extracted_speaker": null, "extracted_keywords": ["ملک", "حالات"], "expanded_terms": ["country situation", "Pakistan crisis", "پاکستان", "معیشت", "economy"], "query_type": "topic_search"}"""},
+                {"role": "user", "content": f"Analyze this search query: {query}"}
+            ],
+            max_tokens=300,
+            temperature=0.1,
+            response_format={"type": "json_object"}
         )
         
-        # Reorder results based on rerank scores
-        reranked = []
-        for result in rerank_response.results:
-            original_result = results[result.index].copy()
-            # Update score with rerank relevance score
-            original_result["score"] = result.relevance_score
-            original_result["rerank_score"] = result.relevance_score
-            original_result["match_types"] = original_result.get("match_types", []) + ["reranked"]
-            reranked.append(original_result)
+        result = json_module.loads(response.choices[0].message.content.strip())
         
-        return reranked
+        # Validate required fields exist
+        for key in ["semantic_query", "detected_language"]:
+            if key not in result:
+                result[key] = default_result[key]
+        
+        # Ensure arrays
+        if not isinstance(result.get("expanded_terms"), list):
+            result["expanded_terms"] = []
+        if not isinstance(result.get("extracted_keywords"), list):
+            result["extracted_keywords"] = query.split()
+        
+        # Cache result
+        embedding_cache[cache_key] = result
+        logger.info(f"Query understood: lang={result.get('detected_language')}, speaker={result.get('extracted_speaker')}, type={result.get('query_type')}")
+        return result
+        
     except Exception as e:
-        logger.warning(f"Reranking error: {str(e)}")
+        logger.warning(f"Query understanding error: {str(e)}")
+        return default_result
+
+
+def rerank_with_llm(query: str, results: List[Dict], top_k: int = 20) -> List[Dict]:
+    """
+    LLM-based reranking using GPT-4o-mini.
+    Replaces Cohere (English-only) with multilingual GPT-4o-mini reranker.
+    Handles Urdu, English, and mixed content properly.
+    """
+    if not openai_client or not results or not query.strip():
+        return results[:top_k]
+    
+    try:
+        # Take top 30 candidates for reranking (cost efficient)
+        candidates = results[:min(len(results), 30)]
+        
+        # Build compact document list for the LLM
+        docs = []
+        for i, r in enumerate(candidates):
+            text = r.get("text", "")[:200]  # Truncate for token efficiency
+            speaker = r.get("speaker", "")
+            title = r.get("video_title", "")
+            docs.append(f"[{i}] Speaker: {speaker} | Title: {title} | Text: {text}")
+        
+        docs_text = "\n".join(docs)
+        
+        response = openai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": """You are a search result relevance judge for a video transcript search engine.
+Content may be in Urdu, English, or mixed. Rate each transcript segment's relevance to the user's search query.
+
+Return ONLY valid JSON: {"scores": [{"i": 0, "s": 8}, {"i": 1, "s": 3}, ...]}
+Where "i" is the document index and "s" is relevance score 0-10.
+
+Scoring guide:
+- 10: Perfect match - directly answers the query
+- 7-9: Highly relevant - discusses the topic/person searched for
+- 4-6: Partially relevant - related but not directly about the query
+- 1-3: Marginally relevant - only loosely connected
+- 0: Not relevant at all
+
+Consider: semantic meaning, speaker match, topic match, language match (Urdu query should match Urdu content).
+Be strict - only give high scores to truly relevant results."""}, 
+                {"role": "user", "content": f"Search Query: {query}\n\nDocuments:\n{docs_text}"}
+            ],
+            max_tokens=500,
+            temperature=0.0,
+            response_format={"type": "json_object"}
+        )
+        
+        llm_result = json_module.loads(response.choices[0].message.content.strip())
+        scores = llm_result.get("scores", [])
+        
+        # Build score map
+        score_map = {}
+        for item in scores:
+            idx = item.get("i", item.get("index", -1))
+            score = item.get("s", item.get("score", 5))
+            if 0 <= idx < len(candidates):
+                score_map[idx] = score / 10.0  # Normalize to 0-1
+        
+        # Apply LLM scores
+        reranked = []
+        for i, r in enumerate(candidates):
+            result_copy = r.copy()
+            llm_score = score_map.get(i, 0.5)  # Default to 0.5 if not scored
+            
+            # Combined score: LLM (50%) + original semantic (30%) + keyword/fuzzy (20%)
+            original_score = result_copy.get("score", 0)
+            result_copy["llm_relevance_score"] = round(llm_score, 4)
+            result_copy["original_score"] = original_score
+            result_copy["score"] = round(
+                llm_score * 0.50 + original_score * 0.30 + result_copy.get("fuzzy_score", 0) * 0.20,
+                4
+            )
+            
+            if "match_types" not in result_copy:
+                result_copy["match_types"] = []
+            result_copy["match_types"].append("llm_reranked")
+            reranked.append(result_copy)
+        
+        # Filter out irrelevant results (LLM score < 0.3 = score < 3/10)
+        reranked = [r for r in reranked if r.get("llm_relevance_score", 0) >= 0.2]
+        
+        # Sort by new combined score
+        reranked.sort(key=lambda x: x.get("score", 0), reverse=True)
+        
+        # Add any remaining results that weren't reranked (beyond top 30)
+        reranked_ids = {r["id"] for r in reranked}
+        for r in results[30:]:
+            if r["id"] not in reranked_ids:
+                reranked.append(r)
+        
+        logger.info(f"LLM reranking: {len(candidates)} candidates -> {len(reranked)} results (filtered {len(candidates) - len([r for r in reranked if r.get('llm_relevance_score')])} irrelevant)")
+        return reranked[:top_k]
+        
+    except Exception as e:
+        logger.warning(f"LLM reranking error: {str(e)}")
         return results[:top_k]
 
 # ============== ELASTIC SEARCH HELPERS ==============
@@ -313,7 +444,9 @@ def get_cached_embedding(text: str) -> List[float]:
             logger.info(f"Using OpenAI embeddings for query")
             embedding_cache[cache_key] = get_openai_embedding(text)
         else:
-            embedding_cache[cache_key] = model.encode(text, show_progress_bar=False).tolist()
+            logger.info("Using FastEmbed for query embedding")
+            result = list(fastembed_model.embed([text]))
+            embedding_cache[cache_key] = result[0].tolist() if hasattr(result[0], 'tolist') else list(result[0])
     return embedding_cache[cache_key]
 
 def fuzzy_match_text(query: str, text: str, threshold: int = 65) -> bool:
@@ -396,13 +529,14 @@ def expand_query_variations(query: str) -> List[str]:
 def calculate_combined_score(semantic_score: float, keyword_match: bool, fuzzy_score: float = 0) -> float:
     """
     Calculate combined relevance score.
-    Weights: semantic=0.6, keyword=0.25, fuzzy=0.15
+    FIXED: No longer caps semantic score at 0.6.
+    Semantic is the primary signal, keyword and fuzzy are bonuses.
     """
-    base_score = semantic_score * 0.6
+    base_score = semantic_score * 0.80  # Semantic is primary
     if keyword_match:
-        base_score += 0.25
+        base_score += 0.12
     if fuzzy_score > 0:
-        base_score += fuzzy_score * 0.15
+        base_score += fuzzy_score * 0.08
     return min(base_score, 1.0)  # Cap at 1.0
 
 # ============== END ELASTIC SEARCH HELPERS ==============
@@ -483,6 +617,10 @@ def ensure_indexes_http():
             {"field_name": "language", "field_schema": "keyword"},
             {"field_name":  "start_time", "field_schema": "float"},
             {"field_name": "end_time", "field_schema": "float"},
+            # NEW: Full-text index on transcript text for keyword search
+            {"field_name": "text", "field_schema": {"type": "text", "tokenizer": "word", "min_token_len": 2, "max_token_len": 30, "lowercase": True}},
+            # NEW: Full-text index on summary_en for cross-language keyword search
+            {"field_name": "summary_en", "field_schema": {"type": "text", "tokenizer": "word", "min_token_len": 2, "max_token_len": 30, "lowercase": True}},
         ]
         
         headers = {
@@ -612,7 +750,20 @@ async def embed_video(data: EmbedVideoRequest, authorized: bool = Depends(verify
                 segments_without_text += 1
                 continue
             
-            texts_to_embed.append(text)
+            # BUILD ENRICHED EMBEDDING TEXT — includes speaker, title, language context
+            # This makes vector search find segments by speaker name and video context
+            enriched_parts = []
+            if speaker and speaker != "UNKNOWN":
+                enriched_parts.append(f"[Speaker: {speaker}]")
+            if video_title:
+                enriched_parts.append(f"[Title: {video_title}]")
+            if language:
+                enriched_parts.append(f"[Language: {language}]")
+            enriched_parts.append(text)
+            
+            enriched_text = " ".join(enriched_parts)
+            
+            texts_to_embed.append(enriched_text)
             segment_metadata.append({
                 'idx': idx,
                 'speaker':  speaker,
@@ -621,7 +772,8 @@ async def embed_video(data: EmbedVideoRequest, authorized: bool = Depends(verify
                 'start_time': start_time,
                 'end_time': end_time,
                 'confidence': confidence,
-                'text': text
+                'text': text,
+                'enriched_text': enriched_text
             })
         
         if not texts_to_embed: 
@@ -633,13 +785,52 @@ async def embed_video(data: EmbedVideoRequest, authorized: bool = Depends(verify
         logger.info(f"Generating embeddings for {len(texts_to_embed)} segments in batch...")
         batch_start_time = datetime.utcnow()
         
-        # Use OpenAI embeddings if enabled, otherwise use sentence-transformers
+        # Use OpenAI embeddings if enabled, otherwise use FastEmbed
         if USE_OPENAI_EMBEDDINGS and openai_client:
             logger.info(f"Using OpenAI {OPENAI_EMBEDDING_MODEL} for batch embedding")
             vectors = get_openai_embeddings_batch(texts_to_embed)
         else:
-            logger.info("Using sentence-transformers for batch embedding")
-            vectors = model.encode(texts_to_embed, show_progress_bar=False, batch_size=32).tolist()
+            logger.info("Using FastEmbed for batch embedding")
+            results_list = list(fastembed_model.embed(texts_to_embed))
+            vectors = [r.tolist() if hasattr(r, 'tolist') else list(r) for r in results_list]
+        
+        # GENERATE LLM ENGLISH SUMMARIES for non-English segments (bilingual bridge)
+        summaries_en = {}
+        if openai_client and language and language.lower() not in ["english", "en"]:
+            try:
+                logger.info(f"Generating English summaries for {len(segment_metadata)} segments...")
+                # Process in batches of 20 for efficiency
+                for batch_start in range(0, len(segment_metadata), 20):
+                    batch_end = min(batch_start + 20, len(segment_metadata))
+                    batch_texts = []
+                    for m in segment_metadata[batch_start:batch_end]:
+                        batch_texts.append(f"[{m['idx']}] {m['text'][:300]}")
+                    
+                    prompt_text = "\n".join(batch_texts)
+                    summary_response = openai_client.chat.completions.create(
+                        model="gpt-4o-mini",
+                        messages=[
+                            {"role": "system", "content": "Translate/summarize each numbered transcript segment into a brief English summary (1 line each). Return one summary per line, prefixed with the segment number in brackets. Keep it concise."},
+                            {"role": "user", "content": prompt_text}
+                        ],
+                        max_tokens=1000,
+                        temperature=0.1
+                    )
+                    
+                    # Parse summaries
+                    for line in summary_response.choices[0].message.content.strip().split("\n"):
+                        line = line.strip()
+                        if line and "[" in line:
+                            try:
+                                idx_str = line.split("]")[0].replace("[", "").strip()
+                                summary_text = "]".join(line.split("]")[1:]).strip().lstrip("- :")
+                                summaries_en[int(idx_str)] = summary_text
+                            except (ValueError, IndexError):
+                                pass
+                
+                logger.info(f"Generated {len(summaries_en)} English summaries")
+            except Exception as e:
+                logger.warning(f"Summary generation failed (non-critical): {str(e)}")
         
         batch_end_time = datetime.utcnow()
         batch_duration = (batch_end_time - batch_start_time).total_seconds()
@@ -649,6 +840,9 @@ async def embed_video(data: EmbedVideoRequest, authorized: bool = Depends(verify
             vector = vectors[i]
             id_string = f"video_{video_id}_seg_{metadata['idx']}"
             point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, id_string))
+            
+            # Get English summary if available
+            summary_en = summaries_en.get(metadata['idx'], "")
             
             payload = {
                 "video_id": video_id,
@@ -666,6 +860,8 @@ async def embed_video(data: EmbedVideoRequest, authorized: bool = Depends(verify
                 "text": metadata['text'],
                 "text_length": len(metadata['text']),
                 "confidence": metadata['confidence'],
+                "summary_en": summary_en,  # NEW: English summary for cross-language search
+                "enriched_text": metadata.get('enriched_text', metadata['text']),  # NEW: context-rich text
                 "created_at": datetime.utcnow().isoformat()
             }
             
@@ -732,7 +928,9 @@ async def embed(data: dict):
     if not text:
         raise HTTPException(status_code=400, detail="Text is required")
     
-    vector = model.encode(text).tolist()
+    # Use FastEmbed for legacy endpoint
+    result = list(fastembed_model.embed([text]))
+    vector = result[0].tolist() if hasattr(result[0], 'tolist') else list(result[0])
     vector_id = f"video_{video_id}_{uuid.uuid4()}" if video_id else str(uuid.uuid4())
 
     metadata = {
@@ -801,9 +999,23 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
     # Enable/disable advanced features via environment or request
     use_query_expansion = os.getenv("USE_QUERY_EXPANSION", "true").lower() == "true"
     use_reranking = os.getenv("USE_RERANKING", "true").lower() == "true"
+    use_llm_understanding = os.getenv("USE_LLM_UNDERSTANDING", "true").lower() == "true"
+    
+    # LLM QUERY UNDERSTANDING — parse intent, detect language, extract speaker
+    query_intent = None
+    if query_text and use_llm_understanding and openai_client:
+        try:
+            query_intent = understand_query(query_text)
+            logger.info(f"LLM intent: {query_intent.get('query_type')}, lang={query_intent.get('detected_language')}, speaker={query_intent.get('extracted_speaker')}")
+            
+            # Auto-extract speaker from query if not explicitly provided
+            if not speaker_filter and query_intent.get("extracted_speaker"):
+                speaker_filter = query_intent["extracted_speaker"]
+                logger.info(f"Auto-extracted speaker filter: {speaker_filter}")
+        except Exception as e:
+            logger.warning(f"LLM understanding failed, continuing without: {e}")
     
     # Speaker filter is ALWAYS used as a filter on the speaker/diarization_speaker fields.
-    # Never convert it to a text search - "Hafiz Naeem" is a valid speaker name.
     speaker_search_in_text = None  # Not used anymore
     
     # Handle backward compatibility for single word
@@ -944,18 +1156,33 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
         try:
             logger.info(f"Semantic search for: '{query_text[:120]}'")
             
-            # Query expansion using GPT (only for longer queries where it helps)
+            # Build query variations using LLM understanding
             query_variations = [query_text]
-            if use_query_expansion and openai_client and len(query_text.split()) >= 3:
+            
+            if query_intent:
+                # Add translated query for cross-language search
+                translated = query_intent.get("semantic_query_translated", "")
+                if translated and translated.strip() and translated.strip().lower() != query_text.strip().lower():
+                    query_variations.append(translated)
+                    logger.info(f"Added cross-language query: {translated[:80]}")
+                
+                # Add expanded terms as additional search queries
+                expanded_terms = query_intent.get("expanded_terms", [])
+                if expanded_terms:
+                    # Join expanded terms into a single query phrase (more efficient)
+                    expansion_query = " ".join(expanded_terms[:3])
+                    if expansion_query.strip() and expansion_query != query_text:
+                        query_variations.append(expansion_query)
+                        logger.info(f"Added expansion query: {expansion_query[:80]}")
+            elif use_query_expansion and openai_client and len(query_text.split()) >= 3:
+                # Fallback to old-style expansion if LLM understanding not available
                 try:
-                    logger.info("Expanding query with GPT...")
                     expanded = expand_query_with_gpt(query_text)
-                    # Only keep expansions, limit to 3 total
                     query_variations = expanded[:3]
-                    logger.info(f"Query expanded to {len(query_variations)} variations")
                 except Exception as e:
-                    logger.warning(f"Query expansion failed, using original: {e}")
-                    query_variations = [query_text]
+                    logger.warning(f"Query expansion failed: {e}")
+            
+            logger.info(f"Total query variations: {len(query_variations)}")
             
             # Search with all query variations
             all_semantic_results = {}  # Use dict to deduplicate by ID
@@ -1249,11 +1476,14 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
         reverse=True
     )
     
-    # ADVANCED: Apply reranking if enabled (this dramatically improves relevance)
+    # ADVANCED: Apply LLM reranking if enabled (replaces Cohere English-only reranker)
     if use_reranking and query_text and len(merged_list) > 0:
-        logger.info(f"Applying reranking to {len(merged_list)} results...")
-        merged_list = rerank_with_cohere(query_text, merged_list, top_k=min(len(merged_list), top_k * 3))
-        logger.info(f"Reranking complete, top score: {merged_list[0].get('score', 0):.4f}")
+        logger.info(f"Applying LLM reranking to {len(merged_list)} results...")
+        merged_list = rerank_with_llm(query_text, merged_list, top_k=min(len(merged_list), top_k * 3))
+        if merged_list:
+            logger.info(f"LLM reranking complete, top score: {merged_list[0].get('score', 0):.4f}")
+        else:
+            logger.info("LLM reranking returned no results")
     
     # Group by video and collect ALL matching segments per video
     videos_seen = {}
@@ -1307,9 +1537,11 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                 "duration": r.get("duration", 0),
                 "text": r. get("text", ""),
                 "text_length": r. get("text_length", 0),
+                "summary_en": r.get("summary_en", ""),
                 "youtube_url": r.get("youtube_url", ""),
                 "language": r.get("language", ""),
                 "created_at": r.get("created_at"),
+                "llm_relevance_score": r.get("llm_relevance_score"),
                 "youtube_url_timestamped": f"{r. get('youtube_url', '')}?t={int(r.get('start_time', 0))}" if r.get('youtube_url') else ""
             }
             for r in final_results
@@ -1402,7 +1634,7 @@ async def search_multi_video(data: dict):
     
     logger.info(f"Searching across {len(video_ids)} videos for: '{query_text[: 100]}'")
     
-    query_vector = model.encode(query_text).tolist()
+    query_vector = get_cached_embedding(query_text)
     
     try:
         search_filter = Filter(
@@ -1568,6 +1800,158 @@ async def suggest(data: SuggestRequest, authorized: bool = Depends(verify_api_ke
         logger.info(f"ERROR in suggest: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
+@app.post("/re-embed-all")
+async def re_embed_all(authorized: bool = Depends(verify_api_key)):
+    """
+    Re-embed all existing segments with enriched context text and English summaries.
+    Processes in batches of 200. This is an admin endpoint - run once after deployment.
+    Requires API key.
+    """
+    try:
+        logger.info("Starting re-embedding of all segments with enriched text...")
+        
+        total_processed = 0
+        total_updated = 0
+        total_errors = 0
+        offset = None
+        batch_size = 200
+        
+        while True:
+            # Scroll through all points
+            points, next_offset = qdrant_client.scroll(
+                collection_name=SEGMENTS_COLLECTION,
+                limit=batch_size,
+                offset=offset,
+                with_payload=True,
+                with_vectors=False
+            )
+            
+            if not points:
+                break
+            
+            texts_to_embed = []
+            points_to_update = []
+            
+            for p in points:
+                total_processed += 1
+                payload = p.payload or {}
+                text = payload.get("text", "")
+                speaker = payload.get("speaker", "UNKNOWN")
+                video_title = payload.get("video_title", "")
+                language = payload.get("language", "")
+                
+                if not text or len(text.strip()) < 3:
+                    continue
+                
+                # Build enriched embedding text
+                enriched_parts = []
+                if speaker and speaker != "UNKNOWN":
+                    enriched_parts.append(f"[Speaker: {speaker}]")
+                if video_title:
+                    enriched_parts.append(f"[Title: {video_title}]")
+                if language:
+                    enriched_parts.append(f"[Language: {language}]")
+                enriched_parts.append(text)
+                enriched_text = " ".join(enriched_parts)
+                
+                texts_to_embed.append(enriched_text)
+                points_to_update.append({
+                    "id": p.id,
+                    "payload": payload,
+                    "enriched_text": enriched_text
+                })
+            
+            if not texts_to_embed:
+                offset = next_offset
+                if not next_offset:
+                    break
+                continue
+            
+            # Generate new embeddings
+            try:
+                if USE_OPENAI_EMBEDDINGS and openai_client:
+                    vectors = get_openai_embeddings_batch(texts_to_embed)
+                else:
+                    results_list = list(fastembed_model.embed(texts_to_embed))
+                    vectors = [r.tolist() if hasattr(r, 'tolist') else list(r) for r in results_list]
+                
+                # Generate English summaries for non-English content
+                summaries = {}
+                non_english_texts = []
+                non_english_indices = []
+                for i, pt in enumerate(points_to_update):
+                    lang = pt["payload"].get("language", "")
+                    if lang and lang.lower() not in ["english", "en"]:
+                        non_english_texts.append(f"[{i}] {pt['payload'].get('text', '')[:300]}")
+                        non_english_indices.append(i)
+                
+                if non_english_texts and openai_client:
+                    try:
+                        for batch_start in range(0, len(non_english_texts), 20):
+                            batch = non_english_texts[batch_start:batch_start + 20]
+                            summary_resp = openai_client.chat.completions.create(
+                                model="gpt-4o-mini",
+                                messages=[
+                                    {"role": "system", "content": "Translate/summarize each numbered transcript segment into a brief English summary (1 line each). Prefix with the segment number in brackets."},
+                                    {"role": "user", "content": "\n".join(batch)}
+                                ],
+                                max_tokens=1000,
+                                temperature=0.1
+                            )
+                            for line in summary_resp.choices[0].message.content.strip().split("\n"):
+                                line = line.strip()
+                                if line and "[" in line:
+                                    try:
+                                        idx_str = line.split("]")[0].replace("[", "").strip()
+                                        summary_text = "]".join(line.split("]")[1:]).strip().lstrip("- :")
+                                        summaries[int(idx_str)] = summary_text
+                                    except (ValueError, IndexError):
+                                        pass
+                    except Exception as e:
+                        logger.warning(f"Summary generation failed in re-embed: {str(e)}")
+                
+                # Upsert updated points
+                new_points = []
+                for i, pt in enumerate(points_to_update):
+                    updated_payload = pt["payload"].copy()
+                    updated_payload["enriched_text"] = pt["enriched_text"]
+                    updated_payload["summary_en"] = summaries.get(i, updated_payload.get("summary_en", ""))
+                    
+                    new_points.append(PointStruct(
+                        id=pt["id"],
+                        vector=vectors[i],
+                        payload=updated_payload
+                    ))
+                
+                qdrant_client.upsert(
+                    collection_name=SEGMENTS_COLLECTION,
+                    points=new_points,
+                    wait=True
+                )
+                total_updated += len(new_points)
+                logger.info(f"Re-embedded batch: {total_updated}/{total_processed} processed")
+                
+            except Exception as e:
+                total_errors += 1
+                logger.error(f"Error re-embedding batch: {str(e)}")
+            
+            offset = next_offset
+            if not next_offset:
+                break
+        
+        return {
+            "success": True,
+            "total_processed": total_processed,
+            "total_updated": total_updated,
+            "total_errors": total_errors,
+            "message": f"Re-embedded {total_updated} segments with enriched text and summaries"
+        }
+        
+    except Exception as e:
+        logger.error(f"Re-embed-all failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.delete("/video/{video_id}/embeddings")
 async def delete_video_embeddings(video_id: int, authorized: bool = Depends(verify_api_key)):
     """Delete all embeddings for a video. Requires API key."""
@@ -1594,7 +1978,13 @@ async def health():
                 "legacy":  LEGACY_COLLECTION
             },
             "points_count": collection_info.points_count,
-            "vectors_count": collection_info.vectors_count
+            "vectors_count": collection_info.vectors_count,
+            "features": {
+                "openai_embeddings": USE_OPENAI_EMBEDDINGS,
+                "fastembed_model": FASTEMBED_MODEL_NAME,
+                "llm_understanding": os.getenv("USE_LLM_UNDERSTANDING", "true"),
+                "llm_reranking": os.getenv("USE_RERANKING", "true"),
+            }
         }
     except Exception as e:
         return {
@@ -1625,74 +2015,48 @@ async def stats():
 @app.get("/")
 async def root():
     return {
-        "service": "Video Transcript ADVANCED Search API",
-        "version": "5.0 - TOP LEVEL ACCURACY",
+        "service": "Video Transcript LLM-Powered Search API",
+        "version": "6.0 - LLM ACCURACY ENGINE",
         "ai_features": {
             "openai_embeddings": USE_OPENAI_EMBEDDINGS,
-            "embedding_model": OPENAI_EMBEDDING_MODEL if USE_OPENAI_EMBEDDINGS else "sentence-transformers/all-MiniLM-L6-v2",
+            "embedding_model": OPENAI_EMBEDDING_MODEL if USE_OPENAI_EMBEDDINGS else FASTEMBED_MODEL_NAME,
             "embedding_dimension": EMBEDDING_DIMENSION,
-            "query_expansion": os.getenv("USE_QUERY_EXPANSION", "true"),
-            "reranking": os.getenv("USE_RERANKING", "true")
+            "fastembed_fallback": FASTEMBED_MODEL_NAME,
+            "llm_query_understanding": os.getenv("USE_LLM_UNDERSTANDING", "true"),
+            "llm_reranking": os.getenv("USE_RERANKING", "true"),
+            "cross_language_search": "Urdu <-> English via LLM translation",
+            "enriched_embeddings": "Speaker + Title + Language context in vectors",
         },
         "endpoints": {
-            "POST /embed-video": "Embed entire video transcript (with OpenAI or sentence-transformers)",
-            "POST /search": "ADVANCED: Semantic + Query Expansion + Reranking + Fuzzy search",
+            "POST /embed-video": "Embed video transcript with enriched context + English summaries",
+            "POST /search": "LLM-powered: Intent parsing + Dual-language + GPT-4o-mini reranking",
             "POST /search-by-title": "Fuzzy search videos by title",
             "POST /search-multi-video": "Search across multiple specific videos",
             "POST /suggest": "Autocomplete suggestions for speakers/titles",
+            "POST /re-embed-all": "Admin: Re-embed all segments with enriched text (run once)",
             "GET /video/{video_id}/segments": "Get all segments for a video",
             "DELETE /video/{video_id}/embeddings": "Delete all embeddings for a video",
             "GET /health": "Health check",
             "GET /stats": "Collection statistics"
         },
-        "advanced_search_features": [
-            "🚀 OpenAI text-embedding-3-large for SUPERIOR semantic understanding (3072-dim)",
-            "🤖 GPT-powered query expansion (finds synonyms and related terms)",
-            "🎯 Cohere reranking for MAXIMUM relevance (state-of-the-art)",
-            "⚡ Semantic search using advanced embeddings (cached for performance)",
-            "🔍 Fuzzy/typo-tolerant matching (e.g., 'Muhamad' matches 'Muhammad')",
-            "📊 N-gram based partial matching",
-            "👤 Speaker name autocomplete with fuzzy matching",
-            "📝 Title search with typo tolerance",
-            "🔢 Combined scoring: semantic + keyword + fuzzy + rerank",
-            "💾 Query caching for repeated searches (1 hour TTL)",
-            "🔤 Multi-keyword search with OR logic",
-            "⏰ Time range filtering",
-            "🎨 Query parsing (e.g., 'speaker:John title:intro AI')",
-            "🎯 HNSW parameters tuned for better recall (ef=128)"
-        ],
-        "performance_improvements": {
-            "semantic_understanding": "10x better with OpenAI embeddings",
-            "query_recall": "3-5x better with query expansion",
-            "result_relevance": "2-4x better with reranking",
-            "typo_tolerance": "Advanced fuzzy matching with rapidfuzz",
-            "caching": "1000 queries cached for 1 hour"
+        "llm_pipeline": {
+            "1_query_understanding": "GPT-4o-mini parses intent, detects language, extracts speaker, translates query",
+            "2_dual_language_search": "Searches with original + translated query for cross-language recall",
+            "3_semantic_search": "OpenAI text-embedding-3-large (3072-dim) vector search in Qdrant",
+            "4_keyword_search": "Qdrant text index for exact keyword matching (no scroll)",
+            "5_llm_reranking": "GPT-4o-mini scores top 30 results for true relevance (multilingual)",
+            "6_enriched_embeddings": "Vectors include speaker name + video title + language context",
+            "7_english_summaries": "Urdu segments get English summary for cross-language matching",
         },
         "environment_variables": {
-            "OPENAI_API_KEY": "Required for OpenAI embeddings and query expansion",
-            "COHERE_API_KEY": "Optional for reranking (highly recommended)",
+            "OPENAI_API_KEY": "Required for embeddings, query understanding, and reranking",
             "USE_OPENAI_EMBEDDINGS": "true/false (default: true)",
-            "OPENAI_EMBEDDING_MODEL": "text-embedding-3-large or text-embedding-3-small",
-            "USE_QUERY_EXPANSION": "true/false (default: true)",
-            "USE_RERANKING": "true/false (default: true)",
-            "EMBEDDING_DIMENSION": "3072 for large, 1536 for small, 384 for sentence-transformers"
+            "USE_LLM_UNDERSTANDING": "true/false (default: true) - GPT-4o-mini query parsing",
+            "USE_RERANKING": "true/false (default: true) - GPT-4o-mini reranking",
+            "USE_QUERY_EXPANSION": "true/false (default: true) - expanded via LLM understanding",
+            "FASTEMBED_MODEL": "FastEmbed model name (default: BAAI/bge-small-en-v1.5)",
+            "EMBEDDING_DIMENSION": "3072 for OpenAI large, 1536 for small",
         },
-        "example_queries": {
-            "semantic": {"query": "machine learning algorithms"},
-            "fuzzy_speaker": {"query": "AI", "speaker": "Muhamad"},
-            "fuzzy_title": {"query": "python", "title": "introducion"},
-            "keyword_fuzzy": {"words": ["nueral", "netwerk"], "query": "AI"},
-            "autocomplete": {"endpoint": "/suggest", "body": {"query": "joh", "type": "speaker"}},
-            "parsed": {"query": "speaker:John title:intro machine learning"},
-            "multi_video": {"query": "AI", "video_ids": [1, 2, 3]}
-        },
-        "setup_instructions": {
-            "1_install_dependencies": "pip install -r requirements.txt",
-            "2_set_openai_key": "export OPENAI_API_KEY='your-key-here'",
-            "3_optional_cohere": "export COHERE_API_KEY='your-key-here' (for reranking)",
-            "4_configure": "Set USE_OPENAI_EMBEDDINGS=true and OPENAI_EMBEDDING_MODEL",
-            "5_run": "python embeddings_test.py"
-        }
     }
 
 if __name__ == "__main__":
