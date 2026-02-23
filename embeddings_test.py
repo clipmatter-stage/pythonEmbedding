@@ -70,6 +70,9 @@ class EmbedVideoRequest(BaseModel):
     video_filename: str = Field(default="", max_length=500)
     youtube_url: str = Field(default="", max_length=1000)
     language: str = Field(default="", max_length=50)
+    batch_info: Optional[dict] = Field(default=None, description="Batch processing info: batch_number, total_batches, segments_in_batch")
+    speakers_transcript: Optional[List[dict]] = Field(default=None, description="Full speakers transcript (ignored)")
+    diarization_segments: Optional[List[dict]] = Field(default=None, description="Diarization segments (ignored)")
 
 class SearchRequest(BaseModel):
     query: str = Field(default="", max_length=1000)
@@ -528,6 +531,24 @@ def expand_query_variations(query: str) -> List[str]:
     
     return list(set(variations))
 
+# Punctuation normalization table: curly quotes → straight, strip misc punctuation
+_PUNCT_NORMALIZE_TABLE = str.maketrans({
+    '\u2018': "'", '\u2019': "'",  # curly single quotes → straight
+    '\u201C': '"', '\u201D': '"',  # curly double quotes → straight
+    '\u2013': '-', '\u2014': '-',  # en/em dash → hyphen
+    '\u2026': ' ',                  # ellipsis → space
+})
+_STRIP_CHARS = _string.punctuation + '\u2018\u2019\u201C\u201D\u2013\u2014\u2026'
+
+def normalize_for_matching(text: str) -> str:
+    """Normalize text for keyword matching: lowercase, normalize quotes/dashes, strip edge punctuation."""
+    return text.translate(_PUNCT_NORMALIZE_TABLE).lower()
+
+def normalize_word(word: str) -> str:
+    """Normalize a single search word: lowercase, normalize quotes, strip surrounding punctuation."""
+    return word.translate(_PUNCT_NORMALIZE_TABLE).strip(_STRIP_CHARS).lower()
+
+
 def calculate_combined_score(semantic_score: float, keyword_match: bool, fuzzy_score: float = 0) -> float:
     """
     Calculate combined relevance score.
@@ -734,7 +755,18 @@ async def embed_video(data: EmbedVideoRequest, authorized: bool = Depends(verify
         
         logger.info(f"Processing video {video_id} with {len(identification_segments)} segments")
         
-        delete_existing_embeddings(video_id)
+        # Only delete existing embeddings on the FIRST batch (or if no batch info = single request)
+        batch_number = 1
+        total_batches = 1
+        if data.batch_info:
+            batch_number = data.batch_info.get("batch_number", 1)
+            total_batches = data.batch_info.get("total_batches", 1)
+            logger.info(f"Batch {batch_number}/{total_batches} for video {video_id}")
+        
+        if batch_number == 1:
+            delete_existing_embeddings(video_id)
+        else:
+            logger.info(f"Skipping delete for batch {batch_number} (only delete on batch 1)")
         
         points = []
         segments_embedded = 0
@@ -1312,17 +1344,17 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
     # DO NOT mix semantic query words into keyword search to avoid false matches
     search_words = list(words) if words else []
     
-    # Clean up search words: strip punctuation, remove too-short words
+    # Clean up search words: normalize quotes/dashes, strip punctuation, remove too-short words
     search_words = list(set(
-        w.strip(_string.punctuation)
+        normalize_word(w)
         for w in search_words
-        if len(w.strip(_string.punctuation)) >= 2
+        if len(normalize_word(w)) >= 2
     ))
     
     if search_words:
         try:
             logger.info(f"Elastic keyword search for: {search_words[:10]} (max_scanned={max_scanned})")
-            words_lower = [w.lower() for w in search_words]
+            words_lower = search_words  # already lowercased by normalize_word
             page_size = 1000
             scanned = 0
             offset = None
@@ -1345,7 +1377,8 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                 for p in points:
                     scanned += 1
                     payload = p.payload or {}
-                    text = (payload.get("text") or "").lower()
+                    # Normalize text fields: lowercase + normalize curly quotes/dashes
+                    text = normalize_for_matching(payload.get("text") or "")
                     speaker_field = (payload.get("speaker") or "")
                     video_title = payload.get("video_title", "")
                     diarization_speaker = (payload.get("diarization_speaker") or "")
@@ -1365,15 +1398,16 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                     best_field_weight = 0
                     
                     # STRICT keyword matching: check each word across fields
+                    # Both search words AND field values are normalized (lowercase + straight quotes)
                     for w in words_lower:
                         word_found = False
                         
                         # Check each field individually to track which field matched
                         fields_to_check = [
-                            ("text", text),
-                            ("speaker", speaker_field.lower()),
-                            ("diarization_speaker", diarization_speaker.lower()),
-                            ("video_title", video_title.lower()),
+                            ("text", text),  # already normalized above
+                            ("speaker", normalize_for_matching(speaker_field)),
+                            ("diarization_speaker", normalize_for_matching(diarization_speaker)),
+                            ("video_title", normalize_for_matching(video_title)),
                         ]
                         
                         for field_name, field_value in fields_to_check:
@@ -1383,6 +1417,7 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                             field_match_score = 0
                             
                             # Exact substring match (primary matching method)
+                            # Both sides are normalized so "there've" matches "there've"
                             if w in field_value:
                                 field_match_score = 1.0
                             # Fuzzy match ONLY for longer words (4+ chars) with HIGH threshold
