@@ -7,6 +7,7 @@ from qdrant_client.models import Distance, VectorParams, PointStruct, Filter, Fi
 import uuid
 import os
 import logging
+import string as _string
 from datetime import datetime
 from typing import Optional, List, Dict, Tuple
 import re
@@ -1037,6 +1038,12 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
             title_filter = parsed["title"]
         query_text = parsed["semantic_query"]
     
+    # Safety net: if query is empty but words are provided, reconstruct query text
+    # This ensures semantic search runs even when the frontend only sends words
+    if not query_text and words:
+        query_text = " ".join(words)
+        logger.info(f"Reconstructed query from words: '{query_text[:120]}'")
+    
     # Allow search with: query, words, title, OR speaker (speaker-only search is valid)
     if not query_text and not words and not title_filter and not speaker_filter:
         raise HTTPException(
@@ -1305,8 +1312,12 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
     # DO NOT mix semantic query words into keyword search to avoid false matches
     search_words = list(words) if words else []
     
-    # Only use exact words - no expansion to avoid false matches
-    search_words = list(set(w for w in search_words if len(w) >= 2))
+    # Clean up search words: strip punctuation, remove too-short words
+    search_words = list(set(
+        w.strip(_string.punctuation)
+        for w in search_words
+        if len(w.strip(_string.punctuation)) >= 2
+    ))
     
     if search_words:
         try:
