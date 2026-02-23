@@ -415,8 +415,9 @@ Be strict - only give high scores to truly relevant results."""},
             result_copy["match_types"].append("llm_reranked")
             reranked.append(result_copy)
         
-        # Filter out irrelevant results (LLM score < 0.3 = score < 3/10)
-        reranked = [r for r in reranked if r.get("llm_relevance_score", 0) >= 0.2]
+        # Filter out irrelevant results (LLM score < 0.2 = score < 2/10)
+        # But never filter out title matches — user searched for the title, so those are always relevant
+        reranked = [r for r in reranked if r.get("llm_relevance_score", 0) >= 0.2 or "title_match" in r.get("match_types", [])]
         
         # Sort by new combined score
         reranked.sort(key=lambda x: x.get("score", 0), reverse=True)
@@ -529,14 +530,17 @@ def expand_query_variations(query: str) -> List[str]:
 def calculate_combined_score(semantic_score: float, keyword_match: bool, fuzzy_score: float = 0) -> float:
     """
     Calculate combined relevance score.
-    FIXED: No longer caps semantic score at 0.6.
     Semantic is the primary signal, keyword and fuzzy are bonuses.
+    Score ranges:
+      - Pure semantic: up to 0.90
+      - Semantic + keyword: up to 0.95
+      - Semantic + keyword + fuzzy: up to 1.0
     """
-    base_score = semantic_score * 0.80  # Semantic is primary
+    base_score = semantic_score * 0.90  # Semantic is primary — preserve most of cosine similarity
     if keyword_match:
-        base_score += 0.12
+        base_score += 0.07  # Keyword bonus
     if fuzzy_score > 0:
-        base_score += fuzzy_score * 0.08
+        base_score += fuzzy_score * 0.05  # Small fuzzy bonus
     return min(base_score, 1.0)  # Cap at 1.0
 
 # ============== END ELASTIC SEARCH HELPERS ==============
@@ -1401,16 +1405,20 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                     word_coverage = matched_words_count / max(len(words_lower), 1)
                     match_quality = best_fuzzy_score / max(best_field_weight, 1.0)
                     
-                    # Score formula: quality * coverage * field_weight
-                    final_score = match_quality * word_coverage * 0.7
+                    # Score formula: quality * coverage — higher baseline
+                    final_score = match_quality * word_coverage * 0.80
                     
                     # Boost for exact text matches
                     if match_quality >= 1.0:
-                        final_score += 0.15
+                        final_score += 0.12
                     
-                    # Boost for title matches
+                    # Strong boost for title matches — title matches are highly relevant
                     if matched_field == "video_title":
-                        final_score = min(final_score + 0.15, 1.0)
+                        final_score = min(final_score + 0.20, 0.98)
+                    
+                    # Boost for speaker field matches
+                    if matched_field in ("speaker", "diarization_speaker"):
+                        final_score = min(final_score + 0.10, 0.95)
                     
                     # Must meet minimum score threshold
                     if final_score < min_score:
@@ -1646,11 +1654,29 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
     )
     
     # ADVANCED: Apply LLM reranking if enabled (replaces Cohere English-only reranker)
+    # Protect title-matched results: they should keep a minimum score floor
     if use_reranking and query_text and len(merged_list) > 0:
         logger.info(f"Applying LLM reranking to {len(merged_list)} results...")
+        
+        # Remember pre-rerank title match scores so we can enforce a floor
+        title_match_scores = {}
+        for r in merged_list:
+            if "title_match" in r.get("match_types", []):
+                title_match_scores[r["id"]] = r["score"]
+        
         merged_list = rerank_with_llm(query_text, merged_list, top_k=min(len(merged_list), top_k * 3))
+        
+        # Restore title-match floor: if LLM dropped a title-matched result below its
+        # original score, bring it back up. Title matches are user-intent matches.
         if merged_list:
-            logger.info(f"LLM reranking complete, top score: {merged_list[0].get('score', 0):.4f}")
+            for r in merged_list:
+                if r["id"] in title_match_scores:
+                    original = title_match_scores[r["id"]]
+                    if r["score"] < original * 0.7:
+                        r["score"] = round(max(r["score"], original * 0.80), 4)
+            # Re-sort after floor adjustments
+            merged_list.sort(key=lambda x: x.get("score", 0), reverse=True)
+            logger.info(f"LLM reranking complete, top score: {merged_list[0].get('score', 0):.4f}, title-protected: {len(title_match_scores)}")
         else:
             logger.info("LLM reranking returned no results")
     
