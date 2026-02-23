@@ -1162,9 +1162,16 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
             logger.info(f"Semantic search for: '{query_text[:120]}'")
             
             # Build query variations using LLM understanding
+            # ALWAYS search with the ORIGINAL query first — it's closest to what the user typed
             query_variations = [query_text]
             
             if query_intent:
+                # If LLM rewrote the semantic_query, add it as a variation (not replacement)
+                llm_query = query_intent.get("semantic_query", "")
+                if llm_query and llm_query.strip().lower() != query_text.strip().lower():
+                    query_variations.append(llm_query)
+                    logger.info(f"Added LLM semantic query: {llm_query[:80]}")
+                
                 # Add translated query for cross-language search
                 translated = query_intent.get("semantic_query_translated", "")
                 if translated and translated.strip() and translated.strip().lower() != query_text.strip().lower():
@@ -1202,12 +1209,17 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                     exact=False   # Use approximate search for speed
                 )
 
-                # Use STRICT score threshold - no lowering
+                # Use a LOWER threshold for Qdrant retrieval to avoid losing good results.
+                # We'll filter by min_score AFTER scoring, not at the DB level.
+                # This prevents the DB from dropping results that would have scored well
+                # after combined scoring (semantic + keyword + fuzzy bonuses).
+                retrieval_threshold = max(min_score * 0.6, 0.15)  # e.g. 0.35 * 0.6 = 0.21
+                
                 sem_search_results = qdrant_client.search(
                     collection_name=SEGMENTS_COLLECTION,
                     query_vector=query_vector,
                     limit=top_k * 3 if idx == 0 else top_k,  # Primary query gets more
-                    score_threshold=min_score,  # Use exact min_score, no reduction
+                    score_threshold=retrieval_threshold,  # Lower threshold — filter later
                     query_filter=search_filter,
                     with_payload=True,
                     with_vectors=False,
@@ -1254,6 +1266,10 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                     
                     base_score = float(getattr(r, "score", 0.0))
                     combined_score = calculate_combined_score(base_score, False, fuzzy_boost)
+                    
+                    # Apply min_score filter AFTER combined scoring
+                    if combined_score < min_score:
+                        continue
                     
                     all_semantic_results[result_id] = {
                         "id": r.id,
@@ -1380,8 +1396,19 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                     if matched_words_count == 0:
                         continue
                     
-                    # STRICT: For multi-word searches, require ALL words to match
-                    if len(words_lower) > 1 and matched_words_count < len(words_lower):
+                    # Flexible word matching: require a high proportion but not necessarily ALL words
+                    # For short queries (2-3 words): require ALL words
+                    # For medium queries (4-6 words): allow 1 missing word
+                    # For long queries (7+ words): require at least 75% of words
+                    total_words = len(words_lower)
+                    if total_words <= 3:
+                        min_required = total_words  # ALL must match
+                    elif total_words <= 6:
+                        min_required = total_words - 1  # Allow 1 miss
+                    else:
+                        min_required = max(3, int(total_words * 0.75))  # 75% must match
+                    
+                    if matched_words_count < min_required:
                         continue
                     
                     # ELASTIC title filter with fuzzy matching
