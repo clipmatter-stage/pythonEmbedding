@@ -212,12 +212,7 @@ def get_openai_embedding(text: str, model_name: str = None) -> List[float]:
         return response.data[0].embedding
     except Exception as e:
         logger.error(f"OpenAI embedding error: {str(e)}")
-        # Fallback to FastEmbed (lightweight CPU model)
-        global _fallback_model
-        if _fallback_model is not None:
-            logger.warning("Falling back to FastEmbed for embedding")
-            result = list(_fallback_model.embed([text]))
-            return result[0].tolist() if hasattr(result[0], 'tolist') else list(result[0])
+        # No fallback - FastEmbed produces 384-dim vectors which fail on 3072-dim collection
         raise
 
 def get_openai_embeddings_batch(texts: List[str], model_name: str = None) -> List[List[float]]:
@@ -235,9 +230,9 @@ def get_openai_embeddings_batch(texts: List[str], model_name: str = None) -> Lis
         cleaned_texts = [text.replace("\n", " ").strip() for text in texts]
         
         # Sub-batch for OpenAI API token limit (max 300,000 tokens per request)
-        # With enriched text averaging ~1,000-1,500 tokens per segment, use 100 segments
-        # to stay well under the limit (100 * 2,000 = 200,000 tokens max)
-        SUB_BATCH_SIZE = 100
+        # Some videos have very long segments (10K+ tokens), so use small batches
+        # 20 segments * ~10K tokens max = 200K tokens, safely under 300K limit
+        SUB_BATCH_SIZE = 20
         all_embeddings = []
         
         for i in range(0, len(cleaned_texts), SUB_BATCH_SIZE):
@@ -257,10 +252,8 @@ def get_openai_embeddings_batch(texts: List[str], model_name: str = None) -> Lis
         return all_embeddings
     except Exception as e:
         logger.error(f"OpenAI batch embedding error: {str(e)}")
-        # Fallback to FastEmbed
-        logger.warning("Falling back to FastEmbed for batch embedding")
-        results = list(fastembed_model.embed(texts))
-        return [r.tolist() if hasattr(r, 'tolist') else list(r) for r in results]
+        # No fallback - FastEmbed produces 384-dim vectors which fail on 3072-dim collection
+        raise
 
 def expand_query_with_gpt(query: str) -> List[str]:
     """
@@ -816,6 +809,11 @@ async def embed_video(data: EmbedVideoRequest, authorized: bool = Depends(verify
             enriched_parts.append(text)
             
             enriched_text = " ".join(enriched_parts)
+            
+            # Truncate to max 6000 chars (~1500-2000 tokens) to stay under OpenAI limits
+            if len(enriched_text) > 6000:
+                enriched_text = enriched_text[:6000] + "..."
+                logger.debug(f"Truncated segment {segment_index} from {len(text)} to 6000 chars")
             
             texts_to_embed.append(enriched_text)
             segment_metadata.append({
