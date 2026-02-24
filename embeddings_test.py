@@ -1094,9 +1094,10 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
             
             # AUTO LANGUAGE FILTER: If query is English, only search English transcripts
             # This prevents showing Urdu videos when user searches in English
+            # NOTE: Database stores ISO codes: "en", "ur", etc. (not "English", "Urdu")
             if not language_filter and query_intent.get("detected_language") == "english":
-                language_filter = "English"
-                logger.info(f"Auto-applied language filter: English (based on English query)")
+                language_filter = "en"  # ISO code matching database value
+                logger.info(f"Auto-applied language filter: en (based on English query)")
         except Exception as e:
             logger.warning(f"LLM understanding failed, continuing without: {e}")
     
