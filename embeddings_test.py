@@ -1080,13 +1080,23 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
             
             # Auto-extract speaker from query ONLY if it's a speaker_search query type
             # Do NOT apply speaker filter for title_search, topic_search, etc.
+            # NOTE: We store the speaker for PARALLEL speaker search, but DON'T use it as
+            # an exclusive filter on semantic search - we want BOTH transcript mentions AND speaker segments
             if not speaker_filter and query_intent.get("extracted_speaker"):
                 query_type = query_intent.get("query_type", "general")
                 if query_type == "speaker_search":
+                    # Store speaker for parallel search, but DON'T apply as exclusive filter
+                    # This allows semantic search to find transcript mentions of the speaker
                     speaker_filter = query_intent["extracted_speaker"]
-                    logger.info(f"Auto-extracted speaker filter: {speaker_filter}")
+                    logger.info(f"Speaker search detected: '{speaker_filter}' - will search BOTH transcript content AND speaker fields")
                 else:
                     logger.info(f"Skipping speaker filter (query_type={query_type}, not speaker_search)")
+            
+            # AUTO LANGUAGE FILTER: If query is English, only search English transcripts
+            # This prevents showing Urdu videos when user searches in English
+            if not language_filter and query_intent.get("detected_language") == "english":
+                language_filter = "English"
+                logger.info(f"Auto-applied language filter: English (based on English query)")
         except Exception as e:
             logger.warning(f"LLM understanding failed, continuing without: {e}")
     
@@ -1156,12 +1166,16 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
     speaker_results = []  # New: results from speaker-only scroll search
     title_results = []    # Results from title fuzzy matching
     
-    # Strategy 0: Speaker-only search (no query, no words - just find all segments by speaker)
-    # This handles the case where user clicks "Speaker Search" toggle without typing anything,
-    # or types a speaker name to find all their segments.
+    # Strategy 0: Speaker field search - find segments BY a specific speaker
+    # This runs in TWO cases:
+    # 1. Speaker-only search: no query/words, just finding segments by speaker
+    # 2. Speaker search WITH query: run alongside semantic search to find BOTH:
+    #    - Segments BY that speaker (speaker field match)
+    #    - Segments MENTIONING that speaker (transcript content match via semantic search)
     speaker_only_search = speaker_filter and not query_text and not words
+    speaker_parallel_search = speaker_filter and query_text  # Run speaker search in parallel with semantic
     
-    if speaker_only_search:
+    if speaker_only_search or speaker_parallel_search:
         try:
             logger.info(f"Speaker-only search for: '{speaker_filter}'")
             offset = None
@@ -1327,9 +1341,16 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                             continue
                     
                     # ELASTIC speaker filter with fuzzy matching (checks both speaker fields)
+                    # For speaker_parallel_search: DON'T filter - we want transcript mentions too
+                    # The speaker field matching is handled separately by Strategy 0
+                    speaker_field_match = False
                     if speaker_filter:
                         speaker_combined = f"{speaker} {diarization_speaker}"
-                        if not fuzzy_match_speaker(speaker_filter, speaker_combined, threshold=70):
+                        speaker_field_match = fuzzy_match_speaker(speaker_filter, speaker_combined, threshold=70)
+                        
+                        # Only filter by speaker if NOT a parallel search (i.e., explicit speaker-only filter from user)
+                        # For speaker searches with query, we want BOTH speaker-tagged AND transcript mentions
+                        if not speaker_parallel_search and not speaker_field_match:
                             continue
                     
                     # Calculate fuzzy boost score
@@ -1348,6 +1369,11 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                     if combined_score < min_score:
                         continue
                     
+                    # Build match types list
+                    match_types = ["semantic"]
+                    if speaker_field_match:
+                        match_types.append("speaker_field_match")
+                    
                     all_semantic_results[result_id] = {
                         "id": r.id,
                         "score": combined_score,
@@ -1364,9 +1390,9 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                         "youtube_url": payload.get("youtube_url", ""),
                         "language": payload.get("language", ""),
                         "created_at": payload.get("created_at"),
-                        "match_types": ["semantic"],
+                        "match_types": match_types,
                         "fuzzy_score": round(fuzzy_boost, 2),
-                        "matched_field": "semantic_vector",
+                        "matched_field": "speaker" if speaker_field_match else "semantic_vector",
                         "query_variation": q_var if idx > 0 else "original"
                     }
             
@@ -1568,11 +1594,11 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
             logger.info(f"ERROR during keyword search: {str(e)}")
             raise HTTPException(status_code=500, detail=f"Keyword search error: {str(e)}")
 
-    # Strategy 3: Title matching — fuzzy-match the query text against video titles
-    # This ensures that searching for a video title always returns results even when
-    # the semantic vector of the title text doesn't match transcript embeddings.
-    # Runs for EVERY search that has a query, words, or title_filter.
-    title_query = query_text or (" ".join(words) if words else "") or title_filter or ""
+    # Strategy 3: Title matching — ONLY when user explicitly provides a title filter
+    # This prevents returning videos based on title match when user is searching transcripts.
+    # For regular searches, we only want transcript content matches (semantic + keyword).
+    # Title matching ONLY runs when title_filter is explicitly provided.
+    title_query = title_filter or ""
     if title_query and len(title_query.strip()) >= 3:
         try:
             logger.info(f"Title matching search for: '{title_query[:120]}'")
