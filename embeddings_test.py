@@ -1248,6 +1248,82 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
             logger.error(f"ERROR during speaker-only search: {str(e)}")
             raise HTTPException(status_code=500, detail=f"Speaker search error: {str(e)}")
 
+    # Strategy 0.5: EXACT PHRASE SEARCH - Find segments containing the exact query text
+    # This runs BEFORE semantic search to prioritize exact transcript matches
+    # When user searches "before Windows 95, 1984", we find segments with that exact text
+    exact_phrase_results = []
+    if query_text and len(query_text.strip()) >= 5:
+        try:
+            exact_phrase = normalize_for_matching(query_text.strip())
+            logger.info(f"Exact phrase search for: '{exact_phrase[:60]}'")
+            
+            offset = None
+            scanned = 0
+            max_scan_exact = min(max_scanned, 20000)  # Limit exact phrase scan
+            
+            while scanned < max_scan_exact and len(exact_phrase_results) < top_k:
+                points, next_offset = qdrant_client.scroll(
+                    collection_name=SEGMENTS_COLLECTION,
+                    scroll_filter=search_filter,  # Apply video/language filters
+                    limit=min(1000, max_scan_exact - scanned),
+                    offset=offset,
+                    with_payload=True,
+                    with_vectors=False
+                )
+                
+                if not points:
+                    break
+                
+                for p in points:
+                    scanned += 1
+                    payload = p.payload or {}
+                    text = normalize_for_matching(payload.get("text") or "")
+                    
+                    # Check if the exact phrase appears in the transcript
+                    if exact_phrase in text:
+                        spk = payload.get("speaker", "")
+                        diar_spk = payload.get("diarization_speaker", "")
+                        video_title = payload.get("video_title", "")
+                        
+                        # Apply speaker filter if present
+                        if speaker_filter:
+                            speaker_combined = f"{spk} {diar_spk}".strip()
+                            if not fuzzy_match_speaker(speaker_filter, speaker_combined, threshold=70):
+                                continue
+                        
+                        exact_phrase_results.append({
+                            "id": p.id,
+                            "score": 0.99,  # Highest score for exact phrase match
+                            "video_id": payload.get("video_id"),
+                            "video_title": video_title,
+                            "speaker": spk,
+                            "diarization_speaker": diar_spk,
+                            "start_time": payload.get("start_time", 0),
+                            "end_time": payload.get("end_time", 0),
+                            "duration": round((payload.get("end_time", 0) - payload.get("start_time", 0)), 2),
+                            "text": payload.get("text", ""),
+                            "text_length": payload.get("text_length", 0),
+                            "youtube_url": payload.get("youtube_url", ""),
+                            "language": payload.get("language", ""),
+                            "created_at": payload.get("created_at"),
+                            "match_types": ["exact_phrase_match"],
+                            "fuzzy_score": 1.0,
+                            "matched_field": "text",
+                            "exact_phrase": True
+                        })
+                
+                if len(exact_phrase_results) >= top_k:
+                    break
+                
+                offset = next_offset
+                if not next_offset:
+                    break
+            
+            logger.info(f"Exact phrase search found {len(exact_phrase_results)} results (scanned {scanned})")
+            
+        except Exception as e:
+            logger.warning(f"Exact phrase search error (non-fatal): {e}")
+
     # Strategy 1: Semantic search with optional query expansion
     if query_text:
         try:
@@ -1416,6 +1492,14 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
         if len(normalize_word(w)) >= 2
     ))
     
+    # EXACT PHRASE MATCHING: Prepare the full original query for exact substring match
+    # This ensures that when user searches for "before Windows 95, 1984" and that exact
+    # phrase exists in a transcript, it gets the highest score (0.99)
+    exact_phrase_query = None
+    if query_text and len(query_text) >= 5:
+        # Normalize the full query for exact phrase comparison
+        exact_phrase_query = normalize_for_matching(query_text.strip())
+    
     if search_words:
         try:
             logger.info(f"Elastic keyword search for: {search_words[:10]} (max_scanned={max_scanned})")
@@ -1448,6 +1532,39 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                     video_title = payload.get("video_title", "")
                     diarization_speaker = (payload.get("diarization_speaker") or "")
                     video_filename = (payload.get("video_filename") or "")
+                    
+                    # ========== EXACT PHRASE MATCH CHECK (HIGHEST PRIORITY) ==========
+                    # If the user's full query appears as-is in the transcript, give it top score
+                    # This ensures "before Windows 95, 1984" matches exactly and ranks first
+                    is_exact_phrase_match = False
+                    if exact_phrase_query and len(exact_phrase_query) >= 5:
+                        if exact_phrase_query in text:
+                            is_exact_phrase_match = True
+                            # Add as exact match with highest score - this goes to the TOP
+                            keyword_results.append({
+                                "id": p.id,
+                                "score": 0.99,  # Near-perfect score for exact phrase match
+                                "video_id": payload.get("video_id"),
+                                "video_title": video_title,
+                                "speaker": speaker_field,
+                                "diarization_speaker": diarization_speaker,
+                                "start_time": payload.get("start_time", 0),
+                                "end_time": payload.get("end_time", 0),
+                                "duration": round((payload.get("end_time", 0) - payload.get("start_time", 0)), 2),
+                                "text": payload.get("text", ""),
+                                "text_length": payload.get("text_length", 0),
+                                "youtube_url": payload.get("youtube_url", ""),
+                                "language": payload.get("language", ""),
+                                "created_at": payload.get("created_at"),
+                                "match_types": ["keyword", "exact_phrase_match"],
+                                "fuzzy_score": 1.0,
+                                "matched_field": "text",
+                                "matched_words_count": len(search_words),
+                                "field_weight": 3.0,  # High weight for exact phrase
+                                "exact_phrase": True
+                            })
+                            continue  # Skip word-by-word matching for this segment
+                    # ========== END EXACT PHRASE MATCH ==========
                     
                     # Track matched words and their scores
                     matched_words_count = 0
@@ -1755,12 +1872,24 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
         except Exception as e:
             logger.warning(f"Title matching search error (non-fatal): {e}")
 
-    # Merge results - combine semantic, keyword, speaker, and title matches
+    # Merge results - combine exact phrase, semantic, keyword, speaker, and title matches
+    # EXACT PHRASE MATCHES GO FIRST - they have highest priority (score 0.99)
     merged = {}
     
-    for r in speaker_results:
+    # 1. Add exact phrase matches FIRST - they should always be on top
+    for r in exact_phrase_results:
         merged[r["id"]] = r
     
+    # 2. Add speaker results
+    for r in speaker_results:
+        if r["id"] in merged:
+            if "speaker_filter" not in merged[r["id"]]["match_types"]:
+                merged[r["id"]]["match_types"].append("speaker_filter")
+            # Don't override exact phrase score (0.99)
+        else:
+            merged[r["id"]] = r
+    
+    # 3. Add title results
     for r in title_results:
         if r["id"] in merged:
             if "title_match" not in merged[r["id"]]["match_types"]:
