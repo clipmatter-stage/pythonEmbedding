@@ -222,7 +222,8 @@ def get_openai_embedding(text: str, model_name: str = None) -> List[float]:
 
 def get_openai_embeddings_batch(texts: List[str], model_name: str = None) -> List[List[float]]:
     """
-    Get embeddings for multiple texts in a single API call (more efficient).
+    Get embeddings for multiple texts using OpenAI API.
+    Handles sub-batching for large inputs (API limit is 2048 inputs per call).
     """
     if not openai_client:
         raise ValueError("OpenAI client not initialized")
@@ -233,15 +234,25 @@ def get_openai_embeddings_batch(texts: List[str], model_name: str = None) -> Lis
         # Clean texts
         cleaned_texts = [text.replace("\n", " ").strip() for text in texts]
         
-        response = openai_client.embeddings.create(
-            input=cleaned_texts,
-            model=model_name,
-            dimensions=EMBEDDING_DIMENSION
-        )
+        # Sub-batch for OpenAI API limit (max 2048 inputs per call)
+        SUB_BATCH_SIZE = 2000
+        all_embeddings = []
         
-        # Sort by index to maintain order
-        embeddings = [item.embedding for item in sorted(response.data, key=lambda x: x.index)]
-        return embeddings
+        for i in range(0, len(cleaned_texts), SUB_BATCH_SIZE):
+            sub_batch = cleaned_texts[i:i + SUB_BATCH_SIZE]
+            logger.info(f"OpenAI sub-batch {i // SUB_BATCH_SIZE + 1}: {len(sub_batch)} texts")
+            
+            response = openai_client.embeddings.create(
+                input=sub_batch,
+                model=model_name,
+                dimensions=EMBEDDING_DIMENSION
+            )
+            
+            # Sort by index to maintain order within sub-batch
+            sub_embeddings = [item.embedding for item in sorted(response.data, key=lambda x: x.index)]
+            all_embeddings.extend(sub_embeddings)
+        
+        return all_embeddings
     except Exception as e:
         logger.error(f"OpenAI batch embedding error: {str(e)}")
         # Fallback to FastEmbed
