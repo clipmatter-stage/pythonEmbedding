@@ -1309,6 +1309,9 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                             "match_types": ["exact_phrase_match"],
                             "fuzzy_score": 1.0,
                             "matched_field": "text",
+                            "matched_terms": [{"term": query_text.strip(), "field": "text", "score": 1.0, "type": "exact_phrase"}],
+                            "matched_words_count": len(query_text.split()),
+                            "is_multi_match": False,
                             "exact_phrase": True
                         })
                 
@@ -1560,6 +1563,8 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                                 "fuzzy_score": 1.0,
                                 "matched_field": "text",
                                 "matched_words_count": len(search_words),
+                                "matched_terms": [{"term": query_text.strip(), "field": "text", "score": 1.0, "type": "exact_phrase"}],
+                                "is_multi_match": False,  # Single exact phrase match
                                 "field_weight": 3.0,  # High weight for exact phrase
                                 "exact_phrase": True
                             })
@@ -1570,6 +1575,7 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                     matched_words_count = 0
                     best_fuzzy_score = 0
                     matched_field = ""
+                    matched_terms = []  # Track exactly which terms matched
                     field_weights = {
                         "video_title": 2.5,      # Highest priority: title matches
                         "speaker": 1.8,          # High priority: speaker matches  
@@ -1609,6 +1615,7 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                             if field_match_score > 0:
                                 word_found = True
                                 matched_words_count += 1
+                                matched_terms.append({"term": w, "field": field_name, "score": round(field_match_score, 2)})
                                 
                                 # Track best matching field and score
                                 field_weight = field_weights.get(field_name, 1.0)
@@ -1698,6 +1705,8 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                         "fuzzy_score": round(best_fuzzy_score / max(best_field_weight, 1.0), 2),
                         "matched_field": matched_field,
                         "matched_words_count": matched_words_count,
+                        "matched_terms": matched_terms,  # List of {term, field, score} for each matched term
+                        "is_multi_match": len(matched_terms) > 1,  # True if multiple terms matched
                         "field_weight": best_field_weight
                     })
 
@@ -1874,10 +1883,27 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
 
     # Merge results - combine exact phrase, semantic, keyword, speaker, and title matches
     # EXACT PHRASE MATCHES GO FIRST - they have highest priority (score 0.99)
+    # Track matched_terms from all sources to detect multi-match within same segment
     merged = {}
+    
+    def merge_matched_terms(existing_terms, new_terms):
+        """Merge matched_terms lists, avoiding duplicates"""
+        if not existing_terms:
+            existing_terms = []
+        if not new_terms:
+            return existing_terms
+        # Track existing term strings to avoid duplicates
+        existing_set = {t.get("term", "") for t in existing_terms}
+        for t in new_terms:
+            if t.get("term", "") not in existing_set:
+                existing_terms.append(t)
+                existing_set.add(t.get("term", ""))
+        return existing_terms
     
     # 1. Add exact phrase matches FIRST - they should always be on top
     for r in exact_phrase_results:
+        r.setdefault("matched_terms", [])
+        r.setdefault("is_multi_match", False)
         merged[r["id"]] = r
     
     # 2. Add speaker results
@@ -1885,8 +1911,15 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
         if r["id"] in merged:
             if "speaker_filter" not in merged[r["id"]]["match_types"]:
                 merged[r["id"]]["match_types"].append("speaker_filter")
+            # Merge matched_terms if speaker result has any
+            merged[r["id"]]["matched_terms"] = merge_matched_terms(
+                merged[r["id"]].get("matched_terms", []),
+                r.get("matched_terms", [])
+            )
             # Don't override exact phrase score (0.99)
         else:
+            r.setdefault("matched_terms", [])
+            r.setdefault("is_multi_match", False)
             merged[r["id"]] = r
     
     # 3. Add title results
@@ -1894,24 +1927,55 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
         if r["id"] in merged:
             if "title_match" not in merged[r["id"]]["match_types"]:
                 merged[r["id"]]["match_types"].append("title_match")
+            merged[r["id"]]["matched_terms"] = merge_matched_terms(
+                merged[r["id"]].get("matched_terms", []),
+                r.get("matched_terms", [])
+            )
             merged[r["id"]]["score"] = max(merged[r["id"]]["score"], r["score"])
         else:
+            r.setdefault("matched_terms", [])
+            r.setdefault("is_multi_match", False)
             merged[r["id"]] = r
     
     for r in semantic_results:
         if r["id"] in merged:
             merged[r["id"]]["match_types"].append("semantic")
+            merged[r["id"]]["matched_terms"] = merge_matched_terms(
+                merged[r["id"]].get("matched_terms", []),
+                r.get("matched_terms", [])
+            )
             merged[r["id"]]["score"] = max(merged[r["id"]]["score"], r["score"])
         else:
+            r.setdefault("matched_terms", [])
+            r.setdefault("is_multi_match", False)
             merged[r["id"]] = r
 
     for r in keyword_results:
         if r["id"] in merged:
             if "keyword" not in merged[r["id"]]["match_types"]:
                 merged[r["id"]]["match_types"].append("keyword")
+            merged[r["id"]]["matched_terms"] = merge_matched_terms(
+                merged[r["id"]].get("matched_terms", []),
+                r.get("matched_terms", [])
+            )
             merged[r["id"]]["score"] = max(merged[r["id"]]["score"], r["score"])
         else:
+            r.setdefault("matched_terms", [])
+            r.setdefault("is_multi_match", False)
             merged[r["id"]] = r
+    
+    # Update is_multi_match flag based on combined matched_terms count
+    # Also boost score for multi-match segments (multiple terms found in same segment)
+    for seg_id, seg in merged.items():
+        matched_terms = seg.get("matched_terms", [])
+        num_unique_terms = len(matched_terms)
+        seg["matched_words_count"] = num_unique_terms
+        seg["is_multi_match"] = num_unique_terms > 1
+        
+        # Boost score for multi-match: each additional term adds a small boost
+        if num_unique_terms > 1 and seg.get("score", 0) < 0.98:
+            multi_match_boost = min(0.05 * (num_unique_terms - 1), 0.15)  # Max 15% boost
+            seg["score"] = round(min(seg["score"] + multi_match_boost, 0.98), 4)
 
     # Sort by score, then by start time for stability
     merged_list = sorted(
@@ -1983,6 +2047,7 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                     "segment_ids": [seg["id"]],
                     "match_count": 1,
                     "texts": [seg.get("text", "")],
+                    "all_matched_terms": seg.get("matched_terms", []).copy(),  # Track all matched terms
                 })
             else:
                 last = merged_segs[-1]
@@ -2005,6 +2070,12 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                     for mt in seg.get("match_types", []):
                         if mt not in last.get("match_types", []):
                             last["match_types"].append(mt)
+                    # Merge matched_terms from consolidated segment
+                    for term in seg.get("matched_terms", []):
+                        term_str = term.get("term", "")
+                        existing_terms = {t.get("term", "") for t in last.get("all_matched_terms", [])}
+                        if term_str and term_str not in existing_terms:
+                            last["all_matched_terms"].append(term)
                     # Keep highest fuzzy score
                     last["fuzzy_score"] = max(last.get("fuzzy_score", 0), seg.get("fuzzy_score", 0))
                     # Keep highest LLM score if present
@@ -2020,6 +2091,7 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                         "segment_ids": [seg["id"]],
                         "match_count": 1,
                         "texts": [seg.get("text", "")],
+                        "all_matched_terms": seg.get("matched_terms", []).copy(),
                     })
         
         # Finalize text for each consolidated segment
@@ -2027,8 +2099,18 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
             # Join texts with proper spacing, removing duplicates
             seg["text"] = " ".join(seg["texts"])
             seg["text_length"] = len(seg["text"])
-            seg["matched_words_count"] = seg.get("match_count", 1)
+            # Update is_multi_match based on consolidated matched_terms
+            all_terms = seg.get("all_matched_terms", [])
+            seg["matched_terms"] = all_terms
+            seg["matched_words_count"] = len(all_terms)
+            seg["is_multi_match"] = len(all_terms) > 1
+            # Boost score further for consolidated multi-match
+            if seg["is_multi_match"] and seg.get("score", 0) < 0.98:
+                consolidated_boost = min(0.03 * (seg["match_count"] - 1), 0.10)  # Bonus for consolidated segments
+                seg["score"] = round(min(seg["score"] + consolidated_boost, 0.98), 4)
             del seg["texts"]  # Clean up temporary field
+            if "all_matched_terms" in seg:
+                del seg["all_matched_terms"]  # Clean up - use matched_terms instead
             consolidated_segments.append(seg)
     
     # Re-sort consolidated segments by score
@@ -2074,6 +2156,8 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                 "id": r["id"],
                 "segment_ids": r.get("segment_ids", [r["id"]]),  # All segment IDs that were consolidated
                 "match_count": r.get("match_count", 1),  # Number of segments consolidated
+                "is_multi_match": r.get("is_multi_match", False),  # True if multiple terms matched same segment
+                "matched_terms": r.get("matched_terms", []),  # List of {term, field, score} for each matched term
                 "score": round(r["score"], 4),
                 "match_types": r.get("match_types", []),
                 "matched_field": r.get("matched_field", ""),
