@@ -305,17 +305,29 @@ Return ONLY valid JSON with these fields:
 - semantic_query: the core search meaning (keep original language)
 - semantic_query_translated: translate to the OTHER language (Urdu→English, English→Urdu transliteration, if same language leave empty)
 - detected_language: "urdu" | "english" | "roman_urdu" | "mixed"
-- extracted_speaker: person name if mentioned, else null
+- extracted_speaker: person name ONLY if the user is clearly searching for content SPOKEN BY that person, else null
 - extracted_keywords: array of key terms for keyword matching
 - expanded_terms: 3-5 synonyms/related terms in BOTH languages (mix of Urdu and English)
-- query_type: "speaker_search" | "topic_search" | "quote_search" | "general"
+- query_type: "speaker_search" | "topic_search" | "quote_search" | "title_search" | "general"
+
+IMPORTANT RULES for extracted_speaker:
+1. ONLY set extracted_speaker when user wants content BY/FROM that person (e.g. "Hafiz Naeem speech" = user wants Hafiz Naeem's speech)
+2. Do NOT extract speaker if the query looks like a VIDEO TITLE (e.g. "The Future Mark Zuckerberg Is Trying To Build" is a title ABOUT Zuckerberg, not content BY him)
+3. Do NOT extract speaker if the person is the SUBJECT/TOPIC of the query rather than the SPEAKER
+4. When in doubt, set extracted_speaker to null - it's better to not filter than to wrongly filter
 
 Examples:
 Query: "Hafiz Naeem election speech"
 {"semantic_query": "Hafiz Naeem election speech", "semantic_query_translated": "حافظ نعیم الیکشن تقریر", "detected_language": "english", "extracted_speaker": "Hafiz Naeem", "extracted_keywords": ["election", "speech"], "expanded_terms": ["انتخابات", "vote", "ووٹ", "political rally", "سیاسی جلسہ"], "query_type": "speaker_search"}
 
 Query: "ملک کے حالات"
-{"semantic_query": "ملک کے حالات", "semantic_query_translated": "situation of the country", "detected_language": "urdu", "extracted_speaker": null, "extracted_keywords": ["ملک", "حالات"], "expanded_terms": ["country situation", "Pakistan crisis", "پاکستان", "معیشت", "economy"], "query_type": "topic_search"}"""},
+{"semantic_query": "ملک کے حالات", "semantic_query_translated": "situation of the country", "detected_language": "urdu", "extracted_speaker": null, "extracted_keywords": ["ملک", "حالات"], "expanded_terms": ["country situation", "Pakistan crisis", "پاکستان", "معیشت", "economy"], "query_type": "topic_search"}
+
+Query: "The Future Mark Zuckerberg Is Trying To Build"
+{"semantic_query": "The Future Mark Zuckerberg Is Trying To Build", "semantic_query_translated": "", "detected_language": "english", "extracted_speaker": null, "extracted_keywords": ["future", "Zuckerberg", "build", "Meta"], "expanded_terms": ["metaverse", "VR", "virtual reality", "Facebook", "technology"], "query_type": "title_search"}
+
+Query: "what did Imran Khan say about economy"
+{"semantic_query": "what did Imran Khan say about economy", "semantic_query_translated": "عمران خان نے معیشت کے بارے میں کیا کہا", "detected_language": "english", "extracted_speaker": "Imran Khan", "extracted_keywords": ["economy", "Imran Khan"], "expanded_terms": ["معیشت", "economic policy", "PTI", "finance"], "query_type": "speaker_search"}"""},
                 {"role": "user", "content": f"Analyze this search query: {query}"}
             ],
             max_tokens=300,
@@ -1066,10 +1078,15 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
             query_intent = understand_query(query_text)
             logger.info(f"LLM intent: {query_intent.get('query_type')}, lang={query_intent.get('detected_language')}, speaker={query_intent.get('extracted_speaker')}")
             
-            # Auto-extract speaker from query if not explicitly provided
+            # Auto-extract speaker from query ONLY if it's a speaker_search query type
+            # Do NOT apply speaker filter for title_search, topic_search, etc.
             if not speaker_filter and query_intent.get("extracted_speaker"):
-                speaker_filter = query_intent["extracted_speaker"]
-                logger.info(f"Auto-extracted speaker filter: {speaker_filter}")
+                query_type = query_intent.get("query_type", "general")
+                if query_type == "speaker_search":
+                    speaker_filter = query_intent["extracted_speaker"]
+                    logger.info(f"Auto-extracted speaker filter: {speaker_filter}")
+                else:
+                    logger.info(f"Skipping speaker filter (query_type={query_type}, not speaker_search)")
         except Exception as e:
             logger.warning(f"LLM understanding failed, continuing without: {e}")
     
