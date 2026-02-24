@@ -1955,10 +1955,87 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
             logger.info("LLM reranking returned no results")
     
     # Group by video and collect ALL matching segments per video
+    # CONSOLIDATE adjacent/overlapping segments into full segments
+    # This prevents showing chunks of the same segment multiple times
     videos_seen = {}
     final_results = []
     
+    # First, group all results by video_id
+    video_segments = {}
     for result in merged_list:
+        vid = result.get("video_id")
+        if vid not in video_segments:
+            video_segments[vid] = []
+        video_segments[vid].append(result)
+    
+    # For each video, consolidate overlapping/adjacent segments
+    consolidated_segments = []
+    for vid, segments in video_segments.items():
+        # Sort segments by start_time
+        segments.sort(key=lambda x: x.get("start_time", 0))
+        
+        # Merge adjacent/overlapping segments (within 5 seconds)
+        merged_segs = []
+        for seg in segments:
+            if not merged_segs:
+                merged_segs.append({
+                    **seg,
+                    "segment_ids": [seg["id"]],
+                    "match_count": 1,
+                    "texts": [seg.get("text", "")],
+                })
+            else:
+                last = merged_segs[-1]
+                last_end = last.get("end_time", 0)
+                seg_start = seg.get("start_time", 0)
+                
+                # If segments are adjacent or overlapping (within 5 sec gap)
+                if seg_start <= last_end + 5:
+                    # Consolidate into the existing segment
+                    last["segment_ids"].append(seg["id"])
+                    last["match_count"] += 1
+                    last["end_time"] = max(last.get("end_time", 0), seg.get("end_time", 0))
+                    last["duration"] = round(last["end_time"] - last["start_time"], 2)
+                    last["score"] = max(last.get("score", 0), seg.get("score", 0))
+                    # Append text if not duplicate
+                    seg_text = seg.get("text", "")
+                    if seg_text and seg_text not in " ".join(last["texts"]):
+                        last["texts"].append(seg_text)
+                    # Merge match types
+                    for mt in seg.get("match_types", []):
+                        if mt not in last.get("match_types", []):
+                            last["match_types"].append(mt)
+                    # Keep highest fuzzy score
+                    last["fuzzy_score"] = max(last.get("fuzzy_score", 0), seg.get("fuzzy_score", 0))
+                    # Keep highest LLM score if present
+                    if seg.get("llm_relevance_score"):
+                        last["llm_relevance_score"] = max(
+                            last.get("llm_relevance_score") or 0, 
+                            seg.get("llm_relevance_score", 0)
+                        )
+                else:
+                    # New segment group
+                    merged_segs.append({
+                        **seg,
+                        "segment_ids": [seg["id"]],
+                        "match_count": 1,
+                        "texts": [seg.get("text", "")],
+                    })
+        
+        # Finalize text for each consolidated segment
+        for seg in merged_segs:
+            # Join texts with proper spacing, removing duplicates
+            seg["text"] = " ".join(seg["texts"])
+            seg["text_length"] = len(seg["text"])
+            seg["matched_words_count"] = seg.get("match_count", 1)
+            del seg["texts"]  # Clean up temporary field
+            consolidated_segments.append(seg)
+    
+    # Re-sort consolidated segments by score
+    consolidated_segments.sort(key=lambda x: (x.get("score", 0), -x.get("start_time", 0)), reverse=True)
+    
+    # Apply limits (up to 10 segments per video, top_k total)
+    for result in consolidated_segments:
         vid = result.get("video_id")
         if vid not in videos_seen:
             videos_seen[vid] = 0
@@ -1970,8 +2047,8 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
         
         if len(final_results) >= top_k:
             break
-    
-    logger.info(f"Search completed: {len(speaker_results)} speaker + {len(semantic_results)} semantic + {len(keyword_results)} keyword + {len(title_results)} title = {len(final_results)} merged results from {len(videos_seen)} videos")
+
+    logger.info(f"Search completed: {len(speaker_results)} speaker + {len(semantic_results)} semantic + {len(keyword_results)} keyword + {len(title_results)} title = {len(final_results)} merged results from {len(videos_seen)} videos (consolidated from {len(merged_list)} raw matches)")
 
     return {
         "query": query_text,
@@ -1995,6 +2072,8 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
         "results": [
             {
                 "id": r["id"],
+                "segment_ids": r.get("segment_ids", [r["id"]]),  # All segment IDs that were consolidated
+                "match_count": r.get("match_count", 1),  # Number of segments consolidated
                 "score": round(r["score"], 4),
                 "match_types": r.get("match_types", []),
                 "matched_field": r.get("matched_field", ""),
