@@ -234,8 +234,10 @@ def get_openai_embeddings_batch(texts: List[str], model_name: str = None) -> Lis
         # Clean texts
         cleaned_texts = [text.replace("\n", " ").strip() for text in texts]
         
-        # Sub-batch for OpenAI API limit (max 2048 inputs per call)
-        SUB_BATCH_SIZE = 2000
+        # Sub-batch for OpenAI API token limit (max 300,000 tokens per request)
+        # With enriched text averaging ~1,000-1,500 tokens per segment, use 100 segments
+        # to stay well under the limit (100 * 2,000 = 200,000 tokens max)
+        SUB_BATCH_SIZE = 100
         all_embeddings = []
         
         for i in range(0, len(cleaned_texts), SUB_BATCH_SIZE):
