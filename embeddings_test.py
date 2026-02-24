@@ -929,11 +929,17 @@ async def embed_video(data: EmbedVideoRequest, authorized: bool = Depends(verify
         logger.info(f"Inserting {len(points)} points into Qdrant...")
         
         try:
-            qdrant_client.upsert(
-                collection_name=SEGMENTS_COLLECTION,
-                points=points,
-                wait=True
-            )
+            # Sub-batch upsert to stay under Qdrant's 32MB payload limit
+            # Each point is ~70KB (3072-dim vector + payload), so 150 points ≈ 10MB (safe)
+            QDRANT_BATCH_SIZE = 150
+            for i in range(0, len(points), QDRANT_BATCH_SIZE):
+                sub_batch = points[i:i + QDRANT_BATCH_SIZE]
+                logger.info(f"Upserting Qdrant sub-batch {i // QDRANT_BATCH_SIZE + 1}: {len(sub_batch)} points")
+                qdrant_client.upsert(
+                    collection_name=SEGMENTS_COLLECTION,
+                    points=sub_batch,
+                    wait=True
+                )
             logger.info(f"Successfully inserted {len(points)} points")
         except Exception as e:
             logger.info(f"ERROR:  Qdrant insertion failed: {str(e)}")
