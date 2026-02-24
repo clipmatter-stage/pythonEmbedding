@@ -786,6 +786,10 @@ async def embed_video(data: EmbedVideoRequest, authorized: bool = Depends(verify
         segment_metadata = []
         
         for idx, segment in enumerate(identification_segments):
+            # Use segment_index from payload if provided (preserves global index across batches)
+            # Fall back to enumerate index for backward compatibility
+            segment_index = segment.get("segment_index", idx)
+            
             speaker = segment.get("speaker", "UNKNOWN")
             text = segment.get("text", "")
             start_time = float(segment.get("start", 0))
@@ -813,7 +817,7 @@ async def embed_video(data: EmbedVideoRequest, authorized: bool = Depends(verify
             
             texts_to_embed.append(enriched_text)
             segment_metadata.append({
-                'idx': idx,
+                'idx': segment_index,  # Use global segment_index, not batch-local idx
                 'speaker':  speaker,
                 'diarization_speaker': diarization_speaker,
                 'match_type': match_type,
