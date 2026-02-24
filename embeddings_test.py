@@ -438,8 +438,8 @@ Be strict - only give high scores to truly relevant results."""},
             reranked.append(result_copy)
         
         # Filter out irrelevant results (LLM score < 0.2 = score < 2/10)
-        # But never filter out title matches — user searched for the title, so those are always relevant
-        reranked = [r for r in reranked if r.get("llm_relevance_score", 0) >= 0.2 or "title_match" in r.get("match_types", [])]
+        # But never filter out title matches or exact phrase matches — these are confirmed user-intent matches
+        reranked = [r for r in reranked if r.get("llm_relevance_score", 0) >= 0.2 or "title_match" in r.get("match_types", []) or "exact_phrase_match" in r.get("match_types", [])]
         
         # Sort by new combined score
         reranked.sort(key=lambda x: x.get("score", 0), reverse=True)
@@ -1921,29 +1921,36 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
     )
     
     # ADVANCED: Apply LLM reranking if enabled (replaces Cohere English-only reranker)
-    # Protect title-matched results: they should keep a minimum score floor
+    # Protect title-matched and exact-phrase-matched results: they should keep a minimum score floor
     if use_reranking and query_text and len(merged_list) > 0:
         logger.info(f"Applying LLM reranking to {len(merged_list)} results...")
         
-        # Remember pre-rerank title match scores so we can enforce a floor
+        # Remember pre-rerank scores for protected match types so we can enforce a floor
         title_match_scores = {}
+        exact_phrase_scores = {}
         for r in merged_list:
             if "title_match" in r.get("match_types", []):
                 title_match_scores[r["id"]] = r["score"]
+            if "exact_phrase_match" in r.get("match_types", []):
+                exact_phrase_scores[r["id"]] = r["score"]
         
         merged_list = rerank_with_llm(query_text, merged_list, top_k=min(len(merged_list), top_k * 3))
         
-        # Restore title-match floor: if LLM dropped a title-matched result below its
-        # original score, bring it back up. Title matches are user-intent matches.
+        # Restore score floors for protected match types
+        # Exact phrase matches should keep at least 0.95 (they are confirmed transcript matches!)
+        # Title matches should keep a floor proportional to their original score
         if merged_list:
             for r in merged_list:
-                if r["id"] in title_match_scores:
+                if r["id"] in exact_phrase_scores:
+                    # Exact phrase matches are confirmed - keep very high score
+                    r["score"] = round(max(r["score"], 0.95), 4)
+                elif r["id"] in title_match_scores:
                     original = title_match_scores[r["id"]]
                     if r["score"] < original * 0.7:
                         r["score"] = round(max(r["score"], original * 0.80), 4)
             # Re-sort after floor adjustments
             merged_list.sort(key=lambda x: x.get("score", 0), reverse=True)
-            logger.info(f"LLM reranking complete, top score: {merged_list[0].get('score', 0):.4f}, title-protected: {len(title_match_scores)}")
+            logger.info(f"LLM reranking complete, top score: {merged_list[0].get('score', 0):.4f}, title-protected: {len(title_match_scores)}, exact-phrase-protected: {len(exact_phrase_scores)}")
         else:
             logger.info("LLM reranking returned no results")
     
