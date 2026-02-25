@@ -1161,6 +1161,47 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
             )
 
     search_filter = Filter(must=filter_conditions) if filter_conditions else None
+    
+    # Title search filter: Skip language filter for universal queries (years, numbers)
+    # This allows searching "2023" to find videos titled "Something 2023" in ANY language
+    def is_universal_query(q):
+        """Check if query is a universal term like a year/number that shouldn't be language-restricted"""
+        if not q:
+            return False
+        q = q.strip()
+        # Pure numbers (including years like 2023, 2024)
+        if q.isdigit():
+            return True
+        # Years with surrounding text like "2023" or numbers
+        if any(c.isdigit() for c in q) and len(q) <= 10:
+            # Short queries with numbers are likely universal (e.g., "2023", "vol 2")
+            return True
+        return False
+    
+    title_filter_conditions = []
+    if video_id_filter is not None:
+        title_filter_conditions.append(
+            FieldCondition(key="video_id", match=MatchValue(value=video_id_filter))
+        )
+    # NOTE: Intentionally NOT adding language_filter for universal queries
+    # This allows title search to find "2023" in videos of any language
+    query_for_title = title_filter or query_text or ""
+    if language_filter is not None and not is_universal_query(query_for_title):
+        title_filter_conditions.append(
+            FieldCondition(key="language", match=MatchValue(value=language_filter))
+        )
+    if time_range:
+        start_t = time_range.get("start")
+        end_t = time_range.get("end")
+        if start_t is not None:
+            title_filter_conditions.append(
+                FieldCondition(key="start_time", range=models.Range(gte=start_t))
+            )
+        if end_t is not None:
+            title_filter_conditions.append(
+                FieldCondition(key="end_time", range=models.Range(lte=end_t))
+            )
+    title_search_filter = Filter(must=title_filter_conditions) if title_filter_conditions else None
 
     semantic_results = []
     keyword_results = []
@@ -1759,7 +1800,7 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
             while scanned < max_scan_title:
                 points, next_offset = qdrant_client.scroll(
                     collection_name=SEGMENTS_COLLECTION,
-                    scroll_filter=search_filter,
+                    scroll_filter=title_search_filter,  # Use title-specific filter (no language restriction for universal queries)
                     limit=min(1000, max_scan_title - scanned),
                     offset=offset,
                     with_payload=True,
