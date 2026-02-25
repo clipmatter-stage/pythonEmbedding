@@ -2648,7 +2648,7 @@ async def health():
                 "legacy":  LEGACY_COLLECTION
             },
             "points_count": collection_info.points_count,
-            "vectors_count": collection_info.vectors_count,
+            "indexed_vectors_count": getattr(collection_info, 'indexed_vectors_count', None),
             "features": {
                 "openai_embeddings": USE_OPENAI_EMBEDDINGS,
                 "fastembed_model": FASTEMBED_MODEL_NAME,
@@ -2670,8 +2670,7 @@ async def stats():
         return {
             "collection":  SEGMENTS_COLLECTION,
             "points_count": collection_info.points_count,
-            "vectors_count": collection_info.vectors_count,
-            "indexed_vectors_count": collection_info.indexed_vectors_count,
+            "indexed_vectors_count": getattr(collection_info, 'indexed_vectors_count', None),
             "status": collection_info.status,
             "optimizer_status": collection_info.optimizer_status,
             "config": {
