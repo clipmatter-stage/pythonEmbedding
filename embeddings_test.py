@@ -1977,10 +1977,14 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
             multi_match_boost = min(0.05 * (num_unique_terms - 1), 0.15)  # Max 15% boost
             seg["score"] = round(min(seg["score"] + multi_match_boost, 0.98), 4)
 
-    # Sort by score, then by start time for stability
+    # Sort: EXACT PHRASE MATCHES FIRST, then by score, then by start time for stability
     merged_list = sorted(
         merged.values(),
-        key=lambda x: (x.get("score", 0), -x.get("start_time", 0)),
+        key=lambda x: (
+            1 if "exact_phrase_match" in x.get("match_types", []) else 0,  # Exact phrase first
+            x.get("score", 0),
+            -x.get("start_time", 0)
+        ),
         reverse=True
     )
     
@@ -2001,20 +2005,30 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
         merged_list = rerank_with_llm(query_text, merged_list, top_k=min(len(merged_list), top_k * 3))
         
         # Restore score floors for protected match types
-        # Exact phrase matches should keep at least 0.95 (they are confirmed transcript matches!)
+        # Exact phrase matches should ALWAYS keep 0.99 score (they are confirmed transcript matches!)
         # Title matches should keep a floor proportional to their original score
         if merged_list:
             for r in merged_list:
                 if r["id"] in exact_phrase_scores:
-                    # Exact phrase matches are confirmed - keep very high score
-                    r["score"] = round(max(r["score"], 0.95), 4)
+                    # Exact phrase matches are CONFIRMED matches - always restore 0.99 score
+                    r["score"] = 0.99
+                    # Ensure the match type is preserved
+                    if "exact_phrase_match" not in r.get("match_types", []):
+                        r["match_types"].append("exact_phrase_match")
                 elif r["id"] in title_match_scores:
                     original = title_match_scores[r["id"]]
                     if r["score"] < original * 0.7:
                         r["score"] = round(max(r["score"], original * 0.80), 4)
-            # Re-sort after floor adjustments
-            merged_list.sort(key=lambda x: x.get("score", 0), reverse=True)
-            logger.info(f"LLM reranking complete, top score: {merged_list[0].get('score', 0):.4f}, title-protected: {len(title_match_scores)}, exact-phrase-protected: {len(exact_phrase_scores)}")
+            # Re-sort: EXACT PHRASE MATCHES FIRST, then by score
+            # This ensures exact matches are always at the top regardless of LLM score
+            merged_list.sort(
+                key=lambda x: (
+                    1 if "exact_phrase_match" in x.get("match_types", []) else 0,  # Exact phrase first
+                    x.get("score", 0)  # Then by score
+                ),
+                reverse=True
+            )
+            logger.info(f"LLM reranking complete, top score: {merged_list[0].get('score', 0):.4f}, exact-phrase-protected: {len(exact_phrase_scores)}, title-protected: {len(title_match_scores)}")
         else:
             logger.info("LLM reranking returned no results")
     
@@ -2113,8 +2127,21 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                 del seg["all_matched_terms"]  # Clean up - use matched_terms instead
             consolidated_segments.append(seg)
     
-    # Re-sort consolidated segments by score
-    consolidated_segments.sort(key=lambda x: (x.get("score", 0), -x.get("start_time", 0)), reverse=True)
+    # Re-sort consolidated segments: EXACT PHRASE MATCHES ALWAYS FIRST, then by score
+    # This ensures exact transcript matches are always shown at the top of results
+    consolidated_segments.sort(
+        key=lambda x: (
+            1 if "exact_phrase_match" in x.get("match_types", []) else 0,  # Exact phrase first
+            x.get("score", 0),  # Then by score
+            -x.get("start_time", 0)  # Then by start time
+        ),
+        reverse=True
+    )
+    
+    # Log exact phrase matches for debugging
+    exact_phrase_count = sum(1 for s in consolidated_segments if "exact_phrase_match" in s.get("match_types", []))
+    if exact_phrase_count > 0:
+        logger.info(f"Exact phrase matches found: {exact_phrase_count} segments will be prioritized at top")
     
     # Apply limits (up to 10 segments per video, top_k total)
     for result in consolidated_segments:
@@ -2141,6 +2168,7 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
         "total_semantic_hits": len(semantic_results),
         "total_keyword_hits": len(keyword_results),
         "total_title_hits": len(title_results),
+        "total_exact_phrase_hits": len(exact_phrase_results),  # Exact transcript matches
         "returned":  len(final_results),
         "unique_videos": len(videos_seen),
         "filters_applied": {
@@ -2156,6 +2184,7 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                 "id": r["id"],
                 "segment_ids": r.get("segment_ids", [r["id"]]),  # All segment IDs that were consolidated
                 "match_count": r.get("match_count", 1),  # Number of segments consolidated
+                "is_exact_phrase_match": "exact_phrase_match" in r.get("match_types", []),  # True if exact query text found in transcript
                 "is_multi_match": r.get("is_multi_match", False),  # True if multiple terms matched same segment
                 "matched_terms": r.get("matched_terms", []),  # List of {term, field, score} for each matched term
                 "score": round(r["score"], 4),
