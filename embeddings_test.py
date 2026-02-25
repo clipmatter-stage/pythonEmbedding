@@ -1459,7 +1459,9 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                 except Exception as e:
                     logger.warning(f"Query expansion failed: {e}")
             
-            logger.info(f"Total query variations: {len(query_variations)}")
+            # Limit query variations for speed - original query is most important
+            query_variations = query_variations[:2]  # Max 2 variations for speed
+            logger.info(f"Total query variations (capped): {len(query_variations)}")
             
             # Search with all query variations
             all_semantic_results = {}  # Use dict to deduplicate by ID
@@ -1468,9 +1470,9 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                 # Use cached embedding for repeated queries
                 query_vector = get_cached_embedding(q_var)
                 
-                # Adjust search parameters for better results
+                # Adjust search parameters - balance speed vs recall
                 search_params = SearchParams(
-                    hnsw_ef=128,  # Higher ef for better recall
+                    hnsw_ef=64,   # Reduced from 128 for faster search
                     exact=False   # Use approximate search for speed
                 )
 
@@ -1483,7 +1485,7 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                 sem_search_response = qdrant_client.query_points(
                     collection_name=SEGMENTS_COLLECTION,
                     query=query_vector,
-                    limit=top_k * 3 if idx == 0 else top_k,  # Primary query gets more
+                    limit=top_k * 2 if idx == 0 else top_k,  # Reduced from 3x for speed
                     score_threshold=retrieval_threshold,  # Lower threshold — filter later
                     query_filter=search_filter,
                     with_payload=True,
@@ -1602,16 +1604,18 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
     if search_words:
         try:
             # Cap keyword search to avoid timeout - keyword matching is fast but needs limit
-            max_scan_keyword = min(max_scanned, 5000)
+            max_scan_keyword = min(max_scanned, 3000)  # Reduced from 5000 for speed
             logger.info(f"Elastic keyword search for: {search_words[:10]} (max_scanned={max_scan_keyword})")
             words_lower = search_words  # already lowercased by normalize_word
-            page_size = 1000
+            page_size = 500  # Smaller batches for faster response
             scanned = 0
             offset = None
 
             scroll_filter = search_filter
 
-            while scanned < max_scan_keyword and len(keyword_results) < top_k * 2:
+            # Early termination when we have enough results
+            target_results = max(top_k, 20)
+            while scanned < max_scan_keyword and len(keyword_results) < target_results:
                 points, next_offset = qdrant_client.scroll(
                     collection_name=SEGMENTS_COLLECTION,
                     scroll_filter=scroll_filter,
@@ -2052,8 +2056,12 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
     )
     
     # ADVANCED: Apply LLM reranking if enabled (replaces Cohere English-only reranker)
+    # Skip reranking for small result sets (not worth the latency) or when we have good matches
     # Protect title-matched and exact-phrase-matched results: they should keep a minimum score floor
-    if use_reranking and query_text and len(merged_list) > 0:
+    has_high_confidence_results = any(r.get("score", 0) >= 0.8 for r in merged_list[:5])
+    should_rerank = use_reranking and query_text and len(merged_list) >= 15 and not has_high_confidence_results
+    
+    if should_rerank:
         logger.info(f"Applying LLM reranking to {len(merged_list)} results...")
         
         # Remember pre-rerank scores for protected match types so we can enforce a floor
@@ -2094,6 +2102,8 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
             logger.info(f"LLM reranking complete, top score: {merged_list[0].get('score', 0):.4f}, exact-phrase-protected: {len(exact_phrase_scores)}, title-protected: {len(title_match_scores)}")
         else:
             logger.info("LLM reranking returned no results")
+    elif use_reranking and query_text:
+        logger.info(f"Skipping LLM reranking (results={len(merged_list)}, high_confidence={has_high_confidence_results}) for speed")
     
     # Group by video and collect ALL matching segments per video
     # CONSOLIDATE adjacent/overlapping segments into full segments
