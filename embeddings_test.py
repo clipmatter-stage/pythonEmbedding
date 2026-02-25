@@ -1818,36 +1818,7 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                     
                     # Skip if we've already determined this video's title match status
                     if vid in seen_titles:
-                        # If this video already matched, collect the segment
-                        if vid in matched_video_ids and p.id not in existing_ids:
-                            spk = payload.get("speaker", "")
-                            diar_spk = payload.get("diarization_speaker", "")
-                            
-                            # Apply speaker filter if present
-                            if speaker_filter:
-                                speaker_combined = f"{spk} {diar_spk}".strip()
-                                if not fuzzy_match_speaker(speaker_filter, speaker_combined, threshold=70):
-                                    continue
-                            
-                            title_results.append({
-                                "id": p.id,
-                                "score": round(matched_video_scores.get(vid, 0.7), 4),
-                                "video_id": vid,
-                                "video_title": video_title,
-                                "speaker": spk,
-                                "diarization_speaker": diar_spk,
-                                "start_time": payload.get("start_time", 0),
-                                "end_time": payload.get("end_time", 0),
-                                "duration": round((payload.get("end_time", 0) - payload.get("start_time", 0)), 2),
-                                "text": payload.get("text", ""),
-                                "text_length": payload.get("text_length", 0),
-                                "youtube_url": payload.get("youtube_url", ""),
-                                "language": payload.get("language", ""),
-                                "created_at": payload.get("created_at"),
-                                "match_types": ["title_match"],
-                                "fuzzy_score": round(matched_video_scores.get(vid, 0.7), 2),
-                                "matched_field": "video_title",
-                            })
+                        # Already processed this video - skip (title match = 1 entry per video)
                         continue
                     
                     # First time seeing this video — check title match
@@ -1880,38 +1851,31 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                         matched_video_ids.add(vid)
                         matched_video_scores[vid] = min(best_title_score, 0.98)
                         
-                        # Add this segment if not already in other results
-                        if p.id not in existing_ids:
-                            spk = payload.get("speaker", "")
-                            diar_spk = payload.get("diarization_speaker", "")
-                            
-                            if speaker_filter:
-                                speaker_combined = f"{spk} {diar_spk}".strip()
-                                if not fuzzy_match_speaker(speaker_filter, speaker_combined, threshold=70):
-                                    continue
-                            
-                            title_results.append({
-                                "id": p.id,
-                                "score": round(matched_video_scores[vid], 4),
-                                "video_id": vid,
-                                "video_title": video_title,
-                                "speaker": spk,
-                                "diarization_speaker": diar_spk,
-                                "start_time": payload.get("start_time", 0),
-                                "end_time": payload.get("end_time", 0),
-                                "duration": round((payload.get("end_time", 0) - payload.get("start_time", 0)), 2),
-                                "text": payload.get("text", ""),
-                                "text_length": payload.get("text_length", 0),
-                                "youtube_url": payload.get("youtube_url", ""),
-                                "language": payload.get("language", ""),
-                                "created_at": payload.get("created_at"),
-                                "match_types": ["title_match"],
-                                "fuzzy_score": round(best_title_score, 2),
-                                "matched_field": "video_title",
-                            })
+                        # For title matches, add ONE video-level entry (no segment details)
+                        # Use this segment's metadata for video info only
+                        title_results.append({
+                            "id": f"title_match_{vid}",  # Special ID for title-only match
+                            "score": round(matched_video_scores[vid], 4),
+                            "video_id": vid,
+                            "video_title": video_title,
+                            "speaker": "",  # No specific speaker for video-level match
+                            "diarization_speaker": "",
+                            "start_time": 0,  # Represents entire video
+                            "end_time": 0,
+                            "duration": 0,
+                            "text": "",  # No segment text - this is a title match
+                            "text_length": 0,
+                            "youtube_url": payload.get("youtube_url", ""),
+                            "language": payload.get("language", ""),
+                            "created_at": payload.get("created_at"),
+                            "match_types": ["title_match"],
+                            "fuzzy_score": round(best_title_score, 2),
+                            "matched_field": "video_title",
+                            "is_video_only": True,  # Flag to indicate this is video-level, not segment
+                        })
                 
-                # Stop early if we found enough title-matched segments
-                if len(title_results) >= top_k * 2:
+                # Stop early if we found enough title-matched videos
+                if len(title_results) >= top_k:
                     break
                     
                 offset = next_offset
