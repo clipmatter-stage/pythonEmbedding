@@ -1721,12 +1721,13 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
             logger.info(f"ERROR during keyword search: {str(e)}")
             raise HTTPException(status_code=500, detail=f"Keyword search error: {str(e)}")
 
-    # Strategy 3: Title matching — ONLY when user explicitly provides a title filter
-    # This prevents returning videos based on title match when user is searching transcripts.
-    # For regular searches, we only want transcript content matches (semantic + keyword).
-    # Title matching ONLY runs when title_filter is explicitly provided.
-    title_query = title_filter or ""
-    if title_query and len(title_query.strip()) >= 3:
+    # Strategy 3: Title matching — search video titles for the query
+    # Runs when either:
+    # 1. User provides explicit title_filter (e.g., title:2023)
+    # 2. User searches with query_text (automatic title search with lower priority)
+    # This ensures searching "2023" finds videos with "2023" in the title
+    title_query = title_filter or query_text or ""
+    if title_query and len(title_query.strip()) >= 2:  # Reduced from 3 to 2 for short queries like "2023"
         try:
             logger.info(f"Title matching search for: '{title_query[:120]}'")
             
