@@ -1427,9 +1427,9 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                 # after combined scoring (semantic + keyword + fuzzy bonuses).
                 retrieval_threshold = max(min_score * 0.6, 0.15)  # e.g. 0.35 * 0.6 = 0.21
                 
-                sem_search_results = qdrant_client.search(
+                sem_search_response = qdrant_client.query_points(
                     collection_name=SEGMENTS_COLLECTION,
-                    query_vector=query_vector,
+                    query=query_vector,
                     limit=top_k * 3 if idx == 0 else top_k,  # Primary query gets more
                     score_threshold=retrieval_threshold,  # Lower threshold — filter later
                     query_filter=search_filter,
@@ -1437,6 +1437,7 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                     with_vectors=False,
                     search_params=search_params
                 )
+                sem_search_results = sem_search_response.points
                 
                 # Process results from this query variation
                 for r in sem_search_results:
@@ -2314,15 +2315,16 @@ async def search_multi_video(data: dict):
             ]
         )
         
-        search_results = qdrant_client.search(
+        search_response = qdrant_client.query_points(
             collection_name=SEGMENTS_COLLECTION,
-            query_vector=query_vector,
+            query=query_vector,
             limit=top_k * len(video_ids),
             score_threshold=min_score,
             query_filter=search_filter,
             with_payload=True,
             with_vectors=False
         )
+        search_results = search_response.points
         
         results_by_video = {}
         for r in search_results:
