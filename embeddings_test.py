@@ -48,6 +48,59 @@ USE_OPENAI_EMBEDDINGS = os.getenv("USE_OPENAI_EMBEDDINGS", "true").lower() == "t
 OPENAI_EMBEDDING_MODEL = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-large")  # Using large model for best quality
 EMBEDDING_DIMENSION = int(os.getenv("EMBEDDING_DIMENSION", "3072"))  # 3072 dimensions for text-embedding-3-large
 
+# ============== STOP WORDS FOR KEYWORD SEARCH ==============
+# Common words that should be filtered out to speed up keyword search
+# These words match too many documents and slow down the search significantly
+STOP_WORDS = frozenset({
+    # Articles & determiners
+    "a", "an", "the", "this", "that", "these", "those", "some", "any", "no", "every",
+    # Pronouns
+    "i", "me", "my", "mine", "we", "us", "our", "ours", "you", "your", "yours",
+    "he", "him", "his", "she", "her", "hers", "it", "its", "they", "them", "their", "theirs",
+    "who", "whom", "whose", "which", "what", "whoever", "whatever",
+    # Prepositions
+    "in", "on", "at", "to", "for", "of", "with", "by", "from", "up", "down", "into",
+    "out", "over", "under", "off", "about", "through", "during", "before", "after",
+    "above", "below", "between", "among", "against", "toward", "towards",
+    # Conjunctions
+    "and", "or", "but", "nor", "so", "yet", "both", "either", "neither", "not", "only",
+    "if", "then", "else", "when", "where", "while", "although", "though", "because", "unless",
+    # Common verbs
+    "is", "are", "was", "were", "be", "been", "being", "am",
+    "have", "has", "had", "having", "do", "does", "did", "doing", "done",
+    "will", "would", "shall", "should", "may", "might", "must", "can", "could",
+    "get", "got", "getting", "go", "goes", "going", "went", "gone",
+    "say", "says", "said", "saying", "make", "makes", "made", "making",
+    "know", "knows", "knew", "known", "knowing", "think", "thinks", "thought", "thinking",
+    "see", "sees", "saw", "seen", "seeing", "want", "wants", "wanted", "wanting",
+    "come", "comes", "came", "coming", "take", "takes", "took", "taking", "taken",
+    "give", "gives", "gave", "giving", "given", "use", "uses", "used", "using",
+    "find", "finds", "found", "finding", "tell", "tells", "told", "telling",
+    "put", "puts", "putting", "let", "lets", "letting", "keep", "keeps", "kept", "keeping",
+    "begin", "begins", "began", "beginning", "begun", "seem", "seems", "seemed", "seeming",
+    "help", "helps", "helped", "helping", "show", "shows", "showed", "showing", "shown",
+    "try", "tries", "tried", "trying", "ask", "asks", "asked", "asking",
+    "work", "works", "worked", "working", "need", "needs", "needed", "needing",
+    "feel", "feels", "felt", "feeling", "become", "becomes", "became", "becoming",
+    "leave", "leaves", "left", "leaving", "call", "calls", "called", "calling",
+    # Adverbs
+    "very", "really", "just", "also", "too", "even", "still", "already", "always", "never",
+    "often", "sometimes", "now", "then", "here", "there", "where", "when", "why", "how",
+    "more", "most", "less", "least", "well", "much", "many", "few", "little", "big", 
+    # Other common words
+    "one", "two", "first", "last", "new", "old", "good", "great", "high", "low",
+    "small", "large", "long", "short", "right", "wrong", "same", "different",
+    "other", "another", "such", "own", "back", "away", "around", "again",
+    "something", "anything", "everything", "nothing", "someone", "anyone", "everyone", "nobody",
+    "thing", "things", "way", "ways", "day", "days", "time", "times", "year", "years",
+    "people", "person", "man", "woman", "men", "women", "child", "children",
+    "part", "parts", "place", "places", "case", "cases", "week", "weeks", "point", "points",
+    "fact", "facts", "hand", "hands", "side", "sides", "world", "life", "being",
+    # Urdu common words (transliterated)
+    "hai", "hain", "tha", "thi", "the", "ka", "ki", "ke", "ko", "ne", "se", "mein", "par",
+    "aur", "ya", "lekin", "jo", "jab", "kya", "kaise", "kahan", "yeh", "woh", "koi", "kuch",
+})
+
 # Initialize OpenAI client if enabled
 openai_client = None
 if USE_OPENAI_EMBEDDINGS:
@@ -1530,12 +1583,13 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
     # DO NOT mix semantic query words into keyword search to avoid false matches
     search_words = list(words) if words else []
     
-    # Clean up search words: normalize quotes/dashes, strip punctuation, remove too-short words
+    # Clean up search words: normalize quotes/dashes, strip punctuation, remove too-short words and stop words
     search_words = list(set(
         normalize_word(w)
         for w in search_words
-        if len(normalize_word(w)) >= 2
+        if len(normalize_word(w)) >= 2 and normalize_word(w).lower() not in STOP_WORDS
     ))
+    logger.info(f"Keywords after stop word filtering: {len(search_words)} words")
     
     # EXACT PHRASE MATCHING: Prepare the full original query for exact substring match
     # This ensures that when user searches for "before Windows 95, 1984" and that exact
@@ -1547,7 +1601,9 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
     
     if search_words:
         try:
-            logger.info(f"Elastic keyword search for: {search_words[:10]} (max_scanned={max_scanned})")
+            # Cap keyword search to avoid timeout - keyword matching is fast but needs limit
+            max_scan_keyword = min(max_scanned, 5000)
+            logger.info(f"Elastic keyword search for: {search_words[:10]} (max_scanned={max_scan_keyword})")
             words_lower = search_words  # already lowercased by normalize_word
             page_size = 1000
             scanned = 0
@@ -1555,11 +1611,11 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
 
             scroll_filter = search_filter
 
-            while scanned < max_scanned and len(keyword_results) < top_k * 2:
+            while scanned < max_scan_keyword and len(keyword_results) < top_k * 2:
                 points, next_offset = qdrant_client.scroll(
                     collection_name=SEGMENTS_COLLECTION,
                     scroll_filter=scroll_filter,
-                    limit=min(page_size, max_scanned - scanned),
+                    limit=min(page_size, max_scan_keyword - scanned),
                     offset=offset,
                     with_payload=True,
                     with_vectors=False
