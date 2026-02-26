@@ -1945,31 +1945,59 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                     
                     # Check each title query variation
                     best_title_score = 0
+                    has_real_overlap = False  # MUST have actual string overlap to be valid
+                    
                     for tq in title_queries:
                         tq_lower = tq.lower().strip()
                         vt_lower = video_title.lower().strip()
                         
-                        # Exact substring - highest priority
+                        # Extract query words (min 2 chars) for overlap checking
+                        query_words = [w for w in tq_lower.split() if len(w) >= 2]
+                        title_words = [w for w in vt_lower.split() if len(w) >= 2]
+                        
+                        # === STEP 1: Check for ACTUAL string overlap ===
+                        # This prevents fuzzy algorithms from matching unrelated strings
+                        overlap_found = False
+                        overlap_score = 0
+                        
+                        # Check if full query is substring of title or vice versa
                         if tq_lower in vt_lower or vt_lower in tq_lower:
-                            best_title_score = max(best_title_score, 0.95)
+                            overlap_found = True
+                            overlap_score = 0.95
                         else:
-                            # Multiple fuzzy matching strategies for better recall
-                            partial = fuzz.partial_ratio(tq_lower, vt_lower) / 100
+                            # Check word-level overlap (more reliable than fuzzy for title matching)
+                            for qw in query_words:
+                                # Exact word match
+                                if qw in title_words:
+                                    overlap_found = True
+                                    overlap_score = max(overlap_score, 0.85)
+                                # Query word is substring of title word (e.g., "rehma" in "rehmaa")
+                                elif any(qw in tw for tw in title_words):
+                                    overlap_found = True
+                                    overlap_score = max(overlap_score, 0.80)
+                                # Title word is substring of query word
+                                elif any(tw in qw for tw in title_words if len(tw) >= 3):
+                                    overlap_found = True
+                                    overlap_score = max(overlap_score, 0.75)
+                        
+                        if overlap_found:
+                            has_real_overlap = True
+                            best_title_score = max(best_title_score, overlap_score)
+                        else:
+                            # === STEP 2: Fuzzy matching ONLY if overlap exists somewhere ===
+                            # Use very strict fuzzy matching - only for handling typos
                             ratio = fuzz.ratio(tq_lower, vt_lower) / 100
-                            token_sort = fuzz.token_sort_ratio(tq_lower, vt_lower) / 100
-                            token_set = fuzz.token_set_ratio(tq_lower, vt_lower) / 100  # Handles word subsets well
                             
-                            # Word-by-word matching: count how many query words appear in title
-                            query_words = [w for w in tq_lower.split() if len(w) >= 2]
-                            title_words = vt_lower.split()
-                            if query_words:
-                                words_found = sum(1 for qw in query_words if any(qw in tw or tw in qw for tw in title_words))
-                                word_match_score = words_found / len(query_words)
-                            else:
-                                word_match_score = 0
-                            
-                            score = max(partial, ratio, token_sort, token_set, word_match_score)
-                            best_title_score = max(best_title_score, score)
+                            # Only accept fuzzy match if ratio is VERY high (>85%) 
+                            # indicating actual similarity, not random matching
+                            if ratio >= 0.85:
+                                has_real_overlap = True
+                                best_title_score = max(best_title_score, ratio * 0.9)  # Discount fuzzy score
+                    
+                    # CRITICAL: Skip if no real string overlap detected
+                    # This prevents "rehmaa" from matching "Elon Musk" due to fuzzy algo quirks
+                    if not has_real_overlap:
+                        continue
                     
                     # Threshold for title match — 50% for longer queries, 65% for short ones (lowered for better recall)
                     threshold = 0.50 if len(title_query) >= 8 else 0.65
