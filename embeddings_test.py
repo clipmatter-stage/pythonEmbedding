@@ -1894,19 +1894,34 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                         tq_lower = tq.lower().strip()
                         vt_lower = video_title.lower().strip()
                         
-                        # Exact substring
+                        # Exact substring - highest priority
                         if tq_lower in vt_lower or vt_lower in tq_lower:
                             best_title_score = max(best_title_score, 0.95)
                         else:
-                            # Fuzzy match
+                            # Multiple fuzzy matching strategies for better recall
                             partial = fuzz.partial_ratio(tq_lower, vt_lower) / 100
                             ratio = fuzz.ratio(tq_lower, vt_lower) / 100
                             token_sort = fuzz.token_sort_ratio(tq_lower, vt_lower) / 100
-                            score = max(partial, ratio, token_sort)
+                            token_set = fuzz.token_set_ratio(tq_lower, vt_lower) / 100  # Handles word subsets well
+                            
+                            # Word-by-word matching: count how many query words appear in title
+                            query_words = [w for w in tq_lower.split() if len(w) >= 2]
+                            title_words = vt_lower.split()
+                            if query_words:
+                                words_found = sum(1 for qw in query_words if any(qw in tw or tw in qw for tw in title_words))
+                                word_match_score = words_found / len(query_words)
+                            else:
+                                word_match_score = 0
+                            
+                            score = max(partial, ratio, token_sort, token_set, word_match_score)
                             best_title_score = max(best_title_score, score)
                     
-                    # Threshold for title match — 55% for longer queries, 70% for short ones
-                    threshold = 0.55 if len(title_query) >= 8 else 0.70
+                    # Threshold for title match — 50% for longer queries, 65% for short ones (lowered for better recall)
+                    threshold = 0.50 if len(title_query) >= 8 else 0.65
+                    
+                    # Log near-matches for debugging
+                    if best_title_score >= 0.3:
+                        logger.info(f"Title check: query='{title_query[:50]}' vs '{video_title[:50]}' => score={best_title_score:.2f} (threshold={threshold})")
                     
                     if best_title_score >= threshold:
                         matched_video_ids.add(vid)
@@ -2044,11 +2059,11 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
             multi_match_boost = min(0.05 * (num_unique_terms - 1), 0.15)  # Max 15% boost
             seg["score"] = round(min(seg["score"] + multi_match_boost, 0.98), 4)
 
-    # Sort: EXACT PHRASE MATCHES FIRST, then by score, then by start time for stability
+    # Sort: EXACT PHRASE MATCHES FIRST, then TITLE MATCHES, then by score, then by start time for stability
     merged_list = sorted(
         merged.values(),
         key=lambda x: (
-            1 if "exact_phrase_match" in x.get("match_types", []) else 0,  # Exact phrase first
+            2 if "exact_phrase_match" in x.get("match_types", []) else (1 if "title_match" in x.get("match_types", []) else 0),  # Exact phrase > title > others
             x.get("score", 0),
             -x.get("start_time", 0)
         ),
@@ -2200,21 +2215,24 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                 del seg["all_matched_terms"]  # Clean up - use matched_terms instead
             consolidated_segments.append(seg)
     
-    # Re-sort consolidated segments: EXACT PHRASE MATCHES ALWAYS FIRST, then by score
-    # This ensures exact transcript matches are always shown at the top of results
+    # Re-sort consolidated segments: EXACT PHRASE MATCHES ALWAYS FIRST, then TITLE MATCHES, then by score
+    # This ensures exact transcript matches and title matches are always shown at the top of results
     consolidated_segments.sort(
         key=lambda x: (
-            1 if "exact_phrase_match" in x.get("match_types", []) else 0,  # Exact phrase first
+            2 if "exact_phrase_match" in x.get("match_types", []) else (1 if "title_match" in x.get("match_types", []) else 0),  # Exact phrase > title > others
             x.get("score", 0),  # Then by score
             -x.get("start_time", 0)  # Then by start time
         ),
         reverse=True
     )
     
-    # Log exact phrase matches for debugging
+    # Log exact phrase and title matches for debugging
     exact_phrase_count = sum(1 for s in consolidated_segments if "exact_phrase_match" in s.get("match_types", []))
+    title_match_count = sum(1 for s in consolidated_segments if "title_match" in s.get("match_types", []))
     if exact_phrase_count > 0:
         logger.info(f"Exact phrase matches found: {exact_phrase_count} segments will be prioritized at top")
+    if title_match_count > 0:
+        logger.info(f"Title matches found: {title_match_count} videos matched by title")
     
     # Apply limits (up to 10 segments per video, top_k total)
     for result in consolidated_segments:
