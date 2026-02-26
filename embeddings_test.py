@@ -101,7 +101,103 @@ STOP_WORDS = frozenset({
     "aur", "ya", "lekin", "jo", "jab", "kya", "kaise", "kahan", "yeh", "woh", "koi", "kuch",
 })
 
-# Initialize OpenAI client if enabled
+# ============== PERSON NAME ALIASES ==============
+# Maps known aliases/abbreviations to canonical names with all their variants.
+# When any alias is detected in a query or speaker filter, the search automatically
+# expands to cover all forms of that person's name.
+PERSON_ALIASES = {
+    "hafiz_naeem": {
+        "canonical": "Hafiz Naeem Ur Rehman",
+        # All text forms that should trigger recognition of this person
+        "aliases": [
+            "hafiz naeem ur rehman", "hafiz naeem", "hafiz naeem rehman",
+            "naeem ur rehman", "naeem rehman", "h naeem", "naeem",
+            "rehman", "hafiz", "hnr", "h.n.r", "h.n.r.",
+            # Urdu transliterations
+            "حافظ نعیم", "حافظ نعیم الرحمن", "نعیم الرحمن", "حافظ نعیم ورحمان",
+            # Common informal references
+            "ameer jamaat", "ameer e jamaat", "jamaati ameer",
+        ],
+        # Speaker field values stored in Qdrant (various forms used at ingestion time)
+        "speaker_variants": [
+            "Hafiz Naeem Ur Rehman", "Hafiz Naeem", "hafiz naeem ur rehman",
+            "Hafiz Naeem ur Rehman", "HAFIZ NAEEM", "Naeem Ur Rehman",
+        ],
+    },
+}
+
+# Build a quick reverse-lookup: lowercased alias → person key
+_ALIAS_LOOKUP: Dict[str, str] = {}
+for _person_key, _person_data in PERSON_ALIASES.items():
+    for _alias in _person_data["aliases"]:
+        _ALIAS_LOOKUP[_alias.lower().strip()] = _person_key
+
+
+def detect_person_alias(text: str) -> Optional[str]:
+    """
+    Returns the PERSON_ALIASES key if the text matches any known alias,
+    otherwise returns None.
+    Checks both exact and substring matches for multi-word aliases.
+    """
+    if not text:
+        return None
+    text_lower = text.lower().strip()
+
+    # 1. Exact match
+    if text_lower in _ALIAS_LOOKUP:
+        return _ALIAS_LOOKUP[text_lower]
+
+    # 2. Check if text contains any known alias as a whole-word substring
+    for alias, person_key in _ALIAS_LOOKUP.items():
+        # Skip very short single-word aliases (e.g. "naeem", "hafiz") for substring search
+        # to avoid false positives — only use them on exact match (handled above)
+        if len(alias.split()) == 1 and len(alias) <= 7:
+            continue
+        if alias in text_lower:
+            return person_key
+
+    return None
+
+
+def expand_speaker_from_aliases(speaker_query: str) -> List[str]:
+    """
+    Given a speaker query that may be an alias, returns a list of all
+    speaker name variants to search against.
+    If no alias is found, returns the original query wrapped in a list.
+    """
+    person_key = detect_person_alias(speaker_query)
+    if person_key:
+        data = PERSON_ALIASES[person_key]
+        # Combine canonical + all speaker_variants (deduplicated, preserving order)
+        seen = set()
+        result = []
+        for name in [data["canonical"]] + data["speaker_variants"]:
+            if name.lower() not in seen:
+                seen.add(name.lower())
+                result.append(name)
+        return result
+    return [speaker_query]
+
+
+def expand_query_with_aliases(query: str) -> Tuple[str, List[str]]:
+    """
+    If query contains a known person alias, expands it to include the
+    canonical name. Returns (expanded_query, extra_keyword_terms).
+    """
+    person_key = detect_person_alias(query)
+    if not person_key:
+        return query, []
+    data = PERSON_ALIASES[person_key]
+    canonical = data["canonical"]
+    # Replace the alias in the query with the canonical name
+    # and collect extra keyword terms for keyword search
+    extra_terms = [canonical] + data["speaker_variants"][:3]
+    # Keep the original query but also inject the canonical name
+    expanded = f"{query} {canonical}" if canonical.lower() not in query.lower() else query
+    return expanded, extra_terms
+
+
+# ============== Initialize OpenAI client if enabled
 openai_client = None
 if USE_OPENAI_EMBEDDINGS:
     if not OPENAI_API_KEY:
@@ -546,23 +642,47 @@ def fuzzy_match_speaker(query: str, speaker: str, threshold: int = 75) -> bool:
     """
     Fuzzy match for speaker names with higher threshold.
     Handles variations like 'John' vs 'Jon', 'Muhammad' vs 'Mohammad'.
+    Also checks PERSON_ALIASES so that 'HNR', 'naeem', etc. match
+    'Hafiz Naeem Ur Rehman' and vice-versa.
     """
     if not query or not speaker:
         return False
-    
+
     query_lower = query.lower().strip()
     speaker_lower = speaker.lower().strip()
-    
+
     # Exact match
     if query_lower == speaker_lower or query_lower in speaker_lower:
         return True
-    
+
+    # ── Alias expansion: if query is a known alias, try all speaker_variants ──
+    person_key = detect_person_alias(query)
+    if person_key:
+        data = PERSON_ALIASES[person_key]
+        for variant in data["speaker_variants"]:
+            vl = variant.lower().strip()
+            if vl == speaker_lower or vl in speaker_lower or speaker_lower in vl:
+                return True
+            if fuzz.ratio(vl, speaker_lower) >= threshold:
+                return True
+
+    # ── Alias expansion: if speaker is a known alias, try all speaker_variants ──
+    person_key_s = detect_person_alias(speaker)
+    if person_key_s:
+        data_s = PERSON_ALIASES[person_key_s]
+        for variant in data_s["speaker_variants"]:
+            vl = variant.lower().strip()
+            if vl == query_lower or vl in query_lower or query_lower in vl:
+                return True
+            if fuzz.ratio(vl, query_lower) >= threshold:
+                return True
+
     # Check each word in speaker name
     speaker_parts = speaker_lower.split()
     for part in speaker_parts:
         if fuzz.ratio(query_lower, part) >= threshold:
             return True
-    
+
     # Full fuzzy match
     return fuzz.ratio(query_lower, speaker_lower) >= threshold
 
@@ -1122,7 +1242,65 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
     min_score = data.min_score
     time_range = data.time_range
     max_scanned = data.max_scanned
-    
+
+    # ── PERSON ALIAS EXPANSION ────────────────────────────────────────────────
+    # Detect known person aliases in the query and speaker filter, then expand
+    # so that "HNR", "naeem", "rehman", "hafiz" all find Hafiz Naeem Ur Rehman.
+    alias_speaker_variants: List[str] = []       # Extra speaker names to search in parallel
+    alias_extra_keywords: List[str] = []          # Extra keyword terms injected into keyword search
+    alias_person_key: Optional[str] = None        # Which person was detected (if any)
+
+    # 1. Check the explicit speaker filter first
+    if speaker_filter:
+        person_key = detect_person_alias(speaker_filter)
+        if person_key:
+            alias_person_key = person_key
+            data_p = PERSON_ALIASES[person_key]
+            alias_speaker_variants = data_p["speaker_variants"]
+            alias_extra_keywords = [data_p["canonical"]] + data_p["speaker_variants"][:3]
+            logger.info(f"Alias detected in speaker filter '{speaker_filter}' → expanding to {len(alias_speaker_variants)} variants for '{data_p['canonical']}'")
+            # Replace speaker_filter with canonical name for cleaner matching
+            speaker_filter = data_p["canonical"]
+
+    # 2. Check the query text (but only if speaker filter didn't already trigger)
+    if not alias_person_key and query_text:
+        person_key = detect_person_alias(query_text)
+        if person_key:
+            alias_person_key = person_key
+            data_p = PERSON_ALIASES[person_key]
+            alias_speaker_variants = data_p["speaker_variants"]
+            alias_extra_keywords = [data_p["canonical"]] + data_p["speaker_variants"][:3]
+            logger.info(f"Alias detected in query '{query_text[:40]}' → expanding to person '{data_p['canonical']}'")
+            # Inject canonical name into query and words list
+            canonical = data_p["canonical"]
+            if canonical.lower() not in query_text.lower():
+                query_text = f"{query_text} {canonical}"
+            for term in alias_extra_keywords:
+                tw = term.strip()
+                if tw and tw.lower() not in [w.lower() for w in words]:
+                    words.append(tw)
+
+    # 3. If no full-phrase match, do single-word check on query words
+    # e.g. query "hafiz speech" triggers alias even if full phrase doesn't match
+    if not alias_person_key and query_text:
+        for qw in query_text.lower().split():
+            person_key = detect_person_alias(qw)
+            if person_key:
+                alias_person_key = person_key
+                data_p = PERSON_ALIASES[person_key]
+                alias_speaker_variants = data_p["speaker_variants"]
+                alias_extra_keywords = [data_p["canonical"]] + data_p["speaker_variants"][:3]
+                logger.info(f"Alias detected via word '{qw}' in query → person '{data_p['canonical']}'")
+                canonical = data_p["canonical"]
+                if canonical.lower() not in query_text.lower():
+                    query_text = f"{query_text} {canonical}"
+                # Auto-set speaker_filter if none set (single-word alias implies speaker search)
+                if not speaker_filter:
+                    speaker_filter = data_p["canonical"]
+                    logger.info(f"Auto-set speaker_filter='{speaker_filter}' from single-word alias '{qw}'")
+                break
+    # ─────────────────────────────────────────────────────────────────────────
+
     # Enable/disable advanced features via environment or request
     use_query_expansion = os.getenv("USE_QUERY_EXPANSION", "true").lower() == "true"
     use_reranking = os.getenv("USE_RERANKING", "true").lower() == "true"
@@ -1951,9 +2129,13 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                         tq_lower = tq.lower().strip()
                         vt_lower = video_title.lower().strip()
                         
-                        # Extract query words (min 2 chars) for overlap checking
-                        query_words = [w for w in tq_lower.split() if len(w) >= 2]
-                        title_words = [w for w in vt_lower.split() if len(w) >= 2]
+                        # Extract query words for overlap checking
+                        # Use >= 4 chars to avoid short words like "ur", "is", "to"
+                        # matching as substrings of unrelated title words ("future", etc.)
+                        query_words_exact = [w for w in tq_lower.split() if len(w) >= 3]  # For exact match
+                        query_words_substr = [w for w in tq_lower.split() if len(w) >= 4]  # For substring match
+                        title_words_exact = [w for w in vt_lower.split() if len(w) >= 3]
+                        title_words_substr = [w for w in vt_lower.split() if len(w) >= 4]
                         
                         # === STEP 1: Check for ACTUAL string overlap ===
                         # This prevents fuzzy algorithms from matching unrelated strings
@@ -1966,19 +2148,25 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                             overlap_score = 0.95
                         else:
                             # Check word-level overlap (more reliable than fuzzy for title matching)
-                            for qw in query_words:
-                                # Exact word match
-                                if qw in title_words:
+                            for qw in query_words_exact:
+                                # Exact word match (both words >= 3 chars)
+                                if qw in title_words_exact:
                                     overlap_found = True
                                     overlap_score = max(overlap_score, 0.85)
-                                # Query word is substring of title word (e.g., "rehma" in "rehmaa")
-                                elif any(qw in tw for tw in title_words):
-                                    overlap_found = True
-                                    overlap_score = max(overlap_score, 0.80)
-                                # Title word is substring of query word
-                                elif any(tw in qw for tw in title_words if len(tw) >= 3):
-                                    overlap_found = True
-                                    overlap_score = max(overlap_score, 0.75)
+                                    break
+                            if not overlap_found:
+                                for qw in query_words_substr:
+                                    # Query word (>= 4 chars) is substring of title word (>= 4 chars)
+                                    # e.g., "rehma" in "rehmaa" — both meaningful length
+                                    if any(qw in tw for tw in title_words_substr):
+                                        overlap_found = True
+                                        overlap_score = max(overlap_score, 0.80)
+                                        break
+                                    # Title word (>= 4 chars) is substring of query word (>= 4 chars)
+                                    elif any(tw in qw for tw in title_words_substr):
+                                        overlap_found = True
+                                        overlap_score = max(overlap_score, 0.75)
+                                        break
                         
                         if overlap_found:
                             has_real_overlap = True
