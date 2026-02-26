@@ -1148,9 +1148,30 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
             # AUTO LANGUAGE FILTER: If query is English, only search English transcripts
             # This prevents showing Urdu videos when user searches in English
             # NOTE: Database stores ISO codes: "en", "ur", etc. (not "English", "Urdu")
+            # EXCEPTION: Skip auto-filter for short title-like queries (may be video titles)
+            def looks_like_title(q):
+                """Check if query looks like a video title rather than a topic search"""
+                if not q:
+                    return False
+                q = q.strip()
+                words = q.split()
+                # Very short queries (1-5 words) are likely titles
+                if len(words) <= 5:
+                    return True
+                # Queries with unusual capitalization (proper nouns/titles)
+                if any(w[0].isupper() for w in words if len(w) > 0):
+                    # Has capital letters beyond just first word
+                    caps = sum(1 for w in words if len(w) > 0 and w[0].isupper())
+                    if caps >= 2:  # Multiple capitalized words = likely a title
+                        return True
+                return False
+            
             if not language_filter and query_intent.get("detected_language") == "english":
-                language_filter = "en"  # ISO code matching database value
-                logger.info(f"Auto-applied language filter: en (based on English query)")
+                if looks_like_title(query_text):
+                    logger.info(f"Skipping auto-language filter: query looks like a title ('{query_text[:50]}')")
+                else:
+                    language_filter = "en"  # ISO code matching database value
+                    logger.info(f"Auto-applied language filter: en (based on English query)")
         except Exception as e:
             logger.warning(f"LLM understanding failed, continuing without: {e}")
     
@@ -1215,34 +1236,20 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
 
     search_filter = Filter(must=filter_conditions) if filter_conditions else None
     
-    # Title search filter: Skip language filter for universal queries (years, numbers)
-    # This allows searching "2023" to find videos titled "Something 2023" in ANY language
-    def is_universal_query(q):
-        """Check if query is a universal term like a year/number that shouldn't be language-restricted"""
-        if not q:
-            return False
-        q = q.strip()
-        # Pure numbers (including years like 2023, 2024)
-        if q.isdigit():
-            return True
-        # Years with surrounding text like "2023" or numbers
-        if any(c.isdigit() for c in q) and len(q) <= 10:
-            # Short queries with numbers are likely universal (e.g., "2023", "vol 2")
-            return True
-        return False
+    # Title search filter: NEVER apply language filter to title searches
+    # This ensures users searching by title (e.g., "Hnr Book Ceremony") find
+    # that specific video regardless of what language the transcript is in.
+    # A video might have an English title but Urdu/Hindi transcript.
     
     title_filter_conditions = []
     if video_id_filter is not None:
         title_filter_conditions.append(
             FieldCondition(key="video_id", match=MatchValue(value=video_id_filter))
         )
-    # NOTE: Intentionally NOT adding language_filter for universal queries
-    # This allows title search to find "2023" in videos of any language
-    query_for_title = title_filter or query_text or ""
-    if language_filter is not None and not is_universal_query(query_for_title):
-        title_filter_conditions.append(
-            FieldCondition(key="language", match=MatchValue(value=language_filter))
-        )
+    # NOTE: Deliberately NOT adding language_filter for title search
+    # Video titles are often in English even when transcripts are in other languages
+    # (e.g., "Hnr Book Ceremony" with Urdu transcript)
+    logger.info(f"Title search: skipping language filter to search ALL languages")
     if time_range:
         start_t = time_range.get("start")
         end_t = time_range.get("end")
