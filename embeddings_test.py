@@ -718,6 +718,10 @@ def ensure_indexes_http():
             {"field_name": "text", "field_schema": {"type": "text", "tokenizer": "word", "min_token_len": 2, "max_token_len": 30, "lowercase": True}},
             # NEW: Full-text index on summary_en for cross-language keyword search
             {"field_name": "summary_en", "field_schema": {"type": "text", "tokenizer": "word", "min_token_len": 2, "max_token_len": 30, "lowercase": True}},
+            # NEW: Full-text index on speaker for speaker name text search
+            {"field_name": "speaker", "field_schema": {"type": "text", "tokenizer": "word", "min_token_len": 2, "max_token_len": 30, "lowercase": True}},
+            # NEW: Full-text index on diarization_speaker for speaker name text search
+            {"field_name": "diarization_speaker", "field_schema": {"type": "text", "tokenizer": "word", "min_token_len": 2, "max_token_len": 30, "lowercase": True}},
         ]
         
         headers = {
@@ -1279,15 +1283,59 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
     
     if speaker_only_search or speaker_parallel_search:
         try:
-            logger.info(f"Speaker-only search for: '{speaker_filter}'")
+            logger.info(f"Speaker field search for: '{speaker_filter}'")
             offset = None
             scanned = 0
             max_scan_speaker = min(max_scanned, 50000)
             
+            # Build a more targeted scroll filter for speaker search
+            # Use MatchText on speaker/diarization_speaker fields to pre-filter at Qdrant level
+            # This avoids scanning ALL segments and only returns candidates with matching text
+            speaker_scroll_conditions = list(filter_conditions)  # Start with existing filters (video_id, language, etc.)
+            
+            # Extract meaningful name parts for Qdrant text matching
+            speaker_name_parts = [w.strip().lower() for w in speaker_filter.split() if len(w.strip()) >= 3]
+            
+            use_text_filter = False
+            speaker_scroll_filter = search_filter  # Default fallback
+            
+            if speaker_name_parts:
+                try:
+                    # Use "should" (OR) filter: match any name part in either speaker or diarization_speaker field
+                    speaker_text_conditions = []
+                    for part in speaker_name_parts:
+                        speaker_text_conditions.append(
+                            FieldCondition(key="speaker", match=MatchText(text=part))
+                        )
+                        speaker_text_conditions.append(
+                            FieldCondition(key="diarization_speaker", match=MatchText(text=part))
+                        )
+                    
+                    # Combine: must match existing filters AND should match at least one speaker name part
+                    candidate_filter = Filter(
+                        must=speaker_scroll_conditions if speaker_scroll_conditions else None,
+                        should=speaker_text_conditions
+                    )
+                    
+                    # Test the filter with a small scroll to see if text indexes work
+                    test_points, _ = qdrant_client.scroll(
+                        collection_name=SEGMENTS_COLLECTION,
+                        scroll_filter=candidate_filter,
+                        limit=1,
+                        with_payload=False,
+                        with_vectors=False
+                    )
+                    speaker_scroll_filter = candidate_filter
+                    use_text_filter = True
+                    logger.info(f"Using MatchText filter for speaker search (text indexes available)")
+                except Exception as filter_err:
+                    logger.warning(f"MatchText filter failed (text indexes may not exist), falling back to full scan: {str(filter_err)}")
+                    speaker_scroll_filter = search_filter
+            
             while scanned < max_scan_speaker and len(speaker_results) < top_k:
                 points, next_offset = qdrant_client.scroll(
                     collection_name=SEGMENTS_COLLECTION,
-                    scroll_filter=search_filter,
+                    scroll_filter=speaker_scroll_filter,
                     limit=min(1000, max_scan_speaker - scanned),
                     offset=offset,
                     with_payload=True,
