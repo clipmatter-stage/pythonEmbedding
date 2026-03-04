@@ -222,6 +222,18 @@ class EmbedVideoRequest(BaseModel):
     batch_info: Optional[dict] = Field(default=None, description="Batch processing info: batch_number, total_batches, segments_in_batch")
     speakers_transcript: Optional[List[dict]] = Field(default=None, description="Full speakers transcript (ignored)")
     diarization_segments: Optional[List[dict]] = Field(default=None, description="Diarization segments (ignored)")
+    # Enriched metadata for dual-mode search (stored in Qdrant payload)
+    video_created_at: Optional[str] = Field(default=None, description="ISO datetime of when video was created")
+    processing_status: str = Field(default="completed", max_length=50)
+    approval_status: str = Field(default="approved", max_length=50)
+    is_archived: bool = Field(default=False)
+    user_id: Optional[int] = Field(default=None)
+    speakers_count: int = Field(default=0)
+    audio_duration_seconds: float = Field(default=0)
+    video_description: str = Field(default="", max_length=5000)
+    video_summary: str = Field(default="", max_length=10000)
+    video_summary_english: str = Field(default="", max_length=10000)
+    video_summary_urdu: str = Field(default="", max_length=10000)
 
 class SearchRequest(BaseModel):
     query: str = Field(default="", max_length=1000)
@@ -235,6 +247,14 @@ class SearchRequest(BaseModel):
     min_score: float = Field(default=0.35, ge=0.0, le=1.0)
     time_range: Optional[dict] = None
     max_scanned: int = Field(default=10000, ge=100, le=100000)
+    # Dual-mode search: 'semantic' (vector + LLM) or 'simple' (structured filters only)
+    search_mode: str = Field(default="semantic", pattern="^(semantic|simple)$")
+    # Simple mode: which single filter is active
+    filter_type: Optional[str] = Field(default=None, pattern="^(video|speaker|date|language|title|summary)$")
+    # Date filter fields for simple mode date filtering within Qdrant
+    filter_year: Optional[int] = Field(default=None, ge=1900, le=2100)
+    filter_month: Optional[int] = Field(default=None, ge=1, le=12)
+    filter_date: Optional[str] = Field(default=None, max_length=20)
 
 class SuggestRequest(BaseModel):
     query: str = Field(..., min_length=2, max_length=200)
@@ -625,18 +645,22 @@ def fuzzy_match_text(query: str, text: str, threshold: int = 65) -> bool:
     """
     Fuzzy match with typo tolerance using rapidfuzz.
     Returns True if query fuzzy-matches text above threshold.
+    Uses whole-word matching to prevent 'tan' matching 'pakistan' etc.
     """
     if not query or not text:
         return False
     query_lower = query.lower()
     text_lower = text.lower()
     
-    # Exact substring match (fastest)
-    if query_lower in text_lower:
+    # Whole-word match (prevents substring false positives)
+    if whole_word_match(query_lower, text_lower):
         return True
     
-    # Fuzzy partial match (handles typos)
-    return fuzz.partial_ratio(query_lower, text_lower) >= threshold
+    # Fuzzy match against individual words (not substrings)
+    if fuzzy_word_match(query_lower, text_lower, threshold) > 0:
+        return True
+    
+    return False
 
 def fuzzy_match_speaker(query: str, speaker: str, threshold: int = 75) -> bool:
     """
@@ -740,6 +764,56 @@ def normalize_word(word: str) -> str:
     return word.translate(_PUNCT_NORMALIZE_TABLE).strip(_STRIP_CHARS).lower()
 
 
+def whole_word_match(word: str, text: str) -> bool:
+    """
+    Check if 'word' appears as a whole word in 'text', NOT as a substring
+    of a larger word. Uses regex word boundaries (\b).
+    Prevents 'tan' matching 'pakistan', 'dance' matching 'abundance', etc.
+    Both inputs should be pre-normalized (lowercase).
+    """
+    if not word or not text:
+        return False
+    try:
+        pattern = r'\b' + re.escape(word) + r'\b'
+        return bool(re.search(pattern, text, re.UNICODE))
+    except re.error:
+        return word in text  # Safe fallback
+
+
+def whole_phrase_match(phrase: str, text: str) -> bool:
+    """
+    Check if 'phrase' appears as whole words in 'text'.
+    Prevents 'dance hall' matching 'abundance hallway'.
+    Both inputs should be pre-normalized (lowercase).
+    """
+    if not phrase or not text:
+        return False
+    try:
+        pattern = r'\b' + re.escape(phrase) + r'\b'
+        return bool(re.search(pattern, text, re.UNICODE))
+    except re.error:
+        return phrase in text  # Safe fallback
+
+
+def fuzzy_word_match(word: str, text: str, threshold: int = 85) -> float:
+    """
+    Fuzzy match a word against individual words in text (not substrings).
+    Returns the best match score (0-1) or 0 if no match above threshold.
+    Prevents 'dance' fuzzy-matching 'abundance' by comparing word-to-word.
+    """
+    if not word or not text:
+        return 0.0
+    best_score = 0.0
+    for text_word in text.split():
+        # Only compare against words of comparable length (±50%)
+        if len(text_word) < 2:
+            continue
+        ratio = fuzz.ratio(word, text_word)
+        if ratio >= threshold and ratio > best_score:
+            best_score = ratio
+    return best_score / 100.0 if best_score >= threshold else 0.0
+
+
 def calculate_combined_score(semantic_score: float, keyword_match: bool, fuzzy_score: float = 0) -> float:
     """
     Calculate combined relevance score.
@@ -760,6 +834,7 @@ def calculate_combined_score(semantic_score: float, keyword_match: bool, fuzzy_s
 
 SEGMENTS_COLLECTION = "video_transcript_segments"
 LEGACY_COLLECTION = "text_embeddings"
+
 
 logger.info("Connecting to Qdrant...")
 qdrant_client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY, timeout=30)
@@ -834,14 +909,26 @@ def ensure_indexes_http():
             {"field_name": "language", "field_schema": "keyword"},
             {"field_name":  "start_time", "field_schema": "float"},
             {"field_name": "end_time", "field_schema": "float"},
-            # NEW: Full-text index on transcript text for keyword search
+            # Full-text index on transcript text for keyword search
             {"field_name": "text", "field_schema": {"type": "text", "tokenizer": "word", "min_token_len": 2, "max_token_len": 30, "lowercase": True}},
-            # NEW: Full-text index on summary_en for cross-language keyword search
+            # Full-text index on summary_en for cross-language keyword search
             {"field_name": "summary_en", "field_schema": {"type": "text", "tokenizer": "word", "min_token_len": 2, "max_token_len": 30, "lowercase": True}},
-            # NEW: Full-text index on speaker for speaker name text search
+            # Full-text index on speaker for speaker name text search
             {"field_name": "speaker", "field_schema": {"type": "text", "tokenizer": "word", "min_token_len": 2, "max_token_len": 30, "lowercase": True}},
-            # NEW: Full-text index on diarization_speaker for speaker name text search
+            # Full-text index on diarization_speaker for speaker name text search
             {"field_name": "diarization_speaker", "field_schema": {"type": "text", "tokenizer": "word", "min_token_len": 2, "max_token_len": 30, "lowercase": True}},
+            # ── Enriched metadata indexes for dual-mode search ──
+            {"field_name": "video_created_at", "field_schema": "keyword"},
+            {"field_name": "processing_status", "field_schema": "keyword"},
+            {"field_name": "approval_status", "field_schema": "keyword"},
+            {"field_name": "is_archived", "field_schema": "bool"},
+            {"field_name": "user_id", "field_schema": "integer"},
+            {"field_name": "speakers_count", "field_schema": "integer"},
+            {"field_name": "audio_duration_seconds", "field_schema": "float"},
+            # Full-text indexes on video summaries for simple-mode summary search
+            {"field_name": "video_summary", "field_schema": {"type": "text", "tokenizer": "word", "min_token_len": 2, "max_token_len": 30, "lowercase": True}},
+            {"field_name": "video_summary_english", "field_schema": {"type": "text", "tokenizer": "word", "min_token_len": 2, "max_token_len": 30, "lowercase": True}},
+            {"field_name": "video_summary_urdu", "field_schema": {"type": "text", "tokenizer": "word", "min_token_len": 2, "max_token_len": 30, "lowercase": True}},
         ]
         
         headers = {
@@ -947,6 +1034,19 @@ async def embed_video(data: EmbedVideoRequest, authorized: bool = Depends(verify
         video_filename = data.video_filename
         youtube_url = data.youtube_url
         language = data.language
+        
+        # Enriched metadata for dual-mode search (stored in Qdrant payload)
+        video_created_at = data.video_created_at or ""
+        processing_status = data.processing_status or "completed"
+        approval_status = data.approval_status or "approved"
+        is_archived = data.is_archived
+        user_id = data.user_id
+        speakers_count = data.speakers_count
+        audio_duration_seconds = data.audio_duration_seconds
+        video_description = data.video_description or ""
+        video_summary = data.video_summary or ""
+        video_summary_english = data.video_summary_english or ""
+        video_summary_urdu = data.video_summary_urdu or ""
         
         logger.info(f"Processing video {video_id} with {len(identification_segments)} segments")
         
@@ -1101,9 +1201,21 @@ async def embed_video(data: EmbedVideoRequest, authorized: bool = Depends(verify
                 "text": metadata['text'],
                 "text_length": len(metadata['text']),
                 "confidence": metadata['confidence'],
-                "summary_en": summary_en,  # NEW: English summary for cross-language search
-                "enriched_text": metadata.get('enriched_text', metadata['text']),  # NEW: context-rich text
-                "created_at": datetime.utcnow().isoformat()
+                "summary_en": summary_en,  # English summary for cross-language search
+                "enriched_text": metadata.get('enriched_text', metadata['text']),  # context-rich text
+                "created_at": datetime.utcnow().isoformat(),
+                # Enriched metadata for dual-mode search eligibility & filtering
+                "video_created_at": video_created_at,
+                "processing_status": processing_status,
+                "approval_status": approval_status,
+                "is_archived": is_archived,
+                "user_id": user_id,
+                "speakers_count": speakers_count,
+                "audio_duration_seconds": audio_duration_seconds,
+                "video_description": video_description,
+                "video_summary": video_summary,
+                "video_summary_english": video_summary_english,
+                "video_summary_urdu": video_summary_urdu,
             }
             
             points.append(PointStruct(id=point_id, vector=vector, payload=payload))
@@ -1242,6 +1354,453 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
     min_score = data.min_score
     time_range = data.time_range
     max_scanned = data.max_scanned
+    search_mode = data.search_mode  # 'semantic' or 'simple'
+    filter_type = data.filter_type  # 'video', 'speaker', 'date', 'language', 'title', 'summary'
+    filter_year = data.filter_year
+    filter_month = data.filter_month
+    filter_date = data.filter_date
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # SIMPLE SEARCH MODE — structured filters only, no vector/LLM operations.
+    # Only one filter is active at a time. Returns results from Qdrant scroll.
+    # Eligibility: processing_status=completed, approval_status=approved, is_archived=false
+    # ═══════════════════════════════════════════════════════════════════════════
+    if search_mode == "simple":
+        logger.info(f"Simple search mode: filter_type={filter_type}, speaker={speaker_filter}, video_id={video_id_filter}, language={language_filter}, title={title_filter}")
+        
+        # Build eligibility filter — only searchable videos
+        eligibility_conditions = [
+            FieldCondition(key="processing_status", match=MatchValue(value="completed")),
+            FieldCondition(key="approval_status", match=MatchValue(value="approved")),
+            FieldCondition(key="is_archived", match=MatchValue(value=False)),
+        ]
+        
+        simple_results = []
+        scanned = 0
+        max_scan_simple = min(max_scanned, 50000)
+        
+        try:
+            if filter_type == "video":
+                # Filter by specific video ID
+                if not video_id_filter:
+                    raise HTTPException(status_code=400, detail="video_id is required for video filter")
+                scroll_conditions = eligibility_conditions + [
+                    FieldCondition(key="video_id", match=MatchValue(value=video_id_filter))
+                ]
+                scroll_filter = Filter(must=scroll_conditions)
+                offset = None
+                while scanned < max_scan_simple and len(simple_results) < top_k:
+                    points, next_offset = qdrant_client.scroll(
+                        collection_name=SEGMENTS_COLLECTION,
+                        scroll_filter=scroll_filter,
+                        limit=min(1000, max_scan_simple - scanned),
+                        offset=offset,
+                        with_payload=True,
+                        with_vectors=False
+                    )
+                    if not points:
+                        break
+                    for p in points:
+                        scanned += 1
+                        payload = p.payload or {}
+                        simple_results.append({
+                            "id": p.id,
+                            "score": 1.0,
+                            "video_id": payload.get("video_id"),
+                            "video_title": payload.get("video_title", ""),
+                            "speaker": payload.get("speaker", ""),
+                            "diarization_speaker": payload.get("diarization_speaker", ""),
+                            "start_time": payload.get("start_time", 0),
+                            "end_time": payload.get("end_time", 0),
+                            "duration": round((payload.get("end_time", 0) - payload.get("start_time", 0)), 2),
+                            "text": payload.get("text", ""),
+                            "text_length": payload.get("text_length", 0),
+                            "youtube_url": payload.get("youtube_url", ""),
+                            "language": payload.get("language", ""),
+                            "created_at": payload.get("created_at"),
+                            "video_created_at": payload.get("video_created_at", ""),
+                            "match_types": ["simple_video_filter"],
+                            "fuzzy_score": 1.0,
+                            "matched_field": "video_id",
+                        })
+                    if len(simple_results) >= top_k:
+                        break
+                    offset = next_offset
+                    if not next_offset:
+                        break
+
+            elif filter_type == "speaker":
+                # Speaker-only search — fuzzy match against speaker fields
+                if not speaker_filter:
+                    raise HTTPException(status_code=400, detail="speaker is required for speaker filter")
+                scroll_filter = Filter(must=eligibility_conditions) if eligibility_conditions else None
+                offset = None
+                while scanned < max_scan_simple and len(simple_results) < top_k:
+                    points, next_offset = qdrant_client.scroll(
+                        collection_name=SEGMENTS_COLLECTION,
+                        scroll_filter=scroll_filter,
+                        limit=min(1000, max_scan_simple - scanned),
+                        offset=offset,
+                        with_payload=True,
+                        with_vectors=False
+                    )
+                    if not points:
+                        break
+                    for p in points:
+                        scanned += 1
+                        payload = p.payload or {}
+                        spk = payload.get("speaker", "")
+                        diar_spk = payload.get("diarization_speaker", "")
+                        speaker_combined = f"{spk} {diar_spk}".strip()
+                        if not fuzzy_match_speaker(speaker_filter, speaker_combined, threshold=70):
+                            continue
+                        match_score = fuzz.ratio(speaker_filter.lower(), speaker_combined.lower()) / 100
+                        simple_results.append({
+                            "id": p.id,
+                            "score": round(max(match_score, 0.5), 4),
+                            "video_id": payload.get("video_id"),
+                            "video_title": payload.get("video_title", ""),
+                            "speaker": spk,
+                            "diarization_speaker": diar_spk,
+                            "start_time": payload.get("start_time", 0),
+                            "end_time": payload.get("end_time", 0),
+                            "duration": round((payload.get("end_time", 0) - payload.get("start_time", 0)), 2),
+                            "text": payload.get("text", ""),
+                            "text_length": payload.get("text_length", 0),
+                            "youtube_url": payload.get("youtube_url", ""),
+                            "language": payload.get("language", ""),
+                            "created_at": payload.get("created_at"),
+                            "video_created_at": payload.get("video_created_at", ""),
+                            "match_types": ["simple_speaker_filter"],
+                            "fuzzy_score": round(match_score, 2),
+                            "matched_field": "speaker",
+                        })
+                    if len(simple_results) >= top_k:
+                        break
+                    offset = next_offset
+                    if not next_offset:
+                        break
+
+            elif filter_type == "date":
+                # Date filter — match video_created_at using prefix or exact match
+                if not filter_year and not filter_date:
+                    raise HTTPException(status_code=400, detail="filter_year or filter_date is required for date filter")
+                scroll_conditions = list(eligibility_conditions)
+                if filter_date:
+                    # Exact date match via keyword prefix (ISO: "2024-03-15")
+                    scroll_conditions.append(
+                        FieldCondition(key="video_created_at", match=MatchText(text=filter_date))
+                    )
+                elif filter_year and filter_month:
+                    prefix = f"{filter_year}-{filter_month:02d}"
+                    scroll_conditions.append(
+                        FieldCondition(key="video_created_at", match=MatchText(text=prefix))
+                    )
+                elif filter_year:
+                    scroll_conditions.append(
+                        FieldCondition(key="video_created_at", match=MatchText(text=str(filter_year)))
+                    )
+                scroll_filter = Filter(must=scroll_conditions)
+                offset = None
+                seen_video_ids = set()
+                while scanned < max_scan_simple and len(simple_results) < top_k:
+                    points, next_offset = qdrant_client.scroll(
+                        collection_name=SEGMENTS_COLLECTION,
+                        scroll_filter=scroll_filter,
+                        limit=min(1000, max_scan_simple - scanned),
+                        offset=offset,
+                        with_payload=True,
+                        with_vectors=False
+                    )
+                    if not points:
+                        break
+                    for p in points:
+                        scanned += 1
+                        payload = p.payload or {}
+                        vid = payload.get("video_id")
+                        # For date filter, return one entry per video
+                        if vid in seen_video_ids:
+                            continue
+                        seen_video_ids.add(vid)
+                        simple_results.append({
+                            "id": p.id,
+                            "score": 1.0,
+                            "video_id": vid,
+                            "video_title": payload.get("video_title", ""),
+                            "speaker": "",
+                            "diarization_speaker": "",
+                            "start_time": 0,
+                            "end_time": 0,
+                            "duration": 0,
+                            "text": "",
+                            "text_length": 0,
+                            "youtube_url": payload.get("youtube_url", ""),
+                            "language": payload.get("language", ""),
+                            "created_at": payload.get("created_at"),
+                            "video_created_at": payload.get("video_created_at", ""),
+                            "match_types": ["simple_date_filter"],
+                            "fuzzy_score": 1.0,
+                            "matched_field": "video_created_at",
+                            "is_video_only": True,
+                        })
+                    if len(simple_results) >= top_k:
+                        break
+                    offset = next_offset
+                    if not next_offset:
+                        break
+
+            elif filter_type == "language":
+                # Language filter — exact match on language field
+                if not language_filter:
+                    raise HTTPException(status_code=400, detail="language is required for language filter")
+                scroll_conditions = eligibility_conditions + [
+                    FieldCondition(key="language", match=MatchValue(value=language_filter))
+                ]
+                scroll_filter = Filter(must=scroll_conditions)
+                offset = None
+                seen_video_ids = set()
+                while scanned < max_scan_simple and len(simple_results) < top_k:
+                    points, next_offset = qdrant_client.scroll(
+                        collection_name=SEGMENTS_COLLECTION,
+                        scroll_filter=scroll_filter,
+                        limit=min(1000, max_scan_simple - scanned),
+                        offset=offset,
+                        with_payload=True,
+                        with_vectors=False
+                    )
+                    if not points:
+                        break
+                    for p in points:
+                        scanned += 1
+                        payload = p.payload or {}
+                        vid = payload.get("video_id")
+                        if vid in seen_video_ids:
+                            continue
+                        seen_video_ids.add(vid)
+                        simple_results.append({
+                            "id": p.id,
+                            "score": 1.0,
+                            "video_id": vid,
+                            "video_title": payload.get("video_title", ""),
+                            "speaker": "",
+                            "diarization_speaker": "",
+                            "start_time": 0,
+                            "end_time": 0,
+                            "duration": 0,
+                            "text": "",
+                            "text_length": 0,
+                            "youtube_url": payload.get("youtube_url", ""),
+                            "language": payload.get("language", ""),
+                            "created_at": payload.get("created_at"),
+                            "video_created_at": payload.get("video_created_at", ""),
+                            "match_types": ["simple_language_filter"],
+                            "fuzzy_score": 1.0,
+                            "matched_field": "language",
+                            "is_video_only": True,
+                        })
+                    if len(simple_results) >= top_k:
+                        break
+                    offset = next_offset
+                    if not next_offset:
+                        break
+
+            elif filter_type == "title":
+                # Title search — fuzzy match against video_title
+                if not title_filter:
+                    raise HTTPException(status_code=400, detail="title is required for title filter")
+                scroll_filter = Filter(must=eligibility_conditions) if eligibility_conditions else None
+                offset = None
+                seen_video_ids = set()
+                while scanned < max_scan_simple and len(simple_results) < top_k:
+                    points, next_offset = qdrant_client.scroll(
+                        collection_name=SEGMENTS_COLLECTION,
+                        scroll_filter=scroll_filter,
+                        limit=min(1000, max_scan_simple - scanned),
+                        offset=offset,
+                        with_payload=True,
+                        with_vectors=False
+                    )
+                    if not points:
+                        break
+                    for p in points:
+                        scanned += 1
+                        payload = p.payload or {}
+                        vid = payload.get("video_id")
+                        if vid in seen_video_ids:
+                            continue
+                        video_title = payload.get("video_title", "")
+                        if not fuzzy_match_text(title_filter, video_title, threshold=60):
+                            continue
+                        seen_video_ids.add(vid)
+                        match_score = fuzz.partial_ratio(title_filter.lower(), video_title.lower()) / 100
+                        simple_results.append({
+                            "id": p.id,
+                            "score": round(match_score, 4),
+                            "video_id": vid,
+                            "video_title": video_title,
+                            "speaker": "",
+                            "diarization_speaker": "",
+                            "start_time": 0,
+                            "end_time": 0,
+                            "duration": 0,
+                            "text": "",
+                            "text_length": 0,
+                            "youtube_url": payload.get("youtube_url", ""),
+                            "language": payload.get("language", ""),
+                            "created_at": payload.get("created_at"),
+                            "video_created_at": payload.get("video_created_at", ""),
+                            "match_types": ["simple_title_filter"],
+                            "fuzzy_score": round(match_score, 2),
+                            "matched_field": "video_title",
+                            "is_video_only": True,
+                        })
+                    if len(simple_results) >= top_k:
+                        break
+                    offset = next_offset
+                    if not next_offset:
+                        break
+                # Sort by match score
+                simple_results.sort(key=lambda x: x["score"], reverse=True)
+
+            elif filter_type == "summary":
+                # Summary keyword search — scroll and check video_summary/video_summary_english/video_summary_urdu
+                search_query = query_text or title_filter or ""
+                if not search_query:
+                    raise HTTPException(status_code=400, detail="query is required for summary filter")
+                scroll_filter = Filter(must=eligibility_conditions) if eligibility_conditions else None
+                search_words_lower = [w.lower().strip() for w in search_query.split() if len(w.strip()) >= 2]
+                offset = None
+                seen_video_ids = set()
+                while scanned < max_scan_simple and len(simple_results) < top_k:
+                    points, next_offset = qdrant_client.scroll(
+                        collection_name=SEGMENTS_COLLECTION,
+                        scroll_filter=scroll_filter,
+                        limit=min(1000, max_scan_simple - scanned),
+                        offset=offset,
+                        with_payload=True,
+                        with_vectors=False
+                    )
+                    if not points:
+                        break
+                    for p in points:
+                        scanned += 1
+                        payload = p.payload or {}
+                        vid = payload.get("video_id")
+                        if vid in seen_video_ids:
+                            continue
+                        summary_all = " ".join([
+                            payload.get("video_summary", ""),
+                            payload.get("video_summary_english", ""),
+                            payload.get("video_summary_urdu", ""),
+                        ]).lower()
+                        if not summary_all.strip():
+                            continue
+                        matched_count = sum(1 for w in search_words_lower if w in summary_all)
+                        if matched_count == 0:
+                            continue
+                        seen_video_ids.add(vid)
+                        match_score = matched_count / max(len(search_words_lower), 1)
+                        simple_results.append({
+                            "id": p.id,
+                            "score": round(min(match_score, 1.0), 4),
+                            "video_id": vid,
+                            "video_title": payload.get("video_title", ""),
+                            "speaker": "",
+                            "diarization_speaker": "",
+                            "start_time": 0,
+                            "end_time": 0,
+                            "duration": 0,
+                            "text": "",
+                            "text_length": 0,
+                            "youtube_url": payload.get("youtube_url", ""),
+                            "language": payload.get("language", ""),
+                            "created_at": payload.get("created_at"),
+                            "video_created_at": payload.get("video_created_at", ""),
+                            "match_types": ["simple_summary_filter"],
+                            "fuzzy_score": round(match_score, 2),
+                            "matched_field": "video_summary",
+                            "is_video_only": True,
+                        })
+                    if len(simple_results) >= top_k:
+                        break
+                    offset = next_offset
+                    if not next_offset:
+                        break
+                simple_results.sort(key=lambda x: x["score"], reverse=True)
+
+            else:
+                raise HTTPException(status_code=400, detail=f"Invalid filter_type: {filter_type}. Must be one of: video, speaker, date, language, title, summary")
+
+            unique_videos = len(set(r["video_id"] for r in simple_results if r.get("video_id")))
+            logger.info(f"Simple search completed: {len(simple_results)} results from {unique_videos} videos (scanned {scanned})")
+
+            return {
+                "query": query_text,
+                "words": words,
+                "speaker_filter": speaker_filter,
+                "collection": SEGMENTS_COLLECTION,
+                "search_mode": "simple",
+                "filter_type": filter_type,
+                "total_speaker_hits": len(simple_results) if filter_type == "speaker" else 0,
+                "total_semantic_hits": 0,
+                "total_keyword_hits": 0,
+                "total_title_hits": len(simple_results) if filter_type == "title" else 0,
+                "total_exact_phrase_hits": 0,
+                "returned": len(simple_results),
+                "unique_videos": unique_videos,
+                "filters_applied": {
+                    "filter_type": filter_type,
+                    "video_id": video_id_filter,
+                    "speaker": speaker_filter,
+                    "title": title_filter,
+                    "language": language_filter,
+                    "filter_year": filter_year,
+                    "filter_month": filter_month,
+                    "filter_date": filter_date,
+                },
+                "results": [
+                    {
+                        "id": r["id"],
+                        "segment_ids": [r["id"]],
+                        "match_count": 1,
+                        "is_exact_phrase_match": False,
+                        "is_multi_match": False,
+                        "matched_terms": [],
+                        "score": round(r["score"], 4),
+                        "match_types": r.get("match_types", []),
+                        "matched_field": r.get("matched_field", ""),
+                        "fuzzy_score": round(r.get("fuzzy_score", 0), 4),
+                        "matched_words_count": 0,
+                        "video_id": r.get("video_id"),
+                        "video_title": r.get("video_title", ""),
+                        "speaker": r.get("speaker", ""),
+                        "diarization_speaker": r.get("diarization_speaker", ""),
+                        "start_time": r.get("start_time", 0),
+                        "end_time": r.get("end_time", 0),
+                        "duration": r.get("duration", 0),
+                        "text": r.get("text", ""),
+                        "text_length": r.get("text_length", 0),
+                        "summary_en": r.get("summary_en", ""),
+                        "youtube_url": r.get("youtube_url", ""),
+                        "language": r.get("language", ""),
+                        "created_at": r.get("created_at"),
+                        "video_created_at": r.get("video_created_at", ""),
+                        "llm_relevance_score": None,
+                        "youtube_url_timestamped": f"{r.get('youtube_url', '')}?t={int(r.get('start_time', 0))}" if r.get('youtube_url') and r.get('start_time', 0) > 0 else r.get('youtube_url', ''),
+                    }
+                    for r in simple_results
+                ]
+            }
+
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"Simple search error: {str(e)}")
+            raise HTTPException(status_code=500, detail=f"Simple search error: {str(e)}")
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # SEMANTIC SEARCH MODE — full vector + LLM pipeline (existing behavior)
+    # ═══════════════════════════════════════════════════════════════════════════
 
     # ── PERSON ALIAS EXPANSION ────────────────────────────────────────────────
     # Detect known person aliases in the query and speaker filter, then expand
@@ -1606,8 +2165,9 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                     payload = p.payload or {}
                     text = normalize_for_matching(payload.get("text") or "")
                     
-                    # Check if the exact phrase appears in the transcript
-                    if exact_phrase in text:
+                    # Check if the exact phrase appears as whole words in the transcript
+                    # Uses word boundaries to prevent 'dance' matching 'abundance' etc.
+                    if whole_phrase_match(exact_phrase, text):
                         spk = payload.get("speaker", "")
                         diar_spk = payload.get("diarization_speaker", "")
                         video_title = payload.get("video_title", "")
@@ -1693,7 +2253,23 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                     logger.warning(f"Query expansion failed: {e}")
             
             # Limit query variations for speed - original query is most important
-            query_variations = query_variations[:2]  # Max 2 variations for speed
+            # For short queries (1-2 words), SKIP expanded terms entirely — they cause
+            # semantic drift (e.g. "mufti" → expanded to "religious scholar" → pulls in
+            # unrelated religious content like "qari mansoor jamat")
+            query_word_count = len(query_text.split()) if query_text else 0
+            if query_word_count <= 2:
+                # For short queries, only use original + translated (no expanded terms)
+                translated = query_intent.get("semantic_query_translated", "") if query_intent else ""
+                filtered = []
+                for v in query_variations:
+                    if v == query_text:
+                        filtered.append(v)
+                    elif translated and v == translated:
+                        filtered.append(v)
+                query_variations = filtered if filtered else [query_text]
+                logger.info(f"Short query ({query_word_count} words): limited to {len(query_variations)} variations (no expansion)")
+            else:
+                query_variations = query_variations[:2]  # Max 2 variations for speed
             logger.info(f"Total query variations (capped): {len(query_variations)}")
             
             # Search with all query variations
@@ -1709,11 +2285,11 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                     exact=False   # Use approximate search for speed
                 )
 
-                # Use a LOWER threshold for Qdrant retrieval to avoid losing good results.
-                # We'll filter by min_score AFTER scoring, not at the DB level.
-                # This prevents the DB from dropping results that would have scored well
-                # after combined scoring (semantic + keyword + fuzzy bonuses).
-                retrieval_threshold = max(min_score * 0.6, 0.15)  # e.g. 0.35 * 0.6 = 0.21
+                # Use a moderately lower threshold for Qdrant retrieval.
+                # We filter by min_score AFTER scoring, not at the DB level, but we
+                # don't go too low to avoid flooding results with loosely related content
+                # (e.g. 'mufti' pulling in all Islamic terms like 'qari', 'jamat').
+                retrieval_threshold = max(min_score * 0.75, 0.25)  # e.g. 0.35 * 0.75 = 0.26
                 
                 sem_search_response = qdrant_client.query_points(
                     collection_name=SEGMENTS_COLLECTION,
@@ -1773,7 +2349,44 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                             fuzzy_boost = max(fuzzy_boost, fuzz.ratio(speaker_filter.lower(), speaker_combined.lower()) / 100)
                     
                     base_score = float(getattr(r, "score", 0.0))
+                    
+                    # ── QUERY-PRESENCE VERIFICATION ──
+                    # For short queries (1-2 words like "mufti"), semantic search can return
+                    # loosely related results from the same domain (e.g. "qari", "jamat").
+                    # We verify if the actual query words appear in the result text/metadata
+                    # and penalize results where they don't.
+                    query_words_in_result = False
+                    if query_text:
+                        text_lower = (text or "").lower()
+                        title_lower = (video_title or "").lower()
+                        speaker_lower = f"{speaker} {diarization_speaker}".lower()
+                        summary_lower = (payload.get("summary_en") or "").lower()
+                        all_text = f"{text_lower} {title_lower} {speaker_lower} {summary_lower}"
+                        
+                        # Check if ANY query word appears as a whole word in the result
+                        query_words = [w.lower().strip() for w in query_text.split() if len(w.strip()) >= 3]
+                        for qw in query_words:
+                            if whole_word_match(qw, all_text):
+                                query_words_in_result = True
+                                break
+                    
+                    # Apply query-presence penalty for SHORT queries (1-2 words)
+                    # Short queries are specific searches ("mufti", "drone") — user expects
+                    # the word to actually appear in results, not just be "semantically related"
+                    query_word_count = len(query_text.split()) if query_text else 0
+                    presence_penalty = 0.0
+                    if query_word_count <= 2 and not query_words_in_result and not speaker_field_match:
+                        # Penalize results that don't contain the actual search term
+                        # This prevents "mufti" → "qari mansoor jamat" false matches
+                        presence_penalty = 0.15
+                    
                     combined_score = calculate_combined_score(base_score, False, fuzzy_boost)
+                    combined_score = max(combined_score - presence_penalty, 0.0)
+                    
+                    # Results from expanded/translated query variations are lower confidence
+                    # They are more likely to drift from user intent
+                    if idx > 0:
+                        combined_score *= 0.85  # 15% discount for non-original queries
                     
                     # Apply min_score filter AFTER combined scoring
                     if combined_score < min_score:
@@ -1783,6 +2396,8 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                     match_types = ["semantic"]
                     if speaker_field_match:
                         match_types.append("speaker_field_match")
+                    if query_words_in_result:
+                        match_types.append("query_term_present")
                     
                     all_semantic_results[result_id] = {
                         "id": r.id,
@@ -1876,7 +2491,7 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                     # This ensures "before Windows 95, 1984" matches exactly and ranks first
                     is_exact_phrase_match = False
                     if exact_phrase_query and len(exact_phrase_query) >= 5:
-                        if exact_phrase_query in text:
+                        if whole_phrase_match(exact_phrase_query, text):
                             is_exact_phrase_match = True
                             # Add as exact match with highest score - this goes to the TOP
                             keyword_results.append({
@@ -1939,13 +2554,16 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                             
                             field_match_score = 0
                             
-                            # Exact substring match (primary matching method)
+                            # Whole-word match (prevents 'tan' matching 'pakistan', 'dance' matching 'abundance')
                             # Both sides are normalized so "there've" matches "there've"
-                            if w in field_value:
+                            if whole_word_match(w, field_value):
                                 field_match_score = 1.0
-                            # Fuzzy match ONLY for longer words (4+ chars) with HIGH threshold
-                            elif len(w) >= 4 and fuzz.partial_ratio(w, field_value) >= 85:
-                                field_match_score = fuzz.partial_ratio(w, field_value) / 100
+                            # Fuzzy match ONLY for longer words (4+ chars) against individual words
+                            # Uses word-to-word comparison, NOT substring matching
+                            elif len(w) >= 4:
+                                fw_score = fuzzy_word_match(w, field_value, threshold=85)
+                                if fw_score > 0:
+                                    field_match_score = fw_score
                             
                             if field_match_score > 0:
                                 word_found = True
@@ -2157,13 +2775,16 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                             if not overlap_found:
                                 for qw in query_words_substr:
                                     # Query word (>= 4 chars) is substring of title word (>= 4 chars)
-                                    # e.g., "rehma" in "rehmaa" — both meaningful length
-                                    if any(qw in tw for tw in title_words_substr):
+                                    # but only if it covers a significant portion (>= 60%) of the target word
+                                    # e.g., "rehma" in "rehmaa" (5/6=83%) — OK
+                                    # e.g., "mark" in "bookmark" (4/8=50%) — rejected
+                                    if any(qw in tw and len(qw) / len(tw) >= 0.6 for tw in title_words_substr):
                                         overlap_found = True
                                         overlap_score = max(overlap_score, 0.80)
                                         break
                                     # Title word (>= 4 chars) is substring of query word (>= 4 chars)
-                                    elif any(tw in qw for tw in title_words_substr):
+                                    # Same coverage ratio requirement
+                                    elif any(tw in qw and len(tw) / len(qw) >= 0.6 for tw in title_words_substr):
                                         overlap_found = True
                                         overlap_score = max(overlap_score, 0.75)
                                         break
