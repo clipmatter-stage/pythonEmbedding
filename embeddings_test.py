@@ -250,7 +250,7 @@ class SearchRequest(BaseModel):
     # Dual-mode search: 'semantic' (vector + LLM) or 'simple' (structured filters only)
     search_mode: str = Field(default="semantic", pattern="^(semantic|simple)$")
     # Simple mode: which single filter is active
-    filter_type: Optional[str] = Field(default=None, pattern="^(video|speaker|date|language|title|summary)$")
+    filter_type: Optional[str] = Field(default=None, pattern="^(video|speaker|date|language|title|summary|text)$")
     # Date filter fields for simple mode date filtering within Qdrant
     filter_year: Optional[int] = Field(default=None, ge=1900, le=2100)
     filter_month: Optional[int] = Field(default=None, ge=1, le=12)
@@ -1728,8 +1728,73 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                         break
                 simple_results.sort(key=lambda x: x["score"], reverse=True)
 
+            elif filter_type == "text":
+                # Text search — keyword/fuzzy match against segment text field
+                search_query = query_text or title_filter or ""
+                if not search_query:
+                    raise HTTPException(status_code=400, detail="query is required for text filter")
+                # Use MatchText on the 'text' field for Qdrant full-text filtering
+                search_words_lower = [w.lower().strip() for w in search_query.split() if len(w.strip()) >= 2]
+                if not search_words_lower:
+                    raise HTTPException(status_code=400, detail="query must contain at least one word with 2+ characters for text filter")
+                # Build Qdrant scroll with text match conditions
+                scroll_conditions = list(eligibility_conditions)
+                # Add MatchText for each search word on the 'text' field
+                for sw in search_words_lower[:5]:  # Limit to 5 words to avoid overly strict filters
+                    scroll_conditions.append(
+                        FieldCondition(key="text", match=MatchText(text=sw))
+                    )
+                scroll_filter = Filter(must=scroll_conditions)
+                offset = None
+                while scanned < max_scan_simple and len(simple_results) < top_k:
+                    points, next_offset = qdrant_client.scroll(
+                        collection_name=SEGMENTS_COLLECTION,
+                        scroll_filter=scroll_filter,
+                        limit=min(1000, max_scan_simple - scanned),
+                        offset=offset,
+                        with_payload=True,
+                        with_vectors=False
+                    )
+                    if not points:
+                        break
+                    for p in points:
+                        scanned += 1
+                        payload = p.payload or {}
+                        seg_text = payload.get("text", "")
+                        if not seg_text:
+                            continue
+                        seg_text_lower = seg_text.lower()
+                        matched_count = sum(1 for w in search_words_lower if w in seg_text_lower)
+                        match_score = matched_count / max(len(search_words_lower), 1)
+                        simple_results.append({
+                            "id": p.id,
+                            "score": round(min(match_score, 1.0), 4),
+                            "video_id": payload.get("video_id"),
+                            "video_title": payload.get("video_title", ""),
+                            "speaker": payload.get("speaker", ""),
+                            "diarization_speaker": payload.get("diarization_speaker", ""),
+                            "start_time": payload.get("start_time", 0),
+                            "end_time": payload.get("end_time", 0),
+                            "duration": round((payload.get("end_time", 0) - payload.get("start_time", 0)), 2),
+                            "text": seg_text,
+                            "text_length": payload.get("text_length", 0),
+                            "youtube_url": payload.get("youtube_url", ""),
+                            "language": payload.get("language", ""),
+                            "created_at": payload.get("created_at"),
+                            "video_created_at": payload.get("video_created_at", ""),
+                            "match_types": ["simple_text_filter"],
+                            "fuzzy_score": round(match_score, 2),
+                            "matched_field": "text",
+                        })
+                    if len(simple_results) >= top_k:
+                        break
+                    offset = next_offset
+                    if not next_offset:
+                        break
+                simple_results.sort(key=lambda x: x["score"], reverse=True)
+
             else:
-                raise HTTPException(status_code=400, detail=f"Invalid filter_type: {filter_type}. Must be one of: video, speaker, date, language, title, summary")
+                raise HTTPException(status_code=400, detail=f"Invalid filter_type: {filter_type}. Must be one of: video, speaker, date, language, title, summary, text")
 
             unique_videos = len(set(r["video_id"] for r in simple_results if r.get("video_id")))
             logger.info(f"Simple search completed: {len(simple_results)} results from {unique_videos} videos (scanned {scanned})")
@@ -1745,6 +1810,7 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                 "total_semantic_hits": 0,
                 "total_keyword_hits": 0,
                 "total_title_hits": len(simple_results) if filter_type == "title" else 0,
+                "total_text_hits": len(simple_results) if filter_type == "text" else 0,
                 "total_exact_phrase_hits": 0,
                 "returned": len(simple_results),
                 "unique_videos": unique_videos,
