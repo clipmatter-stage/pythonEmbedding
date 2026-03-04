@@ -527,11 +527,95 @@ Query: "what did Imran Khan say about economy"
         return default_result
 
 
+def validate_query_relevance(query: str, top_results: List[Dict]) -> Dict:
+    """
+    Validate if ANY of the top search results are actually relevant to the query.
+    This prevents showing completely unrelated results (e.g., "bill gates" returning Pakistan politics).
+    
+    Returns dict with:
+    - is_relevant: bool - True if at least one result is relevant
+    - max_relevance: float - Highest relevance score (0-1)
+    - relevant_count: int - Number of results with score >= 0.5
+    - explanation: str - Why results were deemed irrelevant
+    """
+    if not openai_client or not top_results or not query.strip():
+        # If no LLM available, assume results are valid
+        return {"is_relevant": True, "max_relevance": 1.0, "relevant_count": len(top_results), "explanation": ""}
+    
+    try:
+        # Check top 5 results only (fast validation)
+        check_results = top_results[:5]
+        
+        # Build compact summary for validation
+        docs_summary = []
+        for i, r in enumerate(check_results):
+            text = r.get("text", "")[:150]
+            speaker = r.get("speaker", "")
+            title = r.get("video_title", "")[:80]
+            docs_summary.append(f"[{i+1}] {title} | Speaker: {speaker} | Text: {text}")
+        
+        docs_text = "\n".join(docs_summary)
+        
+        response = openai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": """You are a relevance validator for a search engine. Your job is to determine if search results actually match the user's query.
+
+Return ONLY valid JSON: {"relevant": boolean, "scores": [score1, score2, ...], "explanation": "reason"}
+
+Score each result 0-10:
+- 8-10: Directly discusses the query topic/person
+- 5-7: Related to the query domain
+- 2-4: Loosely connected or tangential
+- 0-1: Completely unrelated
+
+Set "relevant": true ONLY if at least one result scores >= 5.
+Set "relevant": false if ALL results are off-topic.
+
+Be STRICT: If searching for "Bill Gates" but results are about Pakistan politics, that's irrelevant.
+If searching for a person/topic not in the database, all results will be off-topic."""},
+                {"role": "user", "content": f"Query: {query}\n\nTop Results:\n{docs_text}\n\nAre these results relevant to the query?"}
+            ],
+            max_tokens=300,
+            temperature=0.0,
+            response_format={"type": "json_object"}
+        )
+        
+        result = json_module.loads(response.choices[0].message.content.strip())
+        is_relevant = result.get("relevant", True)
+        scores = result.get("scores", [])
+        explanation = result.get("explanation", "")
+        
+        # Normalize scores to 0-1
+        normalized_scores = [s / 10.0 for s in scores if isinstance(s, (int, float))]
+        max_relevance = max(normalized_scores) if normalized_scores else 0.0
+        relevant_count = sum(1 for s in normalized_scores if s >= 0.5)
+        
+        logger.info(f"Query relevance validation: is_relevant={is_relevant}, max_score={max_relevance:.2f}, relevant_count={relevant_count}/{len(check_results)}")
+        if not is_relevant:
+            logger.info(f"Irrelevant query detected: {explanation}")
+        
+        return {
+            "is_relevant": is_relevant,
+            "max_relevance": max_relevance,
+            "relevant_count": relevant_count,
+            "explanation": explanation
+        }
+        
+    except Exception as e:
+        logger.warning(f"Query relevance validation error: {str(e)}")
+        # On error, assume results are valid to avoid blocking searches
+        return {"is_relevant": True, "max_relevance": 1.0, "relevant_count": len(top_results), "explanation": ""}
+
+
 def rerank_with_llm(query: str, results: List[Dict], top_k: int = 20) -> List[Dict]:
     """
     LLM-based reranking using GPT-4o-mini.
     Replaces Cohere (English-only) with multilingual GPT-4o-mini reranker.
     Handles Urdu, English, and mixed content properly.
+    
+    STRICT SCORING: Only truly relevant results get high scores.
+    Irrelevant results (wrong topic/person) get scores < 3/10.
     """
     if not openai_client or not results or not query.strip():
         return results[:top_k]
@@ -553,21 +637,26 @@ def rerank_with_llm(query: str, results: List[Dict], top_k: int = 20) -> List[Di
         response = openai_client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
-                {"role": "system", "content": """You are a search result relevance judge for a video transcript search engine.
+                {"role": "system", "content": """You are a STRICT search result relevance judge for a video transcript search engine.
 Content may be in Urdu, English, or mixed. Rate each transcript segment's relevance to the user's search query.
 
 Return ONLY valid JSON: {"scores": [{"i": 0, "s": 8}, {"i": 1, "s": 3}, ...]}
 Where "i" is the document index and "s" is relevance score 0-10.
 
-Scoring guide:
-- 10: Perfect match - directly answers the query
-- 7-9: Highly relevant - discusses the topic/person searched for
-- 4-6: Partially relevant - related but not directly about the query
-- 1-3: Marginally relevant - only loosely connected
-- 0: Not relevant at all
+Scoring guide (BE STRICT):
+- 10: Perfect match - directly answers the query, exact topic/person
+- 7-9: Highly relevant - clearly discusses the queried topic/person
+- 4-6: Partially relevant - mentions topic but not the main focus
+- 1-3: Marginally relevant - only loosely connected, different topic
+- 0: Completely unrelated - wrong topic/person/domain entirely
 
-Consider: semantic meaning, speaker match, topic match, language match (Urdu query should match Urdu content).
-Be strict - only give high scores to truly relevant results."""}, 
+CRITICAL RULES:
+- If query is "Bill Gates" but result is about Pakistan politics → score 0-1
+- If query is about technology but result is about religion → score 0-2
+- If query person/topic is NOT mentioned in the result → score 0-3
+- Only give scores >= 7 if the result is ACTUALLY ABOUT what the user searched for
+
+Be VERY strict. Most results should get low scores if they don't match the query topic."""}, 
                 {"role": "user", "content": f"Search Query: {query}\n\nDocuments:\n{docs_text}"}
             ],
             max_tokens=500,
@@ -590,14 +679,15 @@ Be strict - only give high scores to truly relevant results."""},
         reranked = []
         for i, r in enumerate(candidates):
             result_copy = r.copy()
-            llm_score = score_map.get(i, 0.5)  # Default to 0.5 if not scored
+            llm_score = score_map.get(i, 0.3)  # Default to LOW score (0.3) if not scored
             
-            # Combined score: LLM (50%) + original semantic (30%) + keyword/fuzzy (20%)
+            # Combined score: LLM (60%) + original semantic (25%) + keyword/fuzzy (15%)
+            # INCREASED LLM weight to 60% so strict LLM scores have more impact
             original_score = result_copy.get("score", 0)
             result_copy["llm_relevance_score"] = round(llm_score, 4)
             result_copy["original_score"] = original_score
             result_copy["score"] = round(
-                llm_score * 0.50 + original_score * 0.30 + result_copy.get("fuzzy_score", 0) * 0.20,
+                llm_score * 0.60 + original_score * 0.25 + result_copy.get("fuzzy_score", 0) * 0.15,
                 4
             )
             
@@ -606,9 +696,14 @@ Be strict - only give high scores to truly relevant results."""},
             result_copy["match_types"].append("llm_reranked")
             reranked.append(result_copy)
         
-        # Filter out irrelevant results (LLM score < 0.2 = score < 2/10)
-        # But never filter out title matches or exact phrase matches — these are confirmed user-intent matches
-        reranked = [r for r in reranked if r.get("llm_relevance_score", 0) >= 0.2 or "title_match" in r.get("match_types", []) or "exact_phrase_match" in r.get("match_types", [])]
+        # STRICTER filtering: LLM score < 0.3 (3/10) is considered irrelevant
+        # But ALWAYS keep title matches and exact phrase matches (these are verified matches)
+        reranked = [
+            r for r in reranked 
+            if r.get("llm_relevance_score", 0) >= 0.3 
+            or "title_match" in r.get("match_types", []) 
+            or "exact_phrase_match" in r.get("match_types", [])
+        ]
         
         # Sort by new combined score
         reranked.sort(key=lambda x: x.get("score", 0), reverse=True)
@@ -619,7 +714,13 @@ Be strict - only give high scores to truly relevant results."""},
             if r["id"] not in reranked_ids:
                 reranked.append(r)
         
-        logger.info(f"LLM reranking: {len(candidates)} candidates -> {len(reranked)} results (filtered {len(candidates) - len([r for r in reranked if r.get('llm_relevance_score')])} irrelevant)")
+        # Log statistics
+        high_relevance = sum(1 for r in reranked if r.get("llm_relevance_score", 0) >= 0.7)
+        med_relevance = sum(1 for r in reranked if 0.5 <= r.get("llm_relevance_score", 0) < 0.7)
+        low_relevance = sum(1 for r in reranked if 0.3 <= r.get("llm_relevance_score", 0) < 0.5)
+        filtered_count = len(candidates) - len([r for r in reranked if r.get("llm_relevance_score")])
+        
+        logger.info(f"LLM reranking: {len(candidates)} candidates -> {len(reranked)} results (high={high_relevance}, med={med_relevance}, low={low_relevance}, filtered={filtered_count})")
         return reranked[:top_k]
         
     except Exception as e:
@@ -1430,11 +1531,13 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                         break
 
             elif filter_type == "speaker":
-                # Speaker-only search — fuzzy match against speaker fields
+                # Speaker-only search — STRICT fuzzy match against speaker fields
+                # Higher threshold (78) and no score inflation for better accuracy
                 if not speaker_filter:
                     raise HTTPException(status_code=400, detail="speaker is required for speaker filter")
                 scroll_filter = Filter(must=eligibility_conditions) if eligibility_conditions else None
                 offset = None
+                min_speaker_score = 0.45  # Minimum score threshold for quality
                 while scanned < max_scan_simple and len(simple_results) < top_k:
                     points, next_offset = qdrant_client.scroll(
                         collection_name=SEGMENTS_COLLECTION,
@@ -1452,12 +1555,17 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                         spk = payload.get("speaker", "")
                         diar_spk = payload.get("diarization_speaker", "")
                         speaker_combined = f"{spk} {diar_spk}".strip()
-                        if not fuzzy_match_speaker(speaker_filter, speaker_combined, threshold=70):
+                        # STRICTER: Raised threshold from 70 to 78 for better accuracy
+                        if not fuzzy_match_speaker(speaker_filter, speaker_combined, threshold=78):
                             continue
+                        # Calculate accurate match score without inflation
                         match_score = fuzz.ratio(speaker_filter.lower(), speaker_combined.lower()) / 100
+                        # Enforce minimum quality threshold
+                        if match_score < min_speaker_score:
+                            continue
                         simple_results.append({
                             "id": p.id,
-                            "score": round(max(match_score, 0.5), 4),
+                            "score": round(match_score, 4),  # REMOVED score inflation (was max(match_score, 0.5))
                             "video_id": payload.get("video_id"),
                             "video_title": payload.get("video_title", ""),
                             "speaker": spk,
@@ -1605,12 +1713,14 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                         break
 
             elif filter_type == "title":
-                # Title search — fuzzy match against video_title
+                # Title search — STRICT fuzzy match against video_title
+                # Higher threshold (72) for better accuracy
                 if not title_filter:
                     raise HTTPException(status_code=400, detail="title is required for title filter")
                 scroll_filter = Filter(must=eligibility_conditions) if eligibility_conditions else None
                 offset = None
                 seen_video_ids = set()
+                min_title_score = 0.50  # Minimum score threshold
                 while scanned < max_scan_simple and len(simple_results) < top_k:
                     points, next_offset = qdrant_client.scroll(
                         collection_name=SEGMENTS_COLLECTION,
@@ -1629,10 +1739,19 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                         if vid in seen_video_ids:
                             continue
                         video_title = payload.get("video_title", "")
-                        if not fuzzy_match_text(title_filter, video_title, threshold=60):
+                        # STRICTER: Raised threshold from 60 to 72 for better accuracy
+                        if not fuzzy_match_text(title_filter, video_title, threshold=72):
+                            continue
+                        # Use regular ratio for better accuracy (not partial_ratio)
+                        # partial_ratio can match small fragments, ratio requires better overall match
+                        match_score = max(
+                            fuzz.ratio(title_filter.lower(), video_title.lower()) / 100,
+                            fuzz.partial_ratio(title_filter.lower(), video_title.lower()) / 100 * 0.85  # Discount partial matches
+                        )
+                        # Enforce minimum quality threshold
+                        if match_score < min_title_score:
                             continue
                         seen_video_ids.add(vid)
-                        match_score = fuzz.partial_ratio(title_filter.lower(), video_title.lower()) / 100
                         simple_results.append({
                             "id": p.id,
                             "score": round(match_score, 4),
@@ -1663,14 +1782,19 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                 simple_results.sort(key=lambda x: x["score"], reverse=True)
 
             elif filter_type == "summary":
-                # Summary keyword search — scroll and check video_summary/video_summary_english/video_summary_urdu
+                # Summary keyword search — STRICT whole-word matching in video summaries
+                # Prevents false matches like 'tan' matching 'pakistan', 'tech' matching 'technology'
                 search_query = query_text or title_filter or ""
                 if not search_query:
                     raise HTTPException(status_code=400, detail="query is required for summary filter")
                 scroll_filter = Filter(must=eligibility_conditions) if eligibility_conditions else None
-                search_words_lower = [w.lower().strip() for w in search_query.split() if len(w.strip()) >= 2]
+                # Normalize and filter search words (>= 3 chars for accuracy)
+                search_words_lower = [normalize_word(w) for w in search_query.split() if len(normalize_word(w)) >= 3]
+                if not search_words_lower:
+                    raise HTTPException(status_code=400, detail="query must contain at least one word with 3+ characters for summary filter")
                 offset = None
                 seen_video_ids = set()
+                min_summary_score = 0.40  # Minimum score threshold
                 while scanned < max_scan_simple and len(simple_results) < top_k:
                     points, next_offset = qdrant_client.scroll(
                         collection_name=SEGMENTS_COLLECTION,
@@ -1688,18 +1812,24 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                         vid = payload.get("video_id")
                         if vid in seen_video_ids:
                             continue
-                        summary_all = " ".join([
+                        # Combine all summary fields and normalize
+                        summary_all = normalize_for_matching(" ".join([
                             payload.get("video_summary", ""),
                             payload.get("video_summary_english", ""),
                             payload.get("video_summary_urdu", ""),
-                        ]).lower()
+                        ]))
                         if not summary_all.strip():
                             continue
-                        matched_count = sum(1 for w in search_words_lower if w in summary_all)
+                        # WHOLE-WORD matching: prevents 'tan' matching 'pakistan'
+                        matched_count = sum(1 for w in search_words_lower if whole_word_match(w, summary_all))
                         if matched_count == 0:
                             continue
-                        seen_video_ids.add(vid)
+                        # Calculate accurate score: require high word coverage for good scores
                         match_score = matched_count / max(len(search_words_lower), 1)
+                        # Enforce minimum quality threshold
+                        if match_score < min_summary_score:
+                            continue
+                        seen_video_ids.add(vid)
                         simple_results.append({
                             "id": p.id,
                             "score": round(min(match_score, 1.0), 4),
@@ -1729,23 +1859,25 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                 simple_results.sort(key=lambda x: x["score"], reverse=True)
 
             elif filter_type == "text":
-                # Text search — keyword/fuzzy match against segment text field
+                # Text search — STRICT whole-word matching against segment text
+                # Prevents false matches like 'dance' matching 'abundance'
                 search_query = query_text or title_filter or ""
                 if not search_query:
                     raise HTTPException(status_code=400, detail="query is required for text filter")
-                # Use MatchText on the 'text' field for Qdrant full-text filtering
-                search_words_lower = [w.lower().strip() for w in search_query.split() if len(w.strip()) >= 2]
-                if not search_words_lower:
-                    raise HTTPException(status_code=400, detail="query must contain at least one word with 2+ characters for text filter")
-                # Build Qdrant scroll with text match conditions
+                # Normalize and filter search words (>= 3 chars for accuracy)
+                search_words_normalized = [normalize_word(w) for w in search_query.split() if len(normalize_word(w)) >= 3]
+                if not search_words_normalized:
+                    raise HTTPException(status_code=400, detail="query must contain at least one word with 3+ characters for text filter")
+                # Build Qdrant scroll with text match conditions (Qdrant pre-filtering)
                 scroll_conditions = list(eligibility_conditions)
                 # Add MatchText for each search word on the 'text' field
-                for sw in search_words_lower[:5]:  # Limit to 5 words to avoid overly strict filters
+                for sw in search_words_normalized[:5]:  # Limit to 5 words to avoid overly strict filters
                     scroll_conditions.append(
                         FieldCondition(key="text", match=MatchText(text=sw))
                     )
                 scroll_filter = Filter(must=scroll_conditions)
                 offset = None
+                min_text_score = 0.40  # Minimum score threshold
                 while scanned < max_scan_simple and len(simple_results) < top_k:
                     points, next_offset = qdrant_client.scroll(
                         collection_name=SEGMENTS_COLLECTION,
@@ -1763,9 +1895,17 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                         seg_text = payload.get("text", "")
                         if not seg_text:
                             continue
-                        seg_text_lower = seg_text.lower()
-                        matched_count = sum(1 for w in search_words_lower if w in seg_text_lower)
-                        match_score = matched_count / max(len(search_words_lower), 1)
+                        # Normalize text for accurate matching
+                        seg_text_normalized = normalize_for_matching(seg_text)
+                        # WHOLE-WORD matching: prevents 'tan' matching 'pakistan', 'dance' matching 'abundance'
+                        matched_count = sum(1 for w in search_words_normalized if whole_word_match(w, seg_text_normalized))
+                        if matched_count == 0:
+                            continue
+                        # Calculate accurate score: require high word coverage
+                        match_score = matched_count / max(len(search_words_normalized), 1)
+                        # Enforce minimum quality threshold
+                        if match_score < min_text_score:
+                            continue
                         simple_results.append({
                             "id": p.id,
                             "score": round(min(match_score, 1.0), 4),
@@ -2351,11 +2491,11 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                     exact=False   # Use approximate search for speed
                 )
 
-                # Use a moderately lower threshold for Qdrant retrieval.
-                # We filter by min_score AFTER scoring, not at the DB level, but we
-                # don't go too low to avoid flooding results with loosely related content
-                # (e.g. 'mufti' pulling in all Islamic terms like 'qari', 'jamat').
-                retrieval_threshold = max(min_score * 0.75, 0.25)  # e.g. 0.35 * 0.75 = 0.26
+                # Use a higher threshold for Qdrant retrieval to avoid irrelevant results.
+                # We want to retrieve results that have at least some semantic similarity.
+                # For queries like "bill gates" in a database without Bill Gates content,
+                # this prevents retrieving completely unrelated Pakistan politics videos.
+                retrieval_threshold = max(min_score * 0.85, 0.35)  # e.g. 0.35 * 0.85 = 0.30 (raised from 0.26)
                 
                 sem_search_response = qdrant_client.query_points(
                     collection_name=SEGMENTS_COLLECTION,
@@ -2437,13 +2577,17 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                                 break
                     
                     # Apply query-presence penalty for SHORT queries (1-2 words)
-                    # Short queries are specific searches ("mufti", "drone") — user expects
+                    # Short queries are specific searches ("mufti", "drone", "bill gates") — user expects
                     # the word to actually appear in results, not just be "semantically related"
                     query_word_count = len(query_text.split()) if query_text else 0
                     presence_penalty = 0.0
                     if query_word_count <= 2 and not query_words_in_result and not speaker_field_match:
-                        # Penalize results that don't contain the actual search term
-                        # This prevents "mufti" → "qari mansoor jamat" false matches
+                        # STRONGER penalty: results that don't contain the actual search term
+                        # This prevents "bill gates" → "pakistan politics" false matches
+                        # Also prevents "mufti" → "qari mansoor jamat" false matches
+                        presence_penalty = 0.25  # Increased from 0.15 to 0.25
+                    elif 3 <= query_word_count <= 4 and not query_words_in_result and not speaker_field_match:
+                        # Medium queries (3-4 words): smaller penalty
                         presence_penalty = 0.15
                     
                     combined_score = calculate_combined_score(base_score, False, fuzzy_boost)
@@ -3191,6 +3335,53 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
         logger.info(f"Exact phrase matches found: {exact_phrase_count} segments will be prioritized at top")
     if title_match_count > 0:
         logger.info(f"Title matches found: {title_match_count} videos matched by title")
+    
+    # ═══════════════════════════════════════════════════════════════════════════
+    # QUERY RELEVANCE VALIDATION - Check if ANY results are actually relevant
+    # This prevents showing completely unrelated results (e.g., "bill gates" → Pakistan politics)
+    # ═══════════════════════════════════════════════════════════════════════════
+    if consolidated_segments and query_text and len(query_text.strip()) >= 3:
+        # Skip validation if we have verified matches (exact phrase or title matches)
+        has_verified_matches = exact_phrase_count > 0 or title_match_count > 0
+        
+        if not has_verified_matches and use_reranking and openai_client:
+            # Validate if top results are actually relevant to the query
+            relevance_check = validate_query_relevance(query_text, consolidated_segments[:5])
+            
+            # If ALL top results are irrelevant, return empty result set
+            if not relevance_check["is_relevant"]:
+                logger.warning(f"Query '{query_text[:50]}' returned no relevant results. Max relevance: {relevance_check['max_relevance']:.2f}. Reason: {relevance_check['explanation']}")
+                return {
+                    "query": query_text,
+                    "words": words,
+                    "speaker_filter": speaker_filter,
+                    "collection": SEGMENTS_COLLECTION,
+                    "total_speaker_hits": 0,
+                    "total_semantic_hits": 0,
+                    "total_keyword_hits": 0,
+                    "total_title_hits": 0,
+                    "total_exact_phrase_hits": 0,
+                    "returned": 0,
+                    "unique_videos": 0,
+                    "filters_applied": {
+                        "video_id": video_id_filter,
+                        "speaker": speaker_filter,
+                        "title": title_filter,
+                        "language": language_filter,
+                        "time_range": time_range,
+                        "min_score": min_score,
+                    },
+                    "relevance_validation": {
+                        "performed": True,
+                        "passed": False,
+                        "max_relevance": relevance_check["max_relevance"],
+                        "explanation": relevance_check["explanation"]
+                    },
+                    "results": [],
+                    "message": f"No relevant results found for '{query_text}'. The database may not contain content about this topic."
+                }
+            else:
+                logger.info(f"Query relevance validation passed: {relevance_check['relevant_count']}/{len(consolidated_segments[:5])} results are relevant (max score: {relevance_check['max_relevance']:.2f})")
     
     # Apply limits (up to 10 segments per video, top_k total)
     for result in consolidated_segments:
