@@ -1531,13 +1531,15 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                         break
 
             elif filter_type == "speaker":
-                # Speaker-only search — STRICT fuzzy match against speaker fields
-                # Higher threshold (78) and no score inflation for better accuracy
+                # Speaker search — fuzzy match against speaker fields
+                # Supports multi-word names like "Hafiz Naeem" matching individual word components
                 if not speaker_filter:
                     raise HTTPException(status_code=400, detail="speaker is required for speaker filter")
                 scroll_filter = Filter(must=eligibility_conditions) if eligibility_conditions else None
                 offset = None
                 min_speaker_score = 0.45  # Minimum score threshold for quality
+                # Split speaker query into words for multi-word matching
+                speaker_query_words = [w.lower().strip() for w in speaker_filter.split() if len(w.strip()) >= 2]
                 while scanned < max_scan_simple and len(simple_results) < top_k:
                     points, next_offset = qdrant_client.scroll(
                         collection_name=SEGMENTS_COLLECTION,
@@ -1555,11 +1557,34 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                         spk = payload.get("speaker", "")
                         diar_spk = payload.get("diarization_speaker", "")
                         speaker_combined = f"{spk} {diar_spk}".strip()
-                        # STRICTER: Raised threshold from 70 to 78 for better accuracy
-                        if not fuzzy_match_speaker(speaker_filter, speaker_combined, threshold=78):
+                        if not speaker_combined:
                             continue
-                        # Calculate accurate match score without inflation
-                        match_score = fuzz.ratio(speaker_filter.lower(), speaker_combined.lower()) / 100
+                        
+                        # Try the existing fuzzy_match_speaker (handles aliases, exact match, etc.)
+                        alias_match = fuzzy_match_speaker(speaker_filter, speaker_combined, threshold=75)
+                        
+                        if not alias_match:
+                            # Multi-word fallback: check if each word in the query
+                            # appears in the speaker fields (handles "rehan Tariq" etc.)
+                            if len(speaker_query_words) > 1:
+                                speaker_lower = speaker_combined.lower()
+                                words_found = sum(1 for sw in speaker_query_words if whole_word_match(sw, speaker_lower))
+                                if words_found < len(speaker_query_words):
+                                    continue  # Not all words found
+                            else:
+                                continue  # Single word didn't match fuzzy_match_speaker
+                        
+                        # Calculate match score — word-level for multi-word, ratio for single-word
+                        if len(speaker_query_words) > 1:
+                            speaker_lower = speaker_combined.lower()
+                            words_found = sum(1 for sw in speaker_query_words if whole_word_match(sw, speaker_lower))
+                            word_coverage = words_found / max(len(speaker_query_words), 1)
+                            # Also get fuzzy scores for reference
+                            partial_score = fuzz.partial_ratio(speaker_filter.lower(), speaker_lower) / 100
+                            match_score = max(word_coverage * 0.85, partial_score * 0.80)
+                        else:
+                            match_score = fuzz.ratio(speaker_filter.lower(), speaker_combined.lower()) / 100
+                        
                         # Enforce minimum quality threshold
                         if match_score < min_speaker_score:
                             continue
@@ -1713,14 +1738,21 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                         break
 
             elif filter_type == "title":
-                # Title search — STRICT fuzzy match against video_title
-                # Higher threshold (72) for better accuracy
+                # Title search — word-level matching against video_title
+                # For multi-word queries like "rehan Tariq", checks if EACH word
+                # appears in the title independently (not as an exact phrase only).
+                # This handles different word orders and words separated by other words.
                 if not title_filter:
                     raise HTTPException(status_code=400, detail="title is required for title filter")
                 scroll_filter = Filter(must=eligibility_conditions) if eligibility_conditions else None
                 offset = None
                 seen_video_ids = set()
-                min_title_score = 0.50  # Minimum score threshold
+                min_title_score = 0.45  # Minimum score threshold
+                # Split query into individual words for word-level matching
+                title_query_words = [w.lower().strip() for w in title_filter.split() if len(w.strip()) >= 2]
+                if not title_query_words:
+                    title_query_words = [title_filter.lower().strip()]
+                logger.info(f"Simple title search: query='{title_filter}', words={title_query_words}")
                 while scanned < max_scan_simple and len(simple_results) < top_k:
                     points, next_offset = qdrant_client.scroll(
                         collection_name=SEGMENTS_COLLECTION,
@@ -1739,18 +1771,51 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                         if vid in seen_video_ids:
                             continue
                         video_title = payload.get("video_title", "")
-                        # STRICTER: Raised threshold from 60 to 72 for better accuracy
-                        if not fuzzy_match_text(title_filter, video_title, threshold=72):
+                        if not video_title:
                             continue
-                        # Use regular ratio for better accuracy (not partial_ratio)
-                        # partial_ratio can match small fragments, ratio requires better overall match
-                        match_score = max(
-                            fuzz.ratio(title_filter.lower(), video_title.lower()) / 100,
-                            fuzz.partial_ratio(title_filter.lower(), video_title.lower()) / 100 * 0.85  # Discount partial matches
-                        )
+                        video_title_lower = video_title.lower()
+                        
+                        # STRATEGY 1: Check exact phrase match first (highest quality)
+                        exact_phrase = whole_word_match(title_filter.lower().strip(), video_title_lower)
+                        
+                        # STRATEGY 2: Word-level matching — count how many query words
+                        # appear as whole words in the title (handles multi-word queries)
+                        words_matched = 0
+                        for qw in title_query_words:
+                            # Check whole-word match (prevents 'tan' matching 'pakistan')
+                            if whole_word_match(qw, video_title_lower):
+                                words_matched += 1
+                            # Fallback: fuzzy word match for typo tolerance (4+ char words only)
+                            elif len(qw) >= 4 and fuzzy_word_match(qw, video_title_lower, threshold=80) > 0:
+                                words_matched += 0.8  # Fuzzy match counts as 0.8
+                        
+                        word_coverage = words_matched / max(len(title_query_words), 1)
+                        
+                        # STRATEGY 3: Full-string fuzzy match (handles very similar titles)
+                        fuzzy_ratio = fuzz.ratio(title_filter.lower(), video_title_lower) / 100
+                        fuzzy_partial = fuzz.partial_ratio(title_filter.lower(), video_title_lower) / 100
+                        
+                        # Calculate final match score
+                        if exact_phrase:
+                            # Exact phrase found → high score
+                            match_score = max(0.90, fuzzy_partial * 0.95)
+                        elif word_coverage >= 1.0:
+                            # All query words found in title → very good match
+                            match_score = max(0.80, fuzzy_partial * 0.90)
+                        elif word_coverage >= 0.5:
+                            # At least half the words found → decent match
+                            match_score = word_coverage * 0.75
+                        elif fuzzy_ratio >= 0.70:
+                            # High overall similarity (handles typos)
+                            match_score = fuzzy_ratio * 0.85
+                        else:
+                            # Not enough overlap
+                            continue
+                        
                         # Enforce minimum quality threshold
                         if match_score < min_title_score:
                             continue
+                        
                         seen_video_ids.add(vid)
                         simple_results.append({
                             "id": p.id,
