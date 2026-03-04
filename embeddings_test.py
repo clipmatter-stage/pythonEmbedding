@@ -3680,6 +3680,165 @@ async def delete_video_embeddings(video_id: int, authorized: bool = Depends(veri
         logger.error(f"Error deleting embeddings: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
+class UpdatePayloadRequest(BaseModel):
+    video_id: int = Field(..., gt=0, description="Video ID to update")
+    video_title: Optional[str] = Field(default=None, max_length=500)
+    video_filename: Optional[str] = Field(default=None, max_length=500)
+    youtube_url: Optional[str] = Field(default=None, max_length=1000)
+    language: Optional[str] = Field(default=None, max_length=50)
+    video_created_at: Optional[str] = Field(default=None, description="ISO datetime")
+    processing_status: Optional[str] = Field(default=None, max_length=50)
+    approval_status: Optional[str] = Field(default=None, max_length=50)
+    is_archived: Optional[bool] = Field(default=None)
+    user_id: Optional[int] = Field(default=None)
+    speakers_count: Optional[int] = Field(default=None)
+    audio_duration_seconds: Optional[float] = Field(default=None)
+    video_description: Optional[str] = Field(default=None, max_length=5000)
+    video_summary: Optional[str] = Field(default=None, max_length=10000)
+    video_summary_english: Optional[str] = Field(default=None, max_length=10000)
+    video_summary_urdu: Optional[str] = Field(default=None, max_length=10000)
+
+
+@app.post("/update-video-payload")
+async def update_video_payload(data: UpdatePayloadRequest, authorized: bool = Depends(verify_api_key)):
+    """
+    Update payload metadata on existing Qdrant points for a video WITHOUT re-generating embeddings.
+    Only the provided (non-None) fields are updated; existing payload fields are preserved.
+    """
+    try:
+        video_id = data.video_id
+
+        # Build payload dict from non-None fields (skip video_id itself)
+        payload_update = {}
+        for field_name, field_value in data.dict(exclude={"video_id"}).items():
+            if field_value is not None:
+                payload_update[field_name] = field_value
+
+        if not payload_update:
+            return {
+                "success": True,
+                "message": f"No fields to update for video {video_id}",
+                "video_id": video_id,
+                "updated_fields": [],
+                "points_affected": 0,
+            }
+
+        # Use set_payload with a filter on video_id — updates ALL points for this video
+        qdrant_client.set_payload(
+            collection_name=SEGMENTS_COLLECTION,
+            payload=payload_update,
+            points=models.Filter(
+                must=[
+                    models.FieldCondition(
+                        key="video_id",
+                        match=models.MatchValue(value=video_id),
+                    )
+                ]
+            ),
+        )
+
+        # Count how many points were affected
+        count_result = qdrant_client.count(
+            collection_name=SEGMENTS_COLLECTION,
+            count_filter=models.Filter(
+                must=[
+                    models.FieldCondition(
+                        key="video_id",
+                        match=models.MatchValue(value=video_id),
+                    )
+                ]
+            ),
+            exact=True,
+        )
+
+        logger.info(f"Updated payload for video {video_id}: {list(payload_update.keys())} on {count_result.count} points")
+
+        return {
+            "success": True,
+            "message": f"Updated {len(payload_update)} fields on {count_result.count} points for video {video_id}",
+            "video_id": video_id,
+            "updated_fields": list(payload_update.keys()),
+            "points_affected": count_result.count,
+        }
+
+    except Exception as e:
+        logger.error(f"Update payload failed for video {data.video_id}: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/update-video-payload-batch")
+async def update_video_payload_batch(
+    data: List[UpdatePayloadRequest],
+    authorized: bool = Depends(verify_api_key)
+):
+    """
+    Batch update payload for multiple videos at once.
+    Each item follows the same rules as /update-video-payload.
+    """
+    results = []
+    total_points = 0
+    errors = []
+
+    for item in data:
+        try:
+            payload_update = {}
+            for field_name, field_value in item.dict(exclude={"video_id"}).items():
+                if field_value is not None:
+                    payload_update[field_name] = field_value
+
+            if not payload_update:
+                results.append({"video_id": item.video_id, "updated_fields": 0, "points": 0, "status": "skipped"})
+                continue
+
+            qdrant_client.set_payload(
+                collection_name=SEGMENTS_COLLECTION,
+                payload=payload_update,
+                points=models.Filter(
+                    must=[
+                        models.FieldCondition(
+                            key="video_id",
+                            match=models.MatchValue(value=item.video_id),
+                        )
+                    ]
+                ),
+            )
+
+            count_result = qdrant_client.count(
+                collection_name=SEGMENTS_COLLECTION,
+                count_filter=models.Filter(
+                    must=[
+                        models.FieldCondition(
+                            key="video_id",
+                            match=models.MatchValue(value=item.video_id),
+                        )
+                    ]
+                ),
+                exact=True,
+            )
+
+            total_points += count_result.count
+            results.append({
+                "video_id": item.video_id,
+                "updated_fields": len(payload_update),
+                "points": count_result.count,
+                "status": "updated",
+            })
+
+        except Exception as e:
+            logger.error(f"Batch update failed for video {item.video_id}: {str(e)}")
+            errors.append({"video_id": item.video_id, "error": str(e)})
+
+    logger.info(f"Batch payload update complete: {len(results)} videos, {total_points} total points, {len(errors)} errors")
+
+    return {
+        "success": len(errors) == 0,
+        "total_videos": len(results),
+        "total_points_affected": total_points,
+        "results": results,
+        "errors": errors,
+    }
+
+
 @app.get("/health")
 async def health():
     try:
