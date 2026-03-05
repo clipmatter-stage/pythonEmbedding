@@ -1853,10 +1853,10 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                 if not search_query:
                     raise HTTPException(status_code=400, detail="query is required for summary filter")
                 scroll_filter = Filter(must=eligibility_conditions) if eligibility_conditions else None
-                # Normalize and filter search words (>= 3 chars for accuracy)
-                search_words_lower = [normalize_word(w) for w in search_query.split() if len(normalize_word(w)) >= 3]
+                # Normalize and filter search words (>= 2 chars to allow 'ai', 'gpt', etc.)
+                search_words_lower = [normalize_word(w) for w in search_query.split() if len(normalize_word(w)) >= 2]
                 if not search_words_lower:
-                    raise HTTPException(status_code=400, detail="query must contain at least one word with 3+ characters for summary filter")
+                    raise HTTPException(status_code=400, detail="query must contain at least one word with 2+ characters for summary filter")
                 offset = None
                 seen_video_ids = set()
                 min_summary_score = 0.40  # Minimum score threshold
@@ -1929,10 +1929,10 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                 search_query = query_text or title_filter or ""
                 if not search_query:
                     raise HTTPException(status_code=400, detail="query is required for text filter")
-                # Normalize and filter search words (>= 3 chars for accuracy)
-                search_words_normalized = [normalize_word(w) for w in search_query.split() if len(normalize_word(w)) >= 3]
+                # Normalize and filter search words (>= 2 chars to allow 'ai', 'gpt', etc.)
+                search_words_normalized = [normalize_word(w) for w in search_query.split() if len(normalize_word(w)) >= 2]
                 if not search_words_normalized:
-                    raise HTTPException(status_code=400, detail="query must contain at least one word with 3+ characters for text filter")
+                    raise HTTPException(status_code=400, detail="query must contain at least one word with 2+ characters for text filter")
                 # Build Qdrant scroll with text match conditions (Qdrant pre-filtering)
                 scroll_conditions = list(eligibility_conditions)
                 # Add MatchText for each search word on the 'text' field
