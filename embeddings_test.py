@@ -1467,7 +1467,7 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
     # Eligibility: processing_status=completed, approval_status=approved, is_archived=false
     # ═══════════════════════════════════════════════════════════════════════════
     if search_mode == "simple":
-        logger.info(f"Simple search mode: filter_type={filter_type}, speaker={speaker_filter}, video_id={video_id_filter}, language={language_filter}, title={title_filter}")
+        logger.info(f"[SIMPLE SEARCH] filter_type={filter_type}, query='{query_text}', speaker={speaker_filter}, video_id={video_id_filter}, language={language_filter}, title={title_filter}")
         
         # Build eligibility filter — only searchable videos
         eligibility_conditions = [
@@ -1926,20 +1926,55 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
             elif filter_type == "text":
                 # Text search — STRICT whole-word matching against segment text
                 # Prevents false matches like 'dance' matching 'abundance'
+                # Supports numeric searches (e.g., "15", "2023", etc.)
                 search_query = query_text or title_filter or ""
                 if not search_query:
-                    raise HTTPException(status_code=400, detail="query is required for text filter")
-                # Normalize and filter search words (>= 2 chars to allow 'ai', 'gpt', etc.)
-                search_words_normalized = [normalize_word(w) for w in search_query.split() if len(normalize_word(w)) >= 2]
+                    raise HTTPException(status_code=400, detail="Please enter search text")
+                
+                # Normalize and filter search words (>= 1 char to allow single digits like '1', '2', '5')
+                # BUT skip stop words to avoid overly broad matches
+                search_words_raw = [w.strip() for w in search_query.split() if w.strip()]
+                search_words_normalized = []
+                skipped_words = []
+                
+                for w in search_words_raw:
+                    normalized = normalize_word(w)
+                    # Skip empty results
+                    if not normalized:
+                        continue
+                    # Skip stop words UNLESS it's a pure number (numbers are always valid search terms)
+                    if normalized.lower() in STOP_WORDS and not normalized.isdigit():
+                        skipped_words.append(w)
+                        continue
+                    search_words_normalized.append(normalized)
+                
                 if not search_words_normalized:
-                    raise HTTPException(status_code=400, detail="query must contain at least one word with 2+ characters for text filter")
+                    if skipped_words:
+                        raise HTTPException(
+                            status_code=400, 
+                            detail=f"Your search only contains common words that are too broad to search: {', '.join(skipped_words[:3])}. Please add more specific terms."
+                        )
+                    else:
+                        raise HTTPException(
+                            status_code=400, 
+                            detail="Please enter valid search text (letters, numbers, or meaningful words)"
+                        )
+                
+                logger.info(f"Text search: query='{search_query}' → normalized_terms={search_words_normalized} (skipped: {skipped_words})")
                 # Build Qdrant scroll with text match conditions (Qdrant pre-filtering)
                 scroll_conditions = list(eligibility_conditions)
                 # Add MatchText for each search word on the 'text' field
-                for sw in search_words_normalized[:5]:  # Limit to 5 words to avoid overly strict filters
+                # For numeric-only searches, use fewer constraints to improve recall
+                is_numeric_search = all(w.replace('.', '').replace('-', '').replace(',', '').isdigit() for w in search_words_normalized)
+                max_filter_words = 3 if is_numeric_search else 5
+                
+                for sw in search_words_normalized[:max_filter_words]:  # Limit words to avoid overly strict filters
                     scroll_conditions.append(
                         FieldCondition(key="text", match=MatchText(text=sw))
                     )
+                
+                if is_numeric_search:
+                    logger.info(f"Numeric-only search detected: using relaxed filtering (max {max_filter_words} terms)")
                 scroll_filter = Filter(must=scroll_conditions)
                 offset = None
                 min_text_score = 0.40  # Minimum score threshold
@@ -1963,13 +1998,23 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                         # Normalize text for accurate matching
                         seg_text_normalized = normalize_for_matching(seg_text)
                         # WHOLE-WORD matching: prevents 'tan' matching 'pakistan', 'dance' matching 'abundance'
-                        matched_count = sum(1 for w in search_words_normalized if whole_word_match(w, seg_text_normalized))
+                        # For numeric searches, also check substring matches to catch numbers embedded in text
+                        matched_count = 0
+                        for w in search_words_normalized:
+                            if whole_word_match(w, seg_text_normalized):
+                                matched_count += 1
+                            elif is_numeric_search and w in seg_text_normalized:
+                                # Allow substring match for numbers (e.g., "15" in "15th" or "2015")
+                                matched_count += 0.7  # Slightly lower weight for substring match
+                        
                         if matched_count == 0:
                             continue
+                        
                         # Calculate accurate score: require high word coverage
                         match_score = matched_count / max(len(search_words_normalized), 1)
-                        # Enforce minimum quality threshold
-                        if match_score < min_text_score:
+                        # Enforce minimum quality threshold (lower for numeric searches)
+                        effective_min_score = min_text_score * 0.7 if is_numeric_search else min_text_score
+                        if match_score < effective_min_score:
                             continue
                         simple_results.append({
                             "id": p.id,
@@ -1996,13 +2041,15 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                     offset = next_offset
                     if not next_offset:
                         break
+                
+                logger.info(f"Text search complete: found {len(simple_results)} matches from {scanned} scanned segments (query: '{search_query}', terms: {search_words_normalized})")
                 simple_results.sort(key=lambda x: x["score"], reverse=True)
 
             else:
                 raise HTTPException(status_code=400, detail=f"Invalid filter_type: {filter_type}. Must be one of: video, speaker, date, language, title, summary, text")
 
             unique_videos = len(set(r["video_id"] for r in simple_results if r.get("video_id")))
-            logger.info(f"Simple search completed: {len(simple_results)} results from {unique_videos} videos (scanned {scanned})")
+            logger.info(f"[SIMPLE SEARCH COMPLETE] {len(simple_results)} results from {unique_videos} videos (scanned {scanned} segments)")
 
             return {
                 "query": query_text,
@@ -2066,8 +2113,8 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
         except HTTPException:
             raise
         except Exception as e:
-            logger.error(f"Simple search error: {str(e)}")
-            raise HTTPException(status_code=500, detail=f"Simple search error: {str(e)}")
+            logger.error(f"[SIMPLE SEARCH ERROR] {str(e)}", exc_info=True)
+            raise HTTPException(status_code=500, detail=f"Search error: {str(e)}")
 
     # ═══════════════════════════════════════════════════════════════════════════
     # SEMANTIC SEARCH MODE — full vector + LLM pipeline (existing behavior)
