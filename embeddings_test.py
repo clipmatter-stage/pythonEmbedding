@@ -727,6 +727,180 @@ Be VERY strict. Most results should get low scores if they don't match the query
         logger.warning(f"LLM reranking error: {str(e)}")
         return results[:top_k]
 
+
+def rerank_simple_results(query: str, results: List[Dict], filter_type: str, top_k: int = 200) -> List[Dict]:
+    """
+    LLM-based reranking for simple search mode results.
+    Uses GPT-4o-mini with filter-type-aware prompts to validate and score
+    each result's actual relevance, then combines with original match score.
+    
+    Filter-type-aware scoring:
+      - speaker: Does the speaker name match the query? Is it the right person?
+      - text: Does the transcript text actually discuss the query topic?
+      - title: Does the video title match what the user is looking for?
+      - summary: Does the summary relate to the query topic?
+    
+    Returns reranked results with llm_relevance_score populated.
+    Falls back to original results if OpenAI is unavailable.
+    """
+    if not openai_client or not results or not query.strip():
+        return results[:top_k]
+    
+    # Skip reranking for very small result sets (not worth the latency)
+    if len(results) < 3:
+        return results[:top_k]
+    
+    # Filter-type-specific system prompts
+    FILTER_PROMPTS = {
+        "speaker": """You are a speaker name matching judge for a video transcript search engine.
+The user searched for a SPEAKER NAME. For each result, judge how well the speaker field matches the query.
+
+Scoring guide:
+- 10: Exact name match (e.g., query "Sam Altman", speaker "Sam Altman")
+- 8-9: Clear match with minor variation (e.g., query "sam", speaker "Sam Altman" — first name matches)
+- 5-7: Partial match — one name component matches (e.g., query "Ali", speaker "Ali Hassan")
+- 2-4: Weak match — fuzzy similarity but different person likely
+- 0-1: No match — completely different name
+
+Focus ONLY on whether the speaker name matches the query. Ignore transcript content.""",
+
+        "text": """You are a transcript relevance judge for a video transcript search engine.
+Content may be in Urdu, English, or mixed. The user searched for specific text/topic in transcripts.
+For each result, judge how relevant the transcript text is to the search query.
+
+Scoring guide:
+- 10: Text directly discusses the exact query topic
+- 7-9: Highly relevant — clearly related to the query
+- 4-6: Partially relevant — mentions related concepts
+- 1-3: Marginally relevant — loosely connected
+- 0: Completely unrelated
+
+Be strict: if the query topic is not present in the text, score 0-2.""",
+
+        "title": """You are a video title matching judge for a video transcript search engine.
+The user searched for a video by title. For each result, judge how well the video title matches the query.
+
+Scoring guide:
+- 10: Exact title match
+- 8-9: Very close match — all key words present
+- 5-7: Partial match — some key words present
+- 2-4: Weak match — only loosely related
+- 0-1: No match — completely different title
+
+Focus on whether the title matches the search query.""",
+
+        "summary": """You are a video summary relevance judge for a video transcript search engine.
+Content may be in Urdu, English, or mixed. The user searched for a topic in video summaries.
+For each result, judge how relevant the video summary is to the search query.
+
+Scoring guide:
+- 10: Summary directly covers the query topic
+- 7-9: Highly relevant — clearly discusses related material
+- 4-6: Partially relevant — touches on the topic
+- 1-3: Marginally relevant — loosely connected
+- 0: Completely unrelated
+
+Be strict: the summary should actually discuss the query topic to score above 5."""
+    }
+    
+    system_prompt = FILTER_PROMPTS.get(filter_type)
+    if not system_prompt:
+        return results[:top_k]
+    
+    try:
+        # Take top 30 candidates for reranking (cost efficient)
+        candidates = results[:min(len(results), 30)]
+        
+        # Build compact document list based on filter type
+        docs = []
+        for i, r in enumerate(candidates):
+            if filter_type == "speaker":
+                speaker = r.get("speaker", "") or r.get("diarization_speaker", "")
+                text_preview = r.get("text", "")[:100]
+                docs.append(f"[{i}] Speaker: {speaker} | Text: {text_preview}")
+            elif filter_type == "text":
+                text = r.get("text", "")[:200]
+                speaker = r.get("speaker", "")
+                docs.append(f"[{i}] Speaker: {speaker} | Text: {text}")
+            elif filter_type == "title":
+                title = r.get("video_title", "")
+                docs.append(f"[{i}] Title: {title}")
+            elif filter_type == "summary":
+                title = r.get("video_title", "")
+                docs.append(f"[{i}] Title: {title}")
+        
+        docs_text = "\n".join(docs)
+        
+        full_prompt = system_prompt + """\n\nReturn ONLY valid JSON: {"scores": [{"i": 0, "s": 8}, {"i": 1, "s": 3}, ...]}
+Where "i" is the document index and "s" is relevance score 0-10."""
+        
+        response = openai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": full_prompt},
+                {"role": "user", "content": f"Search Query: {query}\n\nResults:\n{docs_text}"}
+            ],
+            max_tokens=500,
+            temperature=0.0,
+            response_format={"type": "json_object"}
+        )
+        
+        llm_result = json_module.loads(response.choices[0].message.content.strip())
+        scores = llm_result.get("scores", [])
+        
+        # Build score map
+        score_map = {}
+        for item in scores:
+            idx = item.get("i", item.get("index", -1))
+            score = item.get("s", item.get("score", 5))
+            if 0 <= idx < len(candidates):
+                score_map[idx] = score / 10.0  # Normalize to 0-1
+        
+        # Apply LLM scores: combined = 60% LLM + 40% original match score
+        reranked = []
+        for i, r in enumerate(candidates):
+            result_copy = r.copy()
+            llm_score = score_map.get(i, 0.3)  # Default to LOW if not scored
+            original_score = result_copy.get("score", 0)
+            
+            result_copy["llm_relevance_score"] = round(llm_score, 4)
+            result_copy["original_score"] = original_score
+            result_copy["score"] = round(
+                llm_score * 0.60 + original_score * 0.40,
+                4
+            )
+            
+            if "match_types" not in result_copy:
+                result_copy["match_types"] = []
+            result_copy["match_types"].append("llm_reranked")
+            reranked.append(result_copy)
+        
+        # Filter out results with LLM score < 0.3 (3/10 = irrelevant)
+        reranked = [r for r in reranked if r.get("llm_relevance_score", 0) >= 0.3]
+        
+        # Sort by new combined score
+        reranked.sort(key=lambda x: x.get("score", 0), reverse=True)
+        
+        # Append any remaining results beyond top 30 (unranked)
+        reranked_ids = {r["id"] for r in reranked}
+        for r in results[30:]:
+            if r["id"] not in reranked_ids:
+                reranked.append(r)
+        
+        # Log statistics
+        high_rel = sum(1 for r in reranked if r.get("llm_relevance_score", 0) >= 0.7)
+        med_rel = sum(1 for r in reranked if 0.5 <= r.get("llm_relevance_score", 0) < 0.7)
+        low_rel = sum(1 for r in reranked if 0.3 <= r.get("llm_relevance_score", 0) < 0.5)
+        filtered = len(candidates) - len([r for r in reranked if r.get("llm_relevance_score")])
+        
+        logger.info(f"[SIMPLE RERANK] filter={filter_type}, query='{query[:50]}': {len(candidates)} candidates -> {len(reranked)} results (high={high_rel}, med={med_rel}, low={low_rel}, filtered={filtered})")
+        return reranked[:top_k]
+        
+    except Exception as e:
+        logger.warning(f"[SIMPLE RERANK ERROR] {str(e)}")
+        return results[:top_k]
+
+
 # ============== ELASTIC SEARCH HELPERS ==============
 
 def get_cached_embedding(text: str) -> List[float]:
@@ -2059,6 +2233,22 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
             unique_videos = len(set(r["video_id"] for r in simple_results if r.get("video_id")))
             logger.info(f"[SIMPLE SEARCH COMPLETE] {len(simple_results)} results from {unique_videos} videos (scanned {scanned} segments)")
 
+            # ── LLM RERANKING for content-based simple filters ──
+            # Rerank speaker/text/title/summary results with GPT-4o-mini
+            # Skip structural filters (date/language/video) — they are exact matches
+            use_simple_reranking = os.getenv("USE_SIMPLE_RERANKING", "true").lower() == "true"
+            if use_simple_reranking and filter_type in ("speaker", "text", "title", "summary") and simple_results:
+                rerank_query = speaker_filter or title_filter or query_text or ""
+                if rerank_query.strip():
+                    simple_results = rerank_simple_results(
+                        query=rerank_query,
+                        results=simple_results,
+                        filter_type=filter_type,
+                        top_k=top_k,
+                    )
+                    unique_videos = len(set(r["video_id"] for r in simple_results if r.get("video_id")))
+                    logger.info(f"[SIMPLE SEARCH POST-RERANK] {len(simple_results)} results from {unique_videos} videos")
+
             return {
                 "query": query_text,
                 "words": words,
@@ -2111,7 +2301,7 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                         "language": r.get("language", ""),
                         "created_at": r.get("created_at"),
                         "video_created_at": r.get("video_created_at", ""),
-                        "llm_relevance_score": None,
+                        "llm_relevance_score": r.get("llm_relevance_score"),
                         "youtube_url_timestamped": f"{r.get('youtube_url', '')}?t={int(r.get('start_time', 0))}" if r.get('youtube_url') and r.get('start_time', 0) > 0 else r.get('youtube_url', ''),
                     }
                     for r in simple_results
