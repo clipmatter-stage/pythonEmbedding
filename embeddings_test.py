@@ -976,14 +976,27 @@ def fuzzy_match_speaker(query: str, speaker: str, threshold: int = 75) -> bool:
             if fuzz.ratio(vl, query_lower) >= threshold:
                 return True
 
-    # Check each word in speaker name
+    # Check each word in speaker name — require stricter matching for short words
     speaker_parts = speaker_lower.split()
     for part in speaker_parts:
-        if fuzz.ratio(query_lower, part) >= threshold:
+        # Skip non-name parts like "SPEAKER_01", "SPEAKER_02" etc.
+        if part.startswith("speaker_") or part.startswith("speaker "):
+            continue
+        # For short words (<=4 chars), require near-exact match to prevent 'cleo'→'ceo'
+        effective_threshold = threshold
+        if len(query_lower) <= 4 or len(part) <= 4:
+            effective_threshold = max(threshold, 95)
+            # Also require length difference <= 1 for short words
+            if abs(len(query_lower) - len(part)) > 1:
+                continue
+        if fuzz.ratio(query_lower, part) >= effective_threshold:
             return True
 
-    # Full fuzzy match
-    return fuzz.ratio(query_lower, speaker_lower) >= threshold
+    # Full fuzzy match — also stricter for short queries
+    full_threshold = threshold
+    if len(query_lower) <= 4:
+        full_threshold = max(threshold, 90)
+    return fuzz.ratio(query_lower, speaker_lower) >= full_threshold
 
 def generate_ngrams(text: str, n: int = 3) -> List[str]:
     """Generate character n-grams for partial matching."""
@@ -1075,18 +1088,31 @@ def fuzzy_word_match(word: str, text: str, threshold: int = 85) -> float:
     Fuzzy match a word against individual words in text (not substrings).
     Returns the best match score (0-1) or 0 if no match above threshold.
     Prevents 'dance' fuzzy-matching 'abundance' by comparing word-to-word.
+    For short words (<=4 chars), enforces stricter matching to prevent
+    false positives like 'cleo' matching 'ceo'.
     """
     if not word or not text:
         return 0.0
+    # Short words need stricter thresholds to prevent false positives
+    # e.g., 'cleo' vs 'ceo' = 86% which passes 80% but shouldn't match
+    effective_threshold = threshold
+    if len(word) <= 4:
+        effective_threshold = max(threshold, 95)  # Very strict for short words
+    elif len(word) <= 6:
+        effective_threshold = max(threshold, 90)  # Stricter for medium words
     best_score = 0.0
     for text_word in text.split():
-        # Only compare against words of comparable length (±50%)
+        # Only compare against words of comparable length
         if len(text_word) < 2:
             continue
+        # For short words (<=5 chars), require length difference <= 1
+        # This prevents 'cleo'(4) matching 'ceo'(3), but allows 'sam'(3) matching 'sam'(3)
+        if len(word) <= 5 and abs(len(word) - len(text_word)) > 1:
+            continue
         ratio = fuzz.ratio(word, text_word)
-        if ratio >= threshold and ratio > best_score:
+        if ratio >= effective_threshold and ratio > best_score:
             best_score = ratio
-    return best_score / 100.0 if best_score >= threshold else 0.0
+    return best_score / 100.0 if best_score >= effective_threshold else 0.0
 
 
 def calculate_combined_score(semantic_score: float, keyword_match: bool, fuzzy_score: float = 0) -> float:
@@ -1957,41 +1983,66 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                             continue
                         video_title_lower = video_title.lower()
                         
-                        # STRATEGY 1: Check exact phrase match first (highest quality)
-                        exact_phrase = whole_word_match(title_filter.lower().strip(), video_title_lower)
+                        # STRATEGY 1: Check if query IS the full title (or title IS the query)
+                        query_normalized = title_filter.lower().strip()
+                        is_full_title_match = (query_normalized == video_title_lower) or \
+                            (query_normalized in video_title_lower and len(query_normalized) >= len(video_title_lower) * 0.85) or \
+                            (video_title_lower in query_normalized and len(video_title_lower) >= len(query_normalized) * 0.85)
                         
-                        # STRATEGY 2: Word-level matching — count how many query words
+                        # STRATEGY 2: Check exact phrase match (query appears as substring in title)
+                        exact_phrase = whole_word_match(query_normalized, video_title_lower)
+                        
+                        # STRATEGY 3: Check consecutive word matching — all query words appear in
+                        # the SAME ORDER in the title (prioritizes consecutive over scattered matches)
+                        consecutive_match = False
+                        if len(title_query_words) > 1:
+                            # Build regex: word1.*word2.*word3 (in order, with flexible gaps)
+                            try:
+                                consec_pattern = r'.*'.join(re.escape(w) for w in title_query_words)
+                                if re.search(consec_pattern, video_title_lower):
+                                    consecutive_match = True
+                            except re.error:
+                                pass
+                        
+                        # STRATEGY 4: Word-level matching — count how many query words
                         # appear as whole words in the title (handles multi-word queries)
                         words_matched = 0
                         for qw in title_query_words:
                             # Check whole-word match (prevents 'tan' matching 'pakistan')
                             if whole_word_match(qw, video_title_lower):
                                 words_matched += 1
-                            # Fallback: fuzzy word match for typo tolerance (4+ char words only)
-                            elif len(qw) >= 4 and fuzzy_word_match(qw, video_title_lower, threshold=80) > 0:
+                            # Fallback: fuzzy word match for typo tolerance (5+ char words only)
+                            # Raised from 4 to 5 to prevent 'cleo' matching 'ceo'
+                            elif len(qw) >= 5 and fuzzy_word_match(qw, video_title_lower, threshold=85) > 0:
                                 words_matched += 0.8  # Fuzzy match counts as 0.8
                         
                         word_coverage = words_matched / max(len(title_query_words), 1)
                         
-                        # STRATEGY 3: Full-string fuzzy match (handles very similar titles)
-                        fuzzy_ratio = fuzz.ratio(title_filter.lower(), video_title_lower) / 100
-                        fuzzy_partial = fuzz.partial_ratio(title_filter.lower(), video_title_lower) / 100
+                        # STRATEGY 5: Full-string fuzzy match (handles very similar titles)
+                        fuzzy_ratio = fuzz.ratio(query_normalized, video_title_lower) / 100
+                        fuzzy_partial = fuzz.partial_ratio(query_normalized, video_title_lower) / 100
                         
                         # Calculate final match score
-                        if exact_phrase:
-                            # Exact phrase found → high score
-                            match_score = max(0.90, fuzzy_partial * 0.95)
+                        if is_full_title_match:
+                            # Full title match → 1.0 (perfect score)
+                            match_score = 1.0
+                        elif exact_phrase:
+                            # Exact query found as phrase in title → 0.95
+                            match_score = 0.95
+                        elif consecutive_match and word_coverage >= 1.0:
+                            # All words found in order → 0.90
+                            match_score = 0.90
                         elif word_coverage >= 1.0:
-                            # All query words found in title → very good match
-                            match_score = max(0.80, fuzzy_partial * 0.90)
+                            # All query words found (any order) → 0.85
+                            match_score = 0.85
                         elif word_coverage >= 0.5:
-                            # At least half the words found → decent match
-                            match_score = word_coverage * 0.75
-                        elif fuzzy_ratio >= 0.70:
-                            # High overall similarity (handles typos)
-                            match_score = fuzzy_ratio * 0.85
+                            # At least half the words found → proportional score
+                            match_score = 0.50 + word_coverage * 0.30
+                        elif fuzzy_ratio >= 0.75:
+                            # High overall similarity (handles typos in long queries)
+                            match_score = fuzzy_ratio * 0.80
                         else:
-                            # Not enough overlap
+                            # Not enough overlap — reject
                             continue
                         
                         # Enforce minimum quality threshold
