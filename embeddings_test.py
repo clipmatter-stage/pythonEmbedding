@@ -1574,16 +1574,24 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                             else:
                                 continue  # Single word didn't match fuzzy_match_speaker
                         
-                        # Calculate match score — word-level for multi-word, ratio for single-word
+                        # Calculate match score — use individual speaker name (spk), NOT combined
+                        # Combined string includes diarization_speaker (e.g. "SPEAKER_01") which
+                        # dilutes fuzz.ratio and causes partial/exact name matches to score below threshold
+                        spk_lower = spk.lower().strip() if spk else ""
                         if len(speaker_query_words) > 1:
-                            speaker_lower = speaker_combined.lower()
+                            speaker_lower = spk_lower or speaker_combined.lower()
                             words_found = sum(1 for sw in speaker_query_words if whole_word_match(sw, speaker_lower))
                             word_coverage = words_found / max(len(speaker_query_words), 1)
-                            # Also get fuzzy scores for reference
                             partial_score = fuzz.partial_ratio(speaker_filter.lower(), speaker_lower) / 100
                             match_score = max(word_coverage * 0.85, partial_score * 0.80)
                         else:
-                            match_score = fuzz.ratio(speaker_filter.lower(), speaker_combined.lower()) / 100
+                            # For single-word queries ("sam", "cleo"), use the best of:
+                            # 1) ratio against speaker name only (not combined)
+                            # 2) partial_ratio against speaker name (handles substring matches)
+                            query_low = speaker_filter.lower().strip()
+                            ratio_spk = fuzz.ratio(query_low, spk_lower) / 100 if spk_lower else 0
+                            partial_spk = fuzz.partial_ratio(query_low, spk_lower) / 100 if spk_lower else 0
+                            match_score = max(ratio_spk, partial_spk * 0.90)
                         
                         # Enforce minimum quality threshold
                         if match_score < min_speaker_score:
