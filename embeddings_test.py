@@ -2498,7 +2498,7 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
     if openai_only_search:
         # Keep semantic search responsive by constraining expensive fallbacks.
         use_query_expansion = False
-        max_scanned = min(max_scanned, 1500 if single_word_query else 5000)
+        max_scanned = min(max_scanned, 12000 if single_word_query else 5000)
         if single_word_query:
             logger.info("[OPENAI-ONLY] Single-word query detected: enabling lightweight keyword fallback")
     
@@ -3118,6 +3118,23 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
             offset = None
 
             scroll_filter = search_filter
+
+            # For single-word searches, pre-filter with Qdrant text index so matches are
+            # retrieved directly instead of relying on early scroll windows.
+            if len(words_lower) == 1:
+                kw = words_lower[0]
+                keyword_text_conditions = [
+                    FieldCondition(key="text", match=MatchText(text=kw)),
+                    FieldCondition(key="summary_en", match=MatchText(text=kw)),
+                    FieldCondition(key="video_title", match=MatchText(text=kw)),
+                    FieldCondition(key="speaker", match=MatchText(text=kw)),
+                    FieldCondition(key="diarization_speaker", match=MatchText(text=kw)),
+                ]
+                if search_filter and getattr(search_filter, "must", None):
+                    scroll_filter = Filter(must=list(search_filter.must), should=keyword_text_conditions)
+                else:
+                    scroll_filter = Filter(should=keyword_text_conditions)
+                logger.info(f"Keyword search using MatchText prefilter for single word: '{kw}'")
 
             # Early termination when we have enough results
             target_results = max(top_k, 20)
