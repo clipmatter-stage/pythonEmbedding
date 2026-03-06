@@ -1699,40 +1699,8 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
             detail="OPENAI_ONLY_SEARCH is enabled but OpenAI client is not configured"
         )
 
-    # Identify whether the incoming request is a single-word content search.
-    # Single-word queries benefit from lexical matching and should stay in simple mode.
-    simple_route_query = query_text or ""
-    if search_mode == "simple":
-        if filter_type == "speaker" and not simple_route_query:
-            simple_route_query = speaker_filter or ""
-        elif filter_type == "title" and not simple_route_query:
-            simple_route_query = title_filter or ""
-        elif filter_type in {"text", "summary"} and not simple_route_query:
-            simple_route_query = " ".join(words or [])
-    normalized_simple_route_query = normalize_word(simple_route_query) if simple_route_query else ""
-    single_word_simple_query = bool(
-        normalized_simple_route_query
-        and len(simple_route_query.split()) == 1
-        and len(normalized_simple_route_query) >= 2
-    )
-
-    # For content filters, reuse the semantic pipeline (faster than large scroll scans).
-    if search_mode == "simple" and openai_only_search and filter_type in {"speaker", "text", "title", "summary"} and not single_word_simple_query:
-        if filter_type == "speaker" and not query_text:
-            query_text = speaker_filter or ""
-        elif filter_type == "title" and not query_text:
-            query_text = title_filter or ""
-        elif filter_type in {"text", "summary"} and not query_text:
-            query_text = " ".join(words or [])
-
-        if not query_text:
-            raise HTTPException(
-                status_code=400,
-                detail=f"query is required for OPENAI simple->{filter_type} search"
-            )
-
-        search_mode = "semantic"
-        logger.info(f"[OPENAI-ONLY] Routed simple/{filter_type} request to semantic pipeline")
+    # Keep simple mode on its own code path. OPENAI_ONLY_SEARCH should not reroute
+    # simple filters into semantic mode, otherwise simple behavior becomes inconsistent.
 
     # ═══════════════════════════════════════════════════════════════════════════
     # SIMPLE SEARCH MODE — structured filters only, no vector/LLM operations.
@@ -2155,7 +2123,7 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
             elif filter_type == "summary":
                 # Summary keyword search — STRICT whole-word matching in video summaries
                 # Prevents false matches like 'tan' matching 'pakistan', 'tech' matching 'technology'
-                search_query = query_text or title_filter or ""
+                search_query = query_text or " ".join(words or [])
                 if not search_query:
                     raise HTTPException(status_code=400, detail="query is required for summary filter")
                 scroll_filter = Filter(must=eligibility_conditions) if eligibility_conditions else None
@@ -2233,7 +2201,7 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                 # Text search — STRICT whole-word matching against segment text
                 # Prevents false matches like 'dance' matching 'abundance'
                 # Supports numeric searches (e.g., "15", "2023", etc.)
-                search_query = query_text or title_filter or ""
+                search_query = query_text or " ".join(words or [])
                 if not search_query:
                     raise HTTPException(status_code=400, detail="Please enter search text")
                 
@@ -2361,12 +2329,12 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
             # Rerank speaker/text/title/summary results with GPT-4o-mini
             # Skip structural filters (date/language/video) — they are exact matches
             use_simple_reranking = os.getenv("USE_SIMPLE_RERANKING", "true").lower() == "true"
-            simple_single_word = bool(query_text and len(query_text.split()) == 1 and len(normalize_word(query_text)) >= 2)
             if use_simple_reranking and filter_type in ("speaker", "text", "title", "summary") and simple_results:
+                rerank_query = speaker_filter or title_filter or query_text or " ".join(words or [])
+                simple_single_word = bool(rerank_query and len(rerank_query.split()) == 1 and len(normalize_word(rerank_query)) >= 2)
                 if simple_single_word:
                     logger.info("[SIMPLE SEARCH] Skipping LLM rerank for single-word query to keep scores stable")
                 else:
-                    rerank_query = speaker_filter or title_filter or query_text or ""
                     if rerank_query.strip():
                         simple_results = rerank_simple_results(
                             query=rerank_query,
