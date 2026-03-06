@@ -1988,9 +1988,8 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
 
             elif filter_type == "title":
                 # Title search — word-level matching against video_title
-                # For multi-word queries like "rehan Tariq", checks if EACH word
-                # appears in the title independently (not as an exact phrase only).
-                # This handles different word orders and words separated by other words.
+                # Exact-title matches should score 1.0.
+                # Otherwise, require exact-word coverage (no fuzzy title fallback).
                 if not title_filter:
                     raise HTTPException(status_code=400, detail="title is required for title filter")
                 scroll_filter = Filter(must=eligibility_conditions) if eligibility_conditions else None
@@ -1998,9 +1997,9 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                 seen_video_ids = set()
                 min_title_score = 0.45  # Minimum score threshold
                 # Split query into individual words for word-level matching
-                title_query_words = [w.lower().strip() for w in title_filter.split() if len(w.strip()) >= 2]
+                title_query_words = [normalize_word(w) for w in title_filter.split() if len(normalize_word(w)) >= 2]
                 if not title_query_words:
-                    title_query_words = [title_filter.lower().strip()]
+                    title_query_words = [normalize_word(title_filter)]
                 logger.info(f"Simple title search: query='{title_filter}', words={title_query_words}")
                 while scanned < max_scan_simple and len(simple_results) < top_k:
                     points, next_offset = qdrant_client.scroll(
@@ -2022,66 +2021,34 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                         video_title = payload.get("video_title", "")
                         if not video_title:
                             continue
-                        video_title_lower = video_title.lower()
+                        video_title_norm = " ".join(normalize_for_matching(video_title).split())
+                        query_normalized = " ".join(normalize_for_matching(title_filter).split())
                         
-                        # STRATEGY 1: Check if query IS the full title (or title IS the query)
-                        query_normalized = title_filter.lower().strip()
-                        is_full_title_match = (query_normalized == video_title_lower) or \
-                            (query_normalized in video_title_lower and len(query_normalized) >= len(video_title_lower) * 0.85) or \
-                            (video_title_lower in query_normalized and len(video_title_lower) >= len(query_normalized) * 0.85)
-                        
-                        # STRATEGY 2: Check exact phrase match (query appears as substring in title)
-                        exact_phrase = whole_word_match(query_normalized, video_title_lower)
-                        
-                        # STRATEGY 3: Check consecutive word matching — all query words appear in
-                        # the SAME ORDER in the title (prioritizes consecutive over scattered matches)
-                        consecutive_match = False
-                        if len(title_query_words) > 1:
-                            # Build regex: word1.*word2.*word3 (in order, with flexible gaps)
-                            try:
-                                consec_pattern = r'.*'.join(re.escape(w) for w in title_query_words)
-                                if re.search(consec_pattern, video_title_lower):
-                                    consecutive_match = True
-                            except re.error:
-                                pass
-                        
-                        # STRATEGY 4: Word-level matching — count how many query words
-                        # appear as whole words in the title (handles multi-word queries)
-                        words_matched = 0
+                        # STRATEGY 1: strict normalized full-title equality
+                        is_full_title_match = query_normalized == video_title_norm
+
+                        # STRATEGY 2: exact-word coverage in title
+                        words_matched = 0.0
                         for qw in title_query_words:
                             # Check whole-word match (prevents 'tan' matching 'pakistan')
-                            if whole_word_match(qw, video_title_lower):
+                            if whole_word_match(qw, video_title_norm):
                                 words_matched += 1
-                            # Fallback: fuzzy word match for typo tolerance (5+ char words only)
-                            # Raised from 4 to 5 to prevent 'cleo' matching 'ceo'
-                            elif len(qw) >= 5 and fuzzy_word_match(qw, video_title_lower, threshold=85) > 0:
-                                words_matched += 0.8  # Fuzzy match counts as 0.8
+                            elif len(qw) >= 6 and fuzzy_word_match(qw, video_title_norm, threshold=90) > 0:
+                                # Very conservative typo tolerance for long words only.
+                                words_matched += 0.6
                         
                         word_coverage = words_matched / max(len(title_query_words), 1)
-                        
-                        # STRATEGY 5: Full-string fuzzy match (handles very similar titles)
-                        fuzzy_ratio = fuzz.ratio(query_normalized, video_title_lower) / 100
-                        fuzzy_partial = fuzz.partial_ratio(query_normalized, video_title_lower) / 100
-                        
+
                         # Calculate final match score
                         if is_full_title_match:
                             # Full title match → 1.0 (perfect score)
                             match_score = 1.0
-                        elif exact_phrase:
-                            # Exact query found as phrase in title → 0.95
-                            match_score = 0.95
-                        elif consecutive_match and word_coverage >= 1.0:
-                            # All words found in order → 0.90
-                            match_score = 0.90
                         elif word_coverage >= 1.0:
-                            # All query words found (any order) → 0.85
-                            match_score = 0.85
+                            # All query words found (exact words) → high confidence
+                            match_score = 0.90
                         elif word_coverage >= 0.5:
                             # At least half the words found → proportional score
                             match_score = 0.50 + word_coverage * 0.30
-                        elif fuzzy_ratio >= 0.75:
-                            # High overall similarity (handles typos in long queries)
-                            match_score = fuzzy_ratio * 0.80
                         else:
                             # Not enough overlap — reject
                             continue
@@ -2107,7 +2074,7 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                             "language": payload.get("language", ""),
                             "created_at": payload.get("created_at"),
                             "video_created_at": payload.get("video_created_at", ""),
-                            "match_types": ["simple_title_filter"],
+                            "match_types": ["simple_title_filter", "simple_exact_title_match"] if is_full_title_match else ["simple_title_filter"],
                             "fuzzy_score": round(match_score, 2),
                             "matched_field": "video_title",
                             "is_video_only": True,
@@ -2330,8 +2297,13 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
             # Skip structural filters (date/language/video) — they are exact matches
             use_simple_reranking = os.getenv("USE_SIMPLE_RERANKING", "true").lower() == "true"
             if use_simple_reranking and filter_type in ("speaker", "text", "title", "summary") and simple_results:
-                rerank_query = speaker_filter or title_filter or query_text or " ".join(words or [])
-                simple_single_word = bool(rerank_query and len(rerank_query.split()) == 1 and len(normalize_word(rerank_query)) >= 2)
+                if filter_type == "title":
+                    logger.info("[SIMPLE SEARCH] Skipping LLM rerank for title filter to preserve exact-title scoring")
+                    rerank_query = ""
+                    simple_single_word = False
+                else:
+                    rerank_query = speaker_filter or title_filter or query_text or " ".join(words or [])
+                    simple_single_word = bool(rerank_query and len(rerank_query.split()) == 1 and len(normalize_word(rerank_query)) >= 2)
                 if simple_single_word:
                     logger.info("[SIMPLE SEARCH] Skipping LLM rerank for single-word query to keep scores stable")
                 else:
