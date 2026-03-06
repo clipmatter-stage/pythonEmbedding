@@ -1115,6 +1115,36 @@ def fuzzy_word_match(word: str, text: str, threshold: int = 85) -> float:
     return best_score / 100.0 if best_score >= effective_threshold else 0.0
 
 
+def query_closeness_score(query_words: List[str], text: str, threshold: int = 80) -> float:
+    """
+    Estimate how closely query words match result text (0-1).
+    - Exact whole-word matches contribute 1.0
+    - Fuzzy close matches contribute in [threshold..1.0]
+    Returns average closeness across query words.
+    """
+    if not query_words or not text:
+        return 0.0
+
+    normalized_text = normalize_for_matching(text)
+    scores = []
+    for qw in query_words:
+        qn = normalize_word(qw)
+        if not qn:
+            continue
+        if whole_word_match(qn, normalized_text):
+            scores.append(1.0)
+            continue
+        fw = fuzzy_word_match(qn, normalized_text, threshold=threshold)
+        if fw > 0:
+            scores.append(fw)
+        else:
+            scores.append(0.0)
+
+    if not scores:
+        return 0.0
+    return sum(scores) / len(scores)
+
+
 def calculate_combined_score(semantic_score: float, keyword_match: bool, fuzzy_score: float = 0) -> float:
     """
     Calculate combined relevance score.
@@ -1669,8 +1699,25 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
             detail="OPENAI_ONLY_SEARCH is enabled but OpenAI client is not configured"
         )
 
+    # Identify whether the incoming request is a single-word content search.
+    # Single-word queries benefit from lexical matching and should stay in simple mode.
+    simple_route_query = query_text or ""
+    if search_mode == "simple":
+        if filter_type == "speaker" and not simple_route_query:
+            simple_route_query = speaker_filter or ""
+        elif filter_type == "title" and not simple_route_query:
+            simple_route_query = title_filter or ""
+        elif filter_type in {"text", "summary"} and not simple_route_query:
+            simple_route_query = " ".join(words or [])
+    normalized_simple_route_query = normalize_word(simple_route_query) if simple_route_query else ""
+    single_word_simple_query = bool(
+        normalized_simple_route_query
+        and len(simple_route_query.split()) == 1
+        and len(normalized_simple_route_query) >= 2
+    )
+
     # For content filters, reuse the semantic pipeline (faster than large scroll scans).
-    if search_mode == "simple" and openai_only_search and filter_type in {"speaker", "text", "title", "summary"}:
+    if search_mode == "simple" and openai_only_search and filter_type in {"speaker", "text", "title", "summary"} and not single_word_simple_query:
         if filter_type == "speaker" and not query_text:
             query_text = speaker_filter or ""
         elif filter_type == "title" and not query_text:
@@ -2314,17 +2361,21 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
             # Rerank speaker/text/title/summary results with GPT-4o-mini
             # Skip structural filters (date/language/video) — they are exact matches
             use_simple_reranking = os.getenv("USE_SIMPLE_RERANKING", "true").lower() == "true"
+            simple_single_word = bool(query_text and len(query_text.split()) == 1 and len(normalize_word(query_text)) >= 2)
             if use_simple_reranking and filter_type in ("speaker", "text", "title", "summary") and simple_results:
-                rerank_query = speaker_filter or title_filter or query_text or ""
-                if rerank_query.strip():
-                    simple_results = rerank_simple_results(
-                        query=rerank_query,
-                        results=simple_results,
-                        filter_type=filter_type,
-                        top_k=top_k,
-                    )
-                    unique_videos = len(set(r["video_id"] for r in simple_results if r.get("video_id")))
-                    logger.info(f"[SIMPLE SEARCH POST-RERANK] {len(simple_results)} results from {unique_videos} videos")
+                if simple_single_word:
+                    logger.info("[SIMPLE SEARCH] Skipping LLM rerank for single-word query to keep scores stable")
+                else:
+                    rerank_query = speaker_filter or title_filter or query_text or ""
+                    if rerank_query.strip():
+                        simple_results = rerank_simple_results(
+                            query=rerank_query,
+                            results=simple_results,
+                            filter_type=filter_type,
+                            top_k=top_k,
+                        )
+                        unique_videos = len(set(r["video_id"] for r in simple_results if r.get("video_id")))
+                        logger.info(f"[SIMPLE SEARCH POST-RERANK] {len(simple_results)} results from {unique_videos} videos")
 
             return {
                 "query": query_text,
@@ -2884,8 +2935,8 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                 
                 # Adjust search parameters - balance speed vs recall
                 search_params = SearchParams(
-                    hnsw_ef=64,   # Reduced from 128 for faster search
-                    exact=False   # Use approximate search for speed
+                    hnsw_ef=128 if single_word_query else 64,
+                    exact=True if single_word_query else False
                 )
 
                 # Use a higher threshold for Qdrant retrieval to avoid irrelevant results.
@@ -2986,8 +3037,20 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                     elif 3 <= query_word_count <= 4 and not query_words_in_result and not speaker_field_match:
                         # Medium queries (3-4 words): smaller penalty
                         presence_penalty = 0.15
+
+                    # Reward close lexical matches (including typo/near-word matches)
+                    # so that words near the query get visible score lift.
+                    lexical_closeness = 0.0
+                    if query_text:
+                        all_text = f"{text or ''} {video_title or ''} {speaker or ''} {diarization_speaker or ''} {payload.get('summary_en') or ''}"
+                        lexical_query_words = [w for w in query_text.split() if len(normalize_word(w)) >= 3]
+                        if lexical_query_words:
+                            close_threshold = 78 if len(lexical_query_words) <= 2 else 82
+                            lexical_closeness = query_closeness_score(lexical_query_words, all_text, threshold=close_threshold)
                     
                     combined_score = calculate_combined_score(base_score, False, fuzzy_boost)
+                    if lexical_closeness > 0:
+                        combined_score += min(lexical_closeness * 0.12, 0.12)
                     combined_score = max(combined_score - presence_penalty, 0.0)
                     
                     # Results from expanded/translated query variations are lower confidence
@@ -3005,6 +3068,8 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                         match_types.append("speaker_field_match")
                     if query_words_in_result:
                         match_types.append("query_term_present")
+                    if lexical_closeness >= 0.65:
+                        match_types.append("query_close_match")
                     
                     all_semantic_results[result_id] = {
                         "id": r.id,
@@ -3024,6 +3089,7 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                         "created_at": payload.get("created_at"),
                         "match_types": match_types,
                         "fuzzy_score": round(fuzzy_boost, 2),
+                        "lexical_closeness": round(lexical_closeness, 3),
                         "matched_field": "speaker" if speaker_field_match else "semantic_vector",
                         "query_variation": q_var if idx > 0 else "original"
                     }
@@ -3043,7 +3109,7 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
         search_words.append(query_text)
     
     # Clean up search words: normalize quotes/dashes, strip punctuation, remove too-short words and stop words
-    search_words = list(set(
+    search_words = sorted(set(
         normalize_word(w)
         for w in search_words
         if len(normalize_word(w)) >= 2 and normalize_word(w).lower() not in STOP_WORDS
@@ -3132,6 +3198,7 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                     
                     # Track matched words and their scores
                     matched_words_count = 0
+                    close_words_count = 0.0
                     best_fuzzy_score = 0
                     matched_field = ""
                     matched_terms = []  # Track exactly which terms matched
@@ -3170,9 +3237,14 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                             # Fuzzy match ONLY for longer words (4+ chars) against individual words
                             # Uses word-to-word comparison, NOT substring matching
                             elif len(w) >= 4:
-                                fw_score = fuzzy_word_match(w, field_value, threshold=85)
+                                fw_score = fuzzy_word_match(w, field_value, threshold=80)
                                 if fw_score > 0:
                                     field_match_score = fw_score
+                                elif len(w) >= 5:
+                                    near_score = fuzzy_word_match(w, field_value, threshold=76)
+                                    if near_score > 0:
+                                        field_match_score = near_score * 0.65
+                                        close_words_count += 1
                             
                             if field_match_score > 0:
                                 word_found = True
@@ -3190,7 +3262,7 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                                 
                                 break  # Found match for this word, move to next word
                     
-                    if matched_words_count == 0:
+                    if matched_words_count == 0 and close_words_count == 0:
                         continue
                     
                     # Flexible word matching: require a high proportion but not necessarily ALL words
@@ -3226,7 +3298,7 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                     # 4. Proportion of search query matched
                     
                     # Calculate score based on match quality
-                    word_coverage = matched_words_count / max(len(words_lower), 1)
+                    word_coverage = (matched_words_count + (close_words_count * 0.6)) / max(len(words_lower), 1)
                     match_quality = best_fuzzy_score / max(best_field_weight, 1.0)
                     
                     # Score formula: quality * coverage — higher baseline
@@ -3575,7 +3647,7 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
     # Skip reranking for small result sets (not worth the latency) or when we have good matches
     # Protect title-matched and exact-phrase-matched results: they should keep a minimum score floor
     has_high_confidence_results = any(r.get("score", 0) >= 0.8 for r in merged_list[:5])
-    should_rerank = use_reranking and query_text and len(merged_list) >= 15 and not has_high_confidence_results
+    should_rerank = use_reranking and query_text and len(query_text.split()) > 1 and len(merged_list) >= 15 and not has_high_confidence_results
     
     if should_rerank:
         logger.info(f"Applying LLM reranking to {len(merged_list)} results...")
