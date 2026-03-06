@@ -1995,6 +1995,8 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                 scroll_filter = Filter(must=eligibility_conditions) if eligibility_conditions else None
                 offset = None
                 seen_video_ids = set()
+                exact_title_results = []
+                partial_title_results = []
                 min_title_score = 0.45  # Minimum score threshold
                 # Split query into individual words for word-level matching
                 title_query_words = [normalize_word(w) for w in title_filter.split() if len(normalize_word(w)) >= 2]
@@ -2058,7 +2060,7 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                             continue
                         
                         seen_video_ids.add(vid)
-                        simple_results.append({
+                        result_item = {
                             "id": p.id,
                             "score": round(match_score, 4),
                             "video_id": vid,
@@ -2078,14 +2080,25 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                             "fuzzy_score": round(match_score, 2),
                             "matched_field": "video_title",
                             "is_video_only": True,
-                        })
-                    if len(simple_results) >= top_k:
+                        }
+
+                        if is_full_title_match:
+                            exact_title_results.append(result_item)
+                        else:
+                            partial_title_results.append(result_item)
+
+                    if len(exact_title_results) >= top_k or (not exact_title_results and len(partial_title_results) >= top_k):
                         break
                     offset = next_offset
                     if not next_offset:
                         break
-                # Sort by match score
-                simple_results.sort(key=lambda x: x["score"], reverse=True)
+                # If exact title exists, return ONLY exact title matches.
+                if exact_title_results:
+                    exact_title_results.sort(key=lambda x: x["score"], reverse=True)
+                    simple_results = exact_title_results[:top_k]
+                else:
+                    partial_title_results.sort(key=lambda x: x["score"], reverse=True)
+                    simple_results = partial_title_results[:top_k]
 
             elif filter_type == "summary":
                 # Summary keyword search — STRICT whole-word matching in video summaries
