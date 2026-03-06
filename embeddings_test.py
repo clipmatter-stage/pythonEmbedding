@@ -2457,12 +2457,16 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
     use_query_expansion = os.getenv("USE_QUERY_EXPANSION", "true").lower() == "true"
     use_reranking = os.getenv("USE_RERANKING", "true").lower() == "true"
     use_llm_understanding = os.getenv("USE_LLM_UNDERSTANDING", "true").lower() == "true"
-    use_scan_strategies = not openai_only_search
+    normalized_query = normalize_word(query_text) if query_text else ""
+    single_word_query = bool(normalized_query and len(query_text.split()) == 1 and len(normalized_query) >= 2)
+    use_scan_strategies = (not openai_only_search) or single_word_query
 
     if openai_only_search:
         # Keep semantic search responsive by constraining expensive fallbacks.
         use_query_expansion = False
-        max_scanned = min(max_scanned, 5000)
+        max_scanned = min(max_scanned, 1500 if single_word_query else 5000)
+        if single_word_query:
+            logger.info("[OPENAI-ONLY] Single-word query detected: enabling lightweight keyword fallback")
     
     # LLM QUERY UNDERSTANDING — parse intent, detect language, extract speaker
     query_intent = None
@@ -3032,9 +3036,11 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
             logger.info(f"ERROR during semantic search: {str(e)}")
             raise HTTPException(status_code=500, detail=f"Semantic search error: {str(e)}")
 
-    # Strategy 2: Keyword search - only when explicit words are provided
-    # DO NOT mix semantic query words into keyword search to avoid false matches
+    # Strategy 2: Keyword search
+    # For single-word queries, also use the query itself as a keyword fallback.
     search_words = list(words) if words else []
+    if query_text and len(query_text.split()) == 1:
+        search_words.append(query_text)
     
     # Clean up search words: normalize quotes/dashes, strip punctuation, remove too-short words and stop words
     search_words = list(set(
