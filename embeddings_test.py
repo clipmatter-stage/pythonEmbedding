@@ -2052,9 +2052,6 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                         elif word_coverage >= 1.0:
                             # All query words found (exact words) → high confidence
                             match_score = 0.90
-                        elif word_coverage >= 0.5:
-                            # At least half the words found → proportional score
-                            match_score = 0.50 + word_coverage * 0.30
                         else:
                             # Not enough overlap — reject
                             continue
