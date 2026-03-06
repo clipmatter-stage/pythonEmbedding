@@ -3815,10 +3815,13 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
     # This prevents showing completely unrelated results (e.g., "bill gates" → Pakistan politics)
     # ═══════════════════════════════════════════════════════════════════════════
     if consolidated_segments and query_text and len(query_text.strip()) >= 3:
+        query_word_count = len(query_text.split())
         # Skip validation if we have verified matches (exact phrase or title matches)
         has_verified_matches = exact_phrase_count > 0 or title_match_count > 0
+        has_explicit_keyword_hits = len(keyword_results) > 0
+        skip_validation_for_short_query = query_word_count <= 1
         
-        if not has_verified_matches and use_reranking and openai_client:
+        if not has_verified_matches and not has_explicit_keyword_hits and not skip_validation_for_short_query and use_reranking and openai_client:
             # Validate if top results are actually relevant to the query
             relevance_check = validate_query_relevance(query_text, consolidated_segments[:5])
             
