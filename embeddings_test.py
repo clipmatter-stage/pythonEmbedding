@@ -1083,6 +1083,35 @@ def whole_phrase_match(phrase: str, text: str) -> bool:
         return phrase in text  # Safe fallback
 
 
+def word_variant_match(word: str, text: str) -> bool:
+    """
+    Match common word variants for short/medium query terms.
+    Example: 'fail' should match 'failed', 'failing', 'failure'.
+    """
+    if not word or not text:
+        return False
+
+    w = normalize_word(word)
+    t = normalize_for_matching(text)
+    if not w or not t:
+        return False
+
+    # Keep this conservative to avoid very broad matches on short terms.
+    if len(w) < 4:
+        return False
+
+    try:
+        # Word starts with query stem and has a small suffix.
+        # Allows: fail, failed, failing, failure.
+        pattern = r"\b" + re.escape(w) + r"[a-z]{0,6}\b"
+        if re.search(pattern, t, re.UNICODE):
+            return True
+    except re.error:
+        pass
+
+    return False
+
+
 def fuzzy_word_match(word: str, text: str, threshold: int = 85) -> float:
     """
     Fuzzy match a word against individual words in text (not substrings).
@@ -2971,10 +3000,10 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                         summary_lower = (payload.get("summary_en") or "").lower()
                         all_text = f"{text_lower} {title_lower} {speaker_lower} {summary_lower}"
                         
-                        # Check if ANY query word appears as a whole word in the result
+                        # Check if ANY query word appears in the result (whole word or safe variant)
                         query_words = [w.lower().strip() for w in query_text.split() if len(w.strip()) >= 3]
                         for qw in query_words:
-                            if whole_word_match(qw, all_text):
+                            if whole_word_match(qw, all_text) or word_variant_match(qw, all_text):
                                 query_words_in_result = True
                                 break
                     
@@ -3188,6 +3217,9 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                             # Both sides are normalized so "there've" matches "there've"
                             if whole_word_match(w, field_value):
                                 field_match_score = 1.0
+                            # Variant match for words like fail -> failed/failing/failure
+                            elif word_variant_match(w, field_value):
+                                field_match_score = 0.88
                             # Fuzzy match ONLY for longer words (4+ chars) against individual words
                             # Uses word-to-word comparison, NOT substring matching
                             elif len(w) >= 4:
