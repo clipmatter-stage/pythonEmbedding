@@ -1661,6 +1661,32 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
     filter_month = data.filter_month
     filter_date = data.filter_date
 
+    # OpenAI-only mode: avoid scan-heavy fallbacks and prefer vector+LLM flow.
+    openai_only_search = os.getenv("OPENAI_ONLY_SEARCH", "true").lower() == "true"
+    if openai_only_search and not openai_client:
+        raise HTTPException(
+            status_code=503,
+            detail="OPENAI_ONLY_SEARCH is enabled but OpenAI client is not configured"
+        )
+
+    # For content filters, reuse the semantic pipeline (faster than large scroll scans).
+    if search_mode == "simple" and openai_only_search and filter_type in {"speaker", "text", "title", "summary"}:
+        if filter_type == "speaker" and not query_text:
+            query_text = speaker_filter or ""
+        elif filter_type == "title" and not query_text:
+            query_text = title_filter or ""
+        elif filter_type in {"text", "summary"} and not query_text:
+            query_text = " ".join(words or [])
+
+        if not query_text:
+            raise HTTPException(
+                status_code=400,
+                detail=f"query is required for OPENAI simple->{filter_type} search"
+            )
+
+        search_mode = "semantic"
+        logger.info(f"[OPENAI-ONLY] Routed simple/{filter_type} request to semantic pipeline")
+
     # ═══════════════════════════════════════════════════════════════════════════
     # SIMPLE SEARCH MODE — structured filters only, no vector/LLM operations.
     # Only one filter is active at a time. Returns results from Qdrant scroll.
@@ -2431,6 +2457,12 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
     use_query_expansion = os.getenv("USE_QUERY_EXPANSION", "true").lower() == "true"
     use_reranking = os.getenv("USE_RERANKING", "true").lower() == "true"
     use_llm_understanding = os.getenv("USE_LLM_UNDERSTANDING", "true").lower() == "true"
+    use_scan_strategies = not openai_only_search
+
+    if openai_only_search:
+        # Keep semantic search responsive by constraining expensive fallbacks.
+        use_query_expansion = False
+        max_scanned = min(max_scanned, 5000)
     
     # LLM QUERY UNDERSTANDING — parse intent, detect language, extract speaker
     query_intent = None
@@ -2585,7 +2617,7 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
     speaker_only_search = speaker_filter and not query_text and not words
     speaker_parallel_search = speaker_filter and query_text  # Run speaker search in parallel with semantic
     
-    if speaker_only_search or speaker_parallel_search:
+    if use_scan_strategies and (speaker_only_search or speaker_parallel_search):
         try:
             logger.info(f"Speaker field search for: '{speaker_filter}'")
             offset = None
@@ -2705,7 +2737,7 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
     # This runs BEFORE semantic search to prioritize exact transcript matches
     # When user searches "before Windows 95, 1984", we find segments with that exact text
     exact_phrase_results = []
-    if query_text and len(query_text.strip()) >= 5:
+    if use_scan_strategies and query_text and len(query_text.strip()) >= 5:
         try:
             exact_phrase = normalize_for_matching(query_text.strip())
             logger.info(f"Exact phrase search for: '{exact_phrase[:60]}'")
@@ -3020,7 +3052,7 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
         # Normalize the full query for exact phrase comparison
         exact_phrase_query = normalize_for_matching(query_text.strip())
     
-    if search_words:
+    if use_scan_strategies and search_words:
         try:
             # Cap keyword search to avoid timeout - keyword matching is fast but needs limit
             max_scan_keyword = min(max_scanned, 3000)  # Reduced from 5000 for speed
@@ -3251,7 +3283,7 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
     # 2. User searches with query_text (automatic title search with lower priority)
     # This ensures searching "2023" finds videos with "2023" in the title
     title_query = title_filter or query_text or ""
-    if title_query and len(title_query.strip()) >= 2:  # Reduced from 3 to 2 for short queries like "2023"
+    if use_scan_strategies and title_query and len(title_query.strip()) >= 2:  # Reduced from 3 to 2 for short queries like "2023"
         try:
             logger.info(f"Title matching search for: '{title_query[:120]}'")
             
@@ -4446,6 +4478,7 @@ async def root():
             "embedding_model": OPENAI_EMBEDDING_MODEL if USE_OPENAI_EMBEDDINGS else FASTEMBED_MODEL_NAME,
             "embedding_dimension": EMBEDDING_DIMENSION,
             "fastembed_fallback": FASTEMBED_MODEL_NAME,
+            "openai_only_search": os.getenv("OPENAI_ONLY_SEARCH", "true"),
             "llm_query_understanding": os.getenv("USE_LLM_UNDERSTANDING", "true"),
             "llm_reranking": os.getenv("USE_RERANKING", "true"),
             "cross_language_search": "Urdu <-> English via LLM translation",
@@ -4475,6 +4508,7 @@ async def root():
         "environment_variables": {
             "OPENAI_API_KEY": "Required for embeddings, query understanding, and reranking",
             "USE_OPENAI_EMBEDDINGS": "true/false (default: true)",
+            "OPENAI_ONLY_SEARCH": "true/false (default: true) - route content filters to semantic and skip scan-heavy fallbacks",
             "USE_LLM_UNDERSTANDING": "true/false (default: true) - GPT-4o-mini query parsing",
             "USE_RERANKING": "true/false (default: true) - GPT-4o-mini reranking",
             "USE_QUERY_EXPANSION": "true/false (default: true) - expanded via LLM understanding",
