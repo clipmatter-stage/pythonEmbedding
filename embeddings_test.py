@@ -2023,8 +2023,12 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                         video_title = payload.get("video_title", "")
                         if not video_title:
                             continue
-                        video_title_norm = " ".join(normalize_for_matching(video_title).split())
-                        query_normalized = " ".join(normalize_for_matching(title_filter).split())
+                        # Token-normalize both sides so punctuation/spacing/case variants
+                        # still count as exact title matches.
+                        video_title_tokens = [normalize_word(w) for w in video_title.split() if normalize_word(w)]
+                        query_tokens = [normalize_word(w) for w in title_filter.split() if normalize_word(w)]
+                        video_title_norm = " ".join(video_title_tokens)
+                        query_normalized = " ".join(query_tokens)
                         
                         # STRATEGY 1: strict normalized full-title equality
                         is_full_title_match = query_normalized == video_title_norm
