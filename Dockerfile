@@ -33,6 +33,6 @@ EXPOSE 9000
 
 # Health check removed - Railway has built-in health monitoring
 
-# Start command - Railway will inject environment variables at runtime
-# Python script will read PORT from environment and default to 9000
-CMD ["python", "embeddings_test.py"]
+# Start command - Use uvicorn ASGI server (production-ready)
+# Railway will inject PORT environment variable at runtime
+CMD ["sh", "-c", "uvicorn embeddings_test:app --host 0.0.0.0 --port ${PORT:-9000}"]

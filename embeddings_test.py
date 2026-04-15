@@ -4601,11 +4601,6 @@ async def root():
         },
     }
 
-if __name__ == "__main__":
-    import uvicorn
-    port = int(os.getenv("PORT", 9000))
-    logger.info(f"Starting FastAPI Video Elastic Search Service on port {port}...")
-    logger.info(f"Qdrant URL: {QDRANT_URL}")
-    logger.info(f"Collections: {SEGMENTS_COLLECTION}, {LEGACY_COLLECTION}")
-    logger.info("Features: Fuzzy search, typo tolerance, query caching")
-    uvicorn.run(app, host="0.0.0.0", port=port)
+
+
+
