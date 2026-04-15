@@ -105,23 +105,88 @@ STOP_WORDS = frozenset({
 # Maps known aliases/abbreviations to canonical names with all their variants.
 # When any alias is detected in a query or speaker filter, the search automatically
 # expands to cover all forms of that person's name.
+# Also includes common misspellings, typos, and concatenated forms users may type.
 PERSON_ALIASES = {
     "hafiz_naeem": {
         "canonical": "Hafiz Naeem Ur Rehman",
         # All text forms that should trigger recognition of this person
         "aliases": [
+            # === Canonical and standard forms ===
             "hafiz naeem ur rehman", "hafiz naeem", "hafiz naeem rehman",
             "naeem ur rehman", "naeem rehman", "h naeem", "naeem",
             "rehman", "hafiz", "hnr", "h.n.r", "h.n.r.",
-            # Urdu transliterations
+            "hafiz naeem-ur-rehman", "hafiz naeem ur rahman",
+            "hafiz naeemur rehman", "hafiz naeemurrehman",
+            
+            # === Common concatenated/no-space forms (users type fast) ===
+            "hafiznaeem", "naeemrehman", "naeemurrehman", "hafiznaeemurehman",
+            "hafiz naeemrehman", "hafiz naeemurrehman",
+            "hafiznaeem ur rehman", "hafiznaeem rehman",
+            "naeemur rehman", "naeem-rehman", "naeem-ur-rehman",
+            "hafiz-naeem", "hafiz-naeem-ur-rehman",
+            
+            # === Common misspellings & typos ===
+            "hafiz naem", "hafiz naem ur rehman", "hafiz naim", "hafiz naim ur rehman",
+            "hafiz naaem", "hafiz naeem ur rahman", "hafiz naeem ur rehmaan",
+            "hafiz naeem ur rehmann", "hafiz naeeem", "hafiz naeem ur rahmaan",
+            "hafiz naeem ur reham", "hafiz naeem rehmann", "hafiz naeem reham",
+            "hafiz naeem urehman", "hafiz naeem urehmann",
+            "hfiz naeem", "hafz naeem", "hafix naeem", "hafis naeem",
+            "hafiz naeem ur reman", "hafiz naeem ur reman",
+            "hafiz naeemeurahman", "hafiz naeemeurehman",
+            "hafiz naeemurahman", "hafiz naeemurrahman",
+            "hafi naeem", "hafi naeemeurahman", "hafi naeemurahman",
+            "hafi naeemurrehman", "hafi naeem ur rehman",
+            "hafiz naeem urrehman", "hafiz naeem urrahman",
+            "hafiz naem rehman", "hafiz naim rehman",
+            "hafiz neem", "hafiz neem ur rehman", "hafiz neem rehman",
+            "hafz naeem ur rehman", "hafiz naam", "hafiz naam ur rehman",
+            "hafis naeem ur rehman", "haafiz naeem", "haafiz naeem ur rehman",
+            "hafiz naeem u rehman", "hafiz naeem u rahman",
+            "hafiz naeem oorehman", "hafiz naeem oorahman",
+            "hafiz naeem-rehman", "naeem-ur-rahman", "naeem ur rahman",
+            "naem ur rehman", "naem rehman", "naim ur rehman", "naim rehman",
+            "naaem ur rehman", "naaem rehman", "naeem rehmaan", "naeem rehmann",
+            "naeemur rahman", "naeemurrahman", "naeemeurrehman", "naeemeurahman",
+            "naeem urehman", "naeem ure hman",
+            
+            # === Short/abbreviated forms ===
+            "h naeem ur rehman", "h. naeem", "h.naeem",
+            "h naeem rehman", "hn rehman", "hnr", "h.n.r.",
+            "hafiz n", "hafiz nr", "h n r",
+            
+            # === Case variations (handled by lowering, but listed for completeness) ===
+            "HAFIZ NAEEM", "Hafiz Naeem", "NAEEM UR REHMAN", "NAEEM REHMAN",
+            
+            # === Special characters / punctuation variants ===
+            "hafiz_naeem", "hafiz.naeem", "hafiz,naeem",
+            "naeem_ur_rehman", "naeem.ur.rehman",
+            "hafiz naeem'ur rehman", "hafiz naeem`ur rehman",
+            
+            # === Urdu script forms (various spellings) ===
             "حافظ نعیم", "حافظ نعیم الرحمن", "نعیم الرحمن", "حافظ نعیم ورحمان",
-            # Common informal references
+            "حافظ نعیم الرحمان", "نعیم الرحمان", "حافظ نعیم ور رحمان",
+            "نعیم", "حافظ نعیم رحمان", "نعیم رحمان",
+            "حافظ نائیم", "نائیم الرحمن", "حافظ نائیم الرحمن",
+            "حافظ نعیم ار رحمن", "حافظ نعیم اور رحمن",
+            "حافظ صاحب", "نعیم صاحب", "نعیم بھائی",
+            
+            # === Urdu transliterations (Roman Urdu) ===
+            "hafiz sahab", "hafiz sahib", "naeem sahab", "naeem sahib",
+            "naeem bhai", "hafiz bhai",
+            
+            # === Common informal references ===
             "ameer jamaat", "ameer e jamaat", "jamaati ameer",
+            "ameer jamat", "ameer-e-jamat", "ameer jamat e islami",
+            "ameer jamaat e islami", "ameer ji", "ameer sahab",
+            "ameer jama'at", "ameer jamaat islami",
         ],
         # Speaker field values stored in Qdrant (various forms used at ingestion time)
         "speaker_variants": [
             "Hafiz Naeem Ur Rehman", "Hafiz Naeem", "hafiz naeem ur rehman",
             "Hafiz Naeem ur Rehman", "HAFIZ NAEEM", "Naeem Ur Rehman",
+            "Hafiz Naeem Ur Rahman", "Naeem Ur Rahman", "Naeem Rehman",
+            "Hafiz Naeem Rehman", "hafiz naeem", "naeem ur rehman",
         ],
     },
 }
@@ -137,15 +202,21 @@ def detect_person_alias(text: str) -> Optional[str]:
     """
     Returns the PERSON_ALIASES key if the text matches any known alias,
     otherwise returns None.
-    Checks both exact and substring matches for multi-word aliases.
+    Checks exact matches, substring matches, and fuzzy matches for typo tolerance.
     """
     if not text:
         return None
     text_lower = text.lower().strip()
+    
+    # Remove common punctuation/special chars that users might accidentally type
+    text_cleaned = re.sub(r'[_.,;:!?\'"`~@#$%^&*()+=\[\]{}|\\/<>]', ' ', text_lower)
+    text_cleaned = re.sub(r'\s+', ' ', text_cleaned).strip()
 
-    # 1. Exact match
+    # 1. Exact match against aliases
     if text_lower in _ALIAS_LOOKUP:
         return _ALIAS_LOOKUP[text_lower]
+    if text_cleaned != text_lower and text_cleaned in _ALIAS_LOOKUP:
+        return _ALIAS_LOOKUP[text_cleaned]
 
     # 2. Check if text contains any known alias as a whole-word substring
     for alias, person_key in _ALIAS_LOOKUP.items():
@@ -155,6 +226,59 @@ def detect_person_alias(text: str) -> Optional[str]:
             continue
         if alias in text_lower:
             return person_key
+
+    # 3. Fuzzy matching for typos/misspellings (e.g. "hafi naeemeurahman")
+    #    Only check multi-word aliases or aliases >= 6 chars to avoid false positives
+    if len(text_cleaned) >= 5:
+        best_score = 0
+        best_key = None
+        for alias, person_key in _ALIAS_LOOKUP.items():
+            # Skip short single-word aliases for fuzzy matching
+            if len(alias) < 6 and len(alias.split()) == 1:
+                continue
+            
+            # Use both ratio and partial_ratio for different matching scenarios
+            score = fuzz.ratio(text_cleaned, alias)
+            partial = fuzz.partial_ratio(text_cleaned, alias)
+            
+            # For concatenated forms (naeemurrehman vs naeem ur rehman),
+            # also compare without spaces
+            text_no_space = text_cleaned.replace(' ', '')
+            alias_no_space = alias.replace(' ', '')
+            no_space_score = fuzz.ratio(text_no_space, alias_no_space)
+            
+            effective_score = max(score, partial * 0.9, no_space_score)
+            
+            # Threshold depends on length — longer strings need lower threshold
+            threshold = 75 if len(alias) >= 10 else 80 if len(alias) >= 6 else 90
+            
+            if effective_score >= threshold and effective_score > best_score:
+                best_score = effective_score
+                best_key = person_key
+        
+        if best_key:
+            return best_key
+    
+    # 4. Word-component matching: check if key name parts appear in text
+    #    e.g. "hafiz speech about economy" → detect "hafiz"
+    #    This catches queries where a known name is embedded in a longer phrase
+    text_words = text_cleaned.split()
+    if len(text_words) >= 1:
+        for person_key, person_data in PERSON_ALIASES.items():
+            canonical_words = [w.lower() for w in person_data["canonical"].split()]
+            # Count how many canonical name words appear in the text (exact or fuzzy)
+            matched_canonical = 0
+            for cw in canonical_words:
+                if len(cw) < 3:  # skip "ur", "e" etc.
+                    continue
+                for tw in text_words:
+                    if tw == cw or (len(tw) >= 4 and len(cw) >= 4 and fuzz.ratio(tw, cw) >= 82):
+                        matched_canonical += 1
+                        break
+            # If 2+ significant canonical words match, it's likely this person
+            significant_canonical = [w for w in canonical_words if len(w) >= 3]
+            if len(significant_canonical) >= 2 and matched_canonical >= 2:
+                return person_key
 
     return None
 
@@ -943,16 +1067,33 @@ def fuzzy_match_speaker(query: str, speaker: str, threshold: int = 75) -> bool:
     Handles variations like 'John' vs 'Jon', 'Muhammad' vs 'Mohammad'.
     Also checks PERSON_ALIASES so that 'HNR', 'naeem', etc. match
     'Hafiz Naeem Ur Rehman' and vice-versa.
+    Also handles concatenated forms like 'naeemurrehman' vs 'naeem ur rehman'.
     """
     if not query or not speaker:
         return False
 
     query_lower = query.lower().strip()
     speaker_lower = speaker.lower().strip()
+    
+    # Clean special characters from query (users may type underscores, dots, etc.)
+    query_cleaned = re.sub(r'[_.,;:!?\'"]+', ' ', query_lower)
+    query_cleaned = re.sub(r'\s+', ' ', query_cleaned).strip()
 
     # Exact match
     if query_lower == speaker_lower or query_lower in speaker_lower:
         return True
+    if query_cleaned != query_lower and (query_cleaned == speaker_lower or query_cleaned in speaker_lower):
+        return True
+    
+    # No-space comparison (handles concatenated forms like "naeemurrehman")
+    query_no_space = query_cleaned.replace(' ', '')
+    speaker_no_space = speaker_lower.replace(' ', '').replace('_', '')
+    if query_no_space == speaker_no_space or query_no_space in speaker_no_space or speaker_no_space in query_no_space:
+        return True
+    if len(query_no_space) >= 5 and len(speaker_no_space) >= 5:
+        no_space_ratio = fuzz.ratio(query_no_space, speaker_no_space)
+        if no_space_ratio >= threshold:
+            return True
 
     # ── Alias expansion: if query is a known alias, try all speaker_variants ──
     person_key = detect_person_alias(query)
@@ -963,6 +1104,10 @@ def fuzzy_match_speaker(query: str, speaker: str, threshold: int = 75) -> bool:
             if vl == speaker_lower or vl in speaker_lower or speaker_lower in vl:
                 return True
             if fuzz.ratio(vl, speaker_lower) >= threshold:
+                return True
+            # Also check no-space variant comparison
+            vl_no_space = vl.replace(' ', '')
+            if vl_no_space == speaker_no_space or vl_no_space in speaker_no_space:
                 return True
 
     # ── Alias expansion: if speaker is a known alias, try all speaker_variants ──
@@ -3635,11 +3780,25 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
             multi_match_boost = min(0.05 * (num_unique_terms - 1), 0.15)  # Max 15% boost
             seg["score"] = round(min(seg["score"] + multi_match_boost, 0.98), 4)
 
-    # Sort: EXACT PHRASE MATCHES FIRST, then TITLE MATCHES, then by score, then by start time for stability
+    # Sort: EXACT PHRASE MATCHES FIRST, then TITLE MATCHES, then SPEAKER MATCHES, then by score, then by start time for stability
+    # Priority order: exact_phrase (3) > title_match (2) > speaker (1) > summary/text (0)
+    def match_priority(x):
+        match_types = x.get("match_types", [])
+        matched_field = x.get("matched_field", "")
+        if "exact_phrase_match" in match_types:
+            return 4
+        if "title_match" in match_types or matched_field == "video_title":
+            return 3
+        if "speaker_filter" in match_types or "speaker_field_match" in match_types or matched_field == "speaker":
+            return 2
+        if matched_field == "video_summary":
+            return 1
+        return 0
+    
     merged_list = sorted(
         merged.values(),
         key=lambda x: (
-            2 if "exact_phrase_match" in x.get("match_types", []) else (1 if "title_match" in x.get("match_types", []) else 0),  # Exact phrase > title > others
+            match_priority(x),  # Priority: exact_phrase > title > speaker > summary > text
             x.get("score", 0),
             -x.get("start_time", 0)
         ),
@@ -3681,12 +3840,11 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                     original = title_match_scores[r["id"]]
                     if r["score"] < original * 0.7:
                         r["score"] = round(max(r["score"], original * 0.80), 4)
-            # Re-sort: EXACT PHRASE MATCHES FIRST, then by score
-            # This ensures exact matches are always at the top regardless of LLM score
+            # Re-sort: priority order exact_phrase > title > speaker > others, then by score
             merged_list.sort(
                 key=lambda x: (
-                    1 if "exact_phrase_match" in x.get("match_types", []) else 0,  # Exact phrase first
-                    x.get("score", 0)  # Then by score
+                    2 if "exact_phrase_match" in x.get("match_types", []) else (1 if "title_match" in x.get("match_types", []) else 0),
+                    x.get("score", 0)
                 ),
                 reverse=True
             )
@@ -3791,13 +3949,26 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                 del seg["all_matched_terms"]  # Clean up - use matched_terms instead
             consolidated_segments.append(seg)
     
-    # Re-sort consolidated segments: EXACT PHRASE MATCHES ALWAYS FIRST, then TITLE MATCHES, then by score
-    # This ensures exact transcript matches and title matches are always shown at the top of results
+    # Re-sort consolidated segments: priority order title > speaker > summary > text, then by score
+    # This ensures the most relevant match types are always shown first
+    def consolidated_priority(x):
+        match_types = x.get("match_types", [])
+        matched_field = x.get("matched_field", "")
+        if "exact_phrase_match" in match_types:
+            return 4
+        if "title_match" in match_types or matched_field == "video_title":
+            return 3
+        if "speaker_filter" in match_types or "speaker_field_match" in match_types or matched_field == "speaker":
+            return 2
+        if matched_field == "video_summary":
+            return 1
+        return 0
+    
     consolidated_segments.sort(
         key=lambda x: (
-            2 if "exact_phrase_match" in x.get("match_types", []) else (1 if "title_match" in x.get("match_types", []) else 0),  # Exact phrase > title > others
-            x.get("score", 0),  # Then by score
-            -x.get("start_time", 0)  # Then by start time
+            consolidated_priority(x),
+            x.get("score", 0),
+            -x.get("start_time", 0)
         ),
         reverse=True
     )
