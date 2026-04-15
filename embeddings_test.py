@@ -2638,12 +2638,19 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
     use_llm_understanding = os.getenv("USE_LLM_UNDERSTANDING", "true").lower() == "true"
     normalized_query = normalize_word(query_text) if query_text else ""
     single_word_query = bool(normalized_query and len(query_text.split()) == 1 and len(normalized_query) >= 2)
-    use_scan_strategies = (not openai_only_search) or single_word_query
+    # Always enable scan strategies for known person aliases — we need speaker/keyword/title search
+    is_person_alias_query = alias_person_key is not None
+    use_scan_strategies = (not openai_only_search) or single_word_query or is_person_alias_query
 
     if openai_only_search:
         # Keep semantic search responsive by constraining expensive fallbacks.
         use_query_expansion = False
-        max_scanned = min(max_scanned, 12000 if single_word_query else 5000)
+        if is_person_alias_query:
+            # Person searches need more scanning to find all speaker/title/text matches
+            max_scanned = min(max_scanned, 50000)
+            logger.info(f"[OPENAI-ONLY] Person alias detected ('{alias_person_key}'): enabling all scan strategies, max_scanned={max_scanned}")
+        else:
+            max_scanned = min(max_scanned, 12000 if single_word_query else 5000)
         if single_word_query:
             logger.info("[OPENAI-ONLY] Single-word query detected: enabling lightweight keyword fallback")
     
@@ -2690,8 +2697,12 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                 return False
             
             if not language_filter and query_intent.get("detected_language") == "english":
-                if looks_like_title(query_text):
+                if is_person_alias_query:
+                    logger.info(f"Skipping auto-language filter: person alias query ('{alias_person_key}') — need to search ALL languages")
+                elif looks_like_title(query_text):
                     logger.info(f"Skipping auto-language filter: query looks like a title ('{query_text[:50]}')")
+                elif query_intent.get("query_type") == "speaker_search":
+                    logger.info(f"Skipping auto-language filter: speaker search — need to search ALL languages")
                 else:
                     language_filter = "en"  # ISO code matching database value
                     logger.info(f"Auto-applied language filter: en (based on English query)")
@@ -3155,9 +3166,15 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                     # Apply query-presence penalty for SHORT queries (1-2 words)
                     # Short queries are specific searches ("mufti", "drone", "bill gates") — user expects
                     # the word to actually appear in results, not just be "semantically related"
+                    # EXCEPTION: Skip penalty for known person alias queries — we want ALL results about them
                     query_word_count = len(query_text.split()) if query_text else 0
                     presence_penalty = 0.0
-                    if query_word_count <= 2 and not query_words_in_result and not speaker_field_match:
+                    if is_person_alias_query:
+                        # Person alias queries: no presence penalty — semantic similarity is enough
+                        # We want to find ALL content related to this person even if their name
+                        # isn't literally in the transcript text
+                        pass
+                    elif query_word_count <= 2 and not query_words_in_result and not speaker_field_match:
                         # STRONGER penalty: results that don't contain the actual search term
                         # This prevents "bill gates" → "pakistan politics" false matches
                         # Also prevents "mufti" → "qari mansoor jamat" false matches
@@ -3434,7 +3451,9 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                             continue
                     
                     # ELASTIC speaker filter with fuzzy matching
-                    if speaker_filter:
+                    # For person alias queries with parallel search, DON'T filter keywords by speaker
+                    # We want to find segments MENTIONING the person, not just spoken BY them
+                    if speaker_filter and not (is_person_alias_query and speaker_parallel_search):
                         speaker_check = f"{speaker_field} {diarization_speaker}"
                         if not fuzzy_match_speaker(speaker_filter, speaker_check, threshold=70):
                             continue
@@ -3519,6 +3538,18 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                 translated = query_intent.get("semantic_query_translated", "")
                 if translated and translated.strip().lower() != title_query.strip().lower():
                     title_queries.append(translated)
+            
+            # For person alias queries, add canonical name and key variants as title search terms
+            if is_person_alias_query:
+                person_data = PERSON_ALIASES[alias_person_key]
+                canonical = person_data["canonical"]
+                if canonical.lower() not in title_query.lower():
+                    title_queries.append(canonical)
+                # Add short forms that commonly appear in video titles
+                for variant in person_data["speaker_variants"][:4]:
+                    if variant.lower() not in [tq.lower() for tq in title_queries]:
+                        title_queries.append(variant)
+                logger.info(f"Person alias: expanded title queries to {len(title_queries)} variants")
             
             # Collect video_ids already in semantic/keyword results to avoid duplicating low-value segments
             existing_ids = set()
