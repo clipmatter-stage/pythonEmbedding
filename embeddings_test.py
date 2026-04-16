@@ -574,11 +574,13 @@ def cache_search_results(search_session_id: str, results: List[Dict], query_para
 def extract_batch_from_results(results: List[Dict], cursor: Optional[Dict], batch_size: int) -> Tuple[List[Dict], Optional[str], bool]:
     """
     Extract a batch of results starting from cursor position.
+    Returns segments until we have batch_size unique VIDEO groups (not raw segments).
+    This ensures the PHP controller gets enough segments to display batch_size videos.
     
     Args:
-        results: Full list of search results
+        results: Full list of search results (flat segments)
         cursor: Decoded cursor dict with {id, score, index}
-        batch_size: Number of results to return
+        batch_size: Number of unique videos to return segments for
     
     Returns:
         Tuple of (batch_results, next_cursor_str, has_more)
@@ -591,25 +593,41 @@ def extract_batch_from_results(results: List[Dict], cursor: Optional[Dict], batc
     if cursor and 'index' in cursor:
         start_index = cursor['index'] + 1  # Start after the cursor position
     
-    # Extract batch
-    end_index = min(start_index + batch_size, len(results))
-    batch = results[start_index:end_index]
+    # Collect segments until we have batch_size unique video_ids
+    batch = []
+    unique_video_ids = set()
+    end_index = start_index
+    
+    for i in range(start_index, len(results)):
+        result = results[i]
+        video_id = result.get('video_id')
+        
+        # If this is a new video and we already have enough videos, stop
+        if video_id and video_id not in unique_video_ids and len(unique_video_ids) >= batch_size:
+            break
+        
+        if video_id:
+            unique_video_ids.add(video_id)
+        batch.append(result)
+        end_index = i
+    
+    if not batch:
+        return [], None, False
     
     # Determine if there are more results
-    has_more = end_index < len(results)
+    has_more = (end_index + 1) < len(results)
     
     # Create next cursor if there are more results
     next_cursor = None
     if has_more and batch:
         last_result = batch[-1]
-        # Use the index in the full results list (end_index - 1)
         next_cursor = encode_cursor(
             segment_id=last_result.get('id', ''),
             score=last_result.get('score', 0.0),
-            index=end_index - 1
+            index=end_index
         )
     
-    logger.info(f"Batch extracted: start={start_index}, end={end_index}, size={len(batch)}, has_more={has_more}")
+    logger.info(f"Batch extracted: start={start_index}, end={end_index + 1}, segments={len(batch)}, unique_videos={len(unique_video_ids)}, has_more={has_more}")
     return batch, next_cursor, has_more
 
 # ============== ADVANCED EMBEDDING FUNCTIONS ==============
