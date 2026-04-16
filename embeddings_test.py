@@ -559,17 +559,19 @@ def get_cached_results(search_session_id: str) -> Optional[Dict]:
         logger.info(f"Cache MISS for session {search_session_id[:8] if search_session_id else 'None'}...")
     return cached
 
-def cache_search_results(search_session_id: str, results: List[Dict], query_params: Dict):
+def cache_search_results(search_session_id: str, results: List[Dict], query_params: Dict, top_k_used: int = 20):
     """
     Cache search results with session ID.
+    Stores top_k used to enable progressive query expansion.
     """
     cache_data = {
         "results": results,
         "query_params": query_params,
-        "timestamp": time.time()
+        "timestamp": time.time(),
+        "top_k_used": top_k_used  # Track how many results were queried
     }
     search_result_cache[search_session_id] = cache_data
-    logger.info(f"Cached {len(results)} results for session {search_session_id[:8]}...")
+    logger.info(f"Cached {len(results)} results (top_k={top_k_used}) for session {search_session_id[:8]}...")
 
 def extract_batch_from_results(results: List[Dict], cursor: Optional[Dict], batch_size: int) -> Tuple[List[Dict], Optional[str], bool]:
     """
@@ -4325,12 +4327,57 @@ async def search_incremental(data: IncrementalSearchRequest, authorized: bool = 
     
     if cached_data:
         # ═══════════════════════════════════════════════════════════════════════════
-        # CACHED RESULTS PATH - Fast batch extraction from cache
+        # CACHED RESULTS PATH - Check if cache has enough, else expand query
         # ═══════════════════════════════════════════════════════════════════════════
-        logger.info(f"[INCREMENTAL SEARCH] Using cached results for session {search_session_id[:8]}...")
         
         all_results = cached_data.get("results", [])
         query_params = cached_data.get("query_params", {})
+        top_k_used = cached_data.get("top_k_used", 20)
+        
+        # Calculate if cache has enough results for this batch
+        cursor_index = cursor.get("index", -1) if cursor else -1
+        needed_index = cursor_index + batch_size * 3  # Heuristic: need ~3x batch_size results ahead
+        
+        # If cache doesn't have enough results, expand query
+        if needed_index >= len(all_results) and len(all_results) >= top_k_used * 0.9:
+            # We've consumed most of cached results - query for more
+            new_top_k = min(top_k_used + 30, 200)  # Increase by 30, max 200
+            
+            logger.info(f"[INCREMENTAL SEARCH] Cache insufficient (has {len(all_results)}, need ~{needed_index}). Expanding query from top_k={top_k_used} to {new_top_k}...")
+            
+            # Execute expanded search
+            search_request = SearchRequest(
+                query=data.query,
+                words=data.words,
+                word=data.word,
+                top_k=new_top_k,
+                video_id=data.video_id,
+                speaker=data.speaker,
+                title=data.title,
+                language=data.language,
+                min_score=data.min_score,
+                time_range=data.time_range,
+                max_scanned=data.max_scanned,
+                search_mode=data.search_mode,
+                filter_type=data.filter_type,
+                filter_year=data.filter_year,
+                filter_month=data.filter_month,
+                filter_date=data.filter_date
+            )
+            
+            try:
+                search_response = await search(search_request, authorized=True)
+                all_results = search_response.get("results", [])
+                
+                # Update cache with expanded results
+                cache_search_results(search_session_id, all_results, query_params, new_top_k)
+                
+                logger.info(f"[INCREMENTAL SEARCH] Cache expanded: now {len(all_results)} results (top_k={new_top_k})")
+            except Exception as e:
+                logger.error(f"Failed to expand cache: {str(e)}")
+                # Fall back to existing cached results
+        else:
+            logger.info(f"[INCREMENTAL SEARCH] Using cached results for session {search_session_id[:8]} (has {len(all_results)} results)...")
         
         # Extract batch from cached results
         batch, next_cursor, has_more = extract_batch_from_results(all_results, cursor, batch_size)
@@ -4351,7 +4398,8 @@ async def search_incremental(data: IncrementalSearchRequest, authorized: bool = 
                 "cache_hit": True,
                 "batch_size": len(batch),
                 "batch_start": cursor.get("index", -1) + 1 if cursor else 0,
-                "query": query_params.get("query", "")
+                "query": query_params.get("query", ""),
+                "top_k_used": cached_data.get("top_k_used", top_k_used)
             }
         }
     
@@ -4370,12 +4418,13 @@ async def search_incremental(data: IncrementalSearchRequest, authorized: bool = 
         # We'll execute the full search logic inline (calling the search function would be cleaner
         # but requires refactoring - for now, we'll call the existing search endpoint logic)
         
-        # Create a SearchRequest object
+        # Create a SearchRequest object with SMALL top_k for fast initial response
+        initial_top_k = 20  # Query only 20 results initially (~4-5 seconds)
         search_request = SearchRequest(
             query=data.query,
             words=data.words,
             word=data.word,
-            top_k=200,  # Match normal search top_k (client sends 200)
+            top_k=initial_top_k,  # FAST: Query only 20 instead of 200
             video_id=data.video_id,
             speaker=data.speaker,
             title=data.title,
@@ -4397,7 +4446,7 @@ async def search_incremental(data: IncrementalSearchRequest, authorized: bool = 
             # Extract results from search response
             all_results = search_response.get("results", [])
             
-            # Cache the results
+            # Cache the results with top_k tracking
             query_params = {
                 "query": data.query,
                 "speaker": data.speaker,
@@ -4407,7 +4456,7 @@ async def search_incremental(data: IncrementalSearchRequest, authorized: bool = 
                 "search_mode": data.search_mode,
                 "filter_type": data.filter_type
             }
-            cache_search_results(search_session_id, all_results, query_params)
+            cache_search_results(search_session_id, all_results, query_params, initial_top_k)
             
             # Extract first batch
             batch, next_cursor, has_more = extract_batch_from_results(all_results, None, batch_size)
@@ -4430,7 +4479,8 @@ async def search_incremental(data: IncrementalSearchRequest, authorized: bool = 
                     "batch_start": 0,
                     "query": data.query,
                     "total_found": search_response.get("total_found", 0),
-                    "search_mode": data.search_mode
+                    "search_mode": data.search_mode,
+                    "top_k_used": initial_top_k
                 }
             }
             
