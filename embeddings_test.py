@@ -632,6 +632,62 @@ def extract_batch_from_results(results: List[Dict], cursor: Optional[Dict], batc
     logger.info(f"Batch extracted: start={start_index}, end={end_index + 1}, segments={len(batch)}, unique_videos={len(unique_video_ids)}, has_more={has_more}")
     return batch, next_cursor, has_more
 
+def can_expand_incremental_cache(results_count: int, top_k_used: int, max_top_k: int = 200) -> bool:
+    """
+    Decide whether we should advertise another cursor page so the next request can
+    trigger progressive top_k expansion.
+
+    We only do this when:
+      1) We have not yet reached max_top_k
+      2) Current result count is near the queried top_k (likely capped)
+    """
+    if top_k_used >= max_top_k:
+        return False
+    return results_count >= max(1, int(top_k_used * 0.9))
+
+def maybe_mark_expandable_boundary(
+    batch: List[Dict],
+    next_cursor: Optional[str],
+    has_more: bool,
+    all_results: List[Dict],
+    top_k_used: int,
+    max_top_k: int = 200
+) -> Tuple[Optional[str], bool, bool]:
+    """
+    If we reached the end of currently cached results but cache is expandable,
+    return a boundary cursor and has_more=True so frontend can request the next
+    page and trigger progressive expansion.
+
+    Returns:
+      (next_cursor, has_more, expansion_pending)
+    """
+    # If normal pagination already has more, do nothing.
+    if has_more:
+        return next_cursor, has_more, False
+
+    # No batch means nothing was returned; do not force continuation.
+    if not batch or not all_results:
+        return next_cursor, has_more, False
+
+    # If cache does not look capped/expandable, do nothing.
+    if not can_expand_incremental_cache(len(all_results), top_k_used, max_top_k=max_top_k):
+        return next_cursor, has_more, False
+
+    boundary_index = len(all_results) - 1
+    boundary_result = all_results[boundary_index]
+    boundary_cursor = encode_cursor(
+        segment_id=boundary_result.get('id', ''),
+        score=boundary_result.get('score', 0.0),
+        index=boundary_index
+    )
+
+    logger.info(
+        f"[INCREMENTAL SEARCH] Reached expandable boundary at index={boundary_index}; "
+        f"exposing cursor to allow next request expansion (top_k={top_k_used}, results={len(all_results)})."
+    )
+
+    return boundary_cursor, True, True
+
 # ============== ADVANCED EMBEDDING FUNCTIONS ==============
 
 def get_openai_embedding(text: str, model_name: str = None) -> List[float]:
@@ -4371,6 +4427,7 @@ async def search_incremental(data: IncrementalSearchRequest, authorized: bool = 
                 
                 # Update cache with expanded results
                 cache_search_results(search_session_id, all_results, query_params, new_top_k)
+                top_k_used = new_top_k
                 
                 logger.info(f"[INCREMENTAL SEARCH] Cache expanded: now {len(all_results)} results (top_k={new_top_k})")
             except Exception as e:
@@ -4381,6 +4438,14 @@ async def search_incremental(data: IncrementalSearchRequest, authorized: bool = 
         
         # Extract batch from cached results
         batch, next_cursor, has_more = extract_batch_from_results(all_results, cursor, batch_size)
+        next_cursor, has_more, expansion_pending = maybe_mark_expandable_boundary(
+            batch=batch,
+            next_cursor=next_cursor,
+            has_more=has_more,
+            all_results=all_results,
+            top_k_used=top_k_used,
+            max_top_k=200
+        )
         
         elapsed = time.time() - start_time
         
@@ -4399,7 +4464,8 @@ async def search_incremental(data: IncrementalSearchRequest, authorized: bool = 
                 "batch_size": len(batch),
                 "batch_start": cursor.get("index", -1) + 1 if cursor else 0,
                 "query": query_params.get("query", ""),
-                "top_k_used": cached_data.get("top_k_used", top_k_used)
+                "top_k_used": top_k_used,
+                "expansion_pending": expansion_pending
             }
         }
     
@@ -4460,6 +4526,14 @@ async def search_incremental(data: IncrementalSearchRequest, authorized: bool = 
             
             # Extract first batch
             batch, next_cursor, has_more = extract_batch_from_results(all_results, None, batch_size)
+            next_cursor, has_more, expansion_pending = maybe_mark_expandable_boundary(
+                batch=batch,
+                next_cursor=next_cursor,
+                has_more=has_more,
+                all_results=all_results,
+                top_k_used=initial_top_k,
+                max_top_k=200
+            )
             
             elapsed = time.time() - start_time
             
@@ -4480,7 +4554,8 @@ async def search_incremental(data: IncrementalSearchRequest, authorized: bool = 
                     "query": data.query,
                     "total_found": search_response.get("total_found", 0),
                     "search_mode": data.search_mode,
-                    "top_k_used": initial_top_k
+                    "top_k_used": initial_top_k,
+                    "expansion_pending": expansion_pending
                 }
             }
             
