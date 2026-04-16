@@ -389,6 +389,28 @@ class TitleSearchRequest(BaseModel):
     title: str = Field(..., min_length=1, max_length=500)
     limit: int = Field(default=10, ge=1, le=100)
 
+class IncrementalSearchRequest(BaseModel):
+    """Request model for incremental cursor-based search"""
+    query: str = Field(default="", max_length=1000)
+    words: List[str] = Field(default=[])
+    word: Optional[str] = Field(default=None, max_length=200)
+    video_id: Optional[int] = Field(default=None, gt=0)
+    speaker: Optional[str] = Field(default=None, max_length=200)
+    title: Optional[str] = Field(default=None, max_length=500)
+    language: Optional[str] = Field(default=None, max_length=50)
+    min_score: float = Field(default=0.35, ge=0.0, le=1.0)
+    time_range: Optional[dict] = None
+    max_scanned: int = Field(default=10000, ge=100, le=100000)
+    search_mode: str = Field(default="semantic", pattern="^(semantic|simple)$")
+    filter_type: Optional[str] = Field(default=None, pattern="^(video|speaker|date|language|title|summary|text)$")
+    filter_year: Optional[int] = Field(default=None, ge=1900, le=2100)
+    filter_month: Optional[int] = Field(default=None, ge=1, le=12)
+    filter_date: Optional[str] = Field(default=None, max_length=20)
+    # Cursor-based pagination fields
+    cursor: Optional[str] = Field(default=None, description="Base64-encoded cursor for pagination")
+    batch_size: int = Field(default=10, ge=1, le=50, description="Number of results per batch")
+    search_session_id: Optional[str] = Field(default=None, max_length=100, description="UUID to identify search session")
+
 # ============== RATE LIMITER ==============
 class RateLimiter:
     def __init__(self, requests: int = 100, window: int = 60):
@@ -462,6 +484,10 @@ app.add_middleware(
 # Cache for query embeddings (max 1000 queries, 1 hour TTL)
 embedding_cache = TTLCache(maxsize=1000, ttl=3600)
 
+# Cache for search results (max 1000 search sessions, 30 minute TTL)
+# Key: search_session_id (UUID), Value: {results: List[Dict], query_params: Dict, timestamp: float}
+search_result_cache = TTLCache(maxsize=1000, ttl=1800)  # 30 minutes
+
 # ============== FASTEMBED MODEL (lightweight CPU fallback) ==============
 # FastEmbed: ~200MB RAM vs ~2GB for sentence-transformers+PyTorch
 # BAAI/bge-small-en-v1.5 is fast and English-focused (384-dim)
@@ -479,6 +505,108 @@ logger.info("FastEmbed model warmed up and ready")
 
 # Reference for fallback in get_openai_embedding
 _fallback_model = fastembed_model
+
+# ============== CURSOR-BASED PAGINATION FUNCTIONS ==============
+
+import base64
+
+def encode_cursor(segment_id: str, score: float, index: int) -> str:
+    """
+    Encode cursor as base64 JSON string.
+    Cursor format: {id: segment_id, score: score, index: position_in_results}
+    """
+    cursor_data = {
+        "id": segment_id,
+        "score": float(score),
+        "index": int(index)
+    }
+    cursor_json = json_module.dumps(cursor_data)
+    cursor_b64 = base64.b64encode(cursor_json.encode('utf-8')).decode('utf-8')
+    return cursor_b64
+
+def decode_cursor(cursor_str: Optional[str]) -> Optional[Dict]:
+    """
+    Decode base64 cursor string to dict.
+    Returns None if cursor is invalid or None.
+    """
+    if not cursor_str:
+        return None
+    
+    try:
+        cursor_json = base64.b64decode(cursor_str.encode('utf-8')).decode('utf-8')
+        cursor_data = json_module.loads(cursor_json)
+        return cursor_data
+    except Exception as e:
+        logger.warning(f"Failed to decode cursor: {e}")
+        return None
+
+def get_cached_results(search_session_id: str) -> Optional[Dict]:
+    """
+    Retrieve cached search results by session ID.
+    Returns cached data or None if not found/expired.
+    """
+    if not search_session_id:
+        return None
+    
+    cached = search_result_cache.get(search_session_id)
+    if cached:
+        logger.info(f"Cache HIT for session {search_session_id[:8]}... ({len(cached.get('results', []))} results)")
+    else:
+        logger.info(f"Cache MISS for session {search_session_id[:8] if search_session_id else 'None'}...")
+    return cached
+
+def cache_search_results(search_session_id: str, results: List[Dict], query_params: Dict):
+    """
+    Cache search results with session ID.
+    """
+    cache_data = {
+        "results": results,
+        "query_params": query_params,
+        "timestamp": time.time()
+    }
+    search_result_cache[search_session_id] = cache_data
+    logger.info(f"Cached {len(results)} results for session {search_session_id[:8]}...")
+
+def extract_batch_from_results(results: List[Dict], cursor: Optional[Dict], batch_size: int) -> Tuple[List[Dict], Optional[str], bool]:
+    """
+    Extract a batch of results starting from cursor position.
+    
+    Args:
+        results: Full list of search results
+        cursor: Decoded cursor dict with {id, score, index}
+        batch_size: Number of results to return
+    
+    Returns:
+        Tuple of (batch_results, next_cursor_str, has_more)
+    """
+    if not results:
+        return [], None, False
+    
+    # Determine starting index
+    start_index = 0
+    if cursor and 'index' in cursor:
+        start_index = cursor['index'] + 1  # Start after the cursor position
+    
+    # Extract batch
+    end_index = min(start_index + batch_size, len(results))
+    batch = results[start_index:end_index]
+    
+    # Determine if there are more results
+    has_more = end_index < len(results)
+    
+    # Create next cursor if there are more results
+    next_cursor = None
+    if has_more and batch:
+        last_result = batch[-1]
+        # Use the index in the full results list (end_index - 1)
+        next_cursor = encode_cursor(
+            segment_id=last_result.get('id', ''),
+            score=last_result.get('score', 0.0),
+            index=end_index - 1
+        )
+    
+    logger.info(f"Batch extracted: start={start_index}, end={end_index}, size={len(batch)}, has_more={has_more}")
+    return batch, next_cursor, has_more
 
 # ============== ADVANCED EMBEDDING FUNCTIONS ==============
 
@@ -4130,6 +4258,166 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
             for r in final_results
         ]
     }
+
+@app.post("/search/incremental")
+async def search_incremental(data: IncrementalSearchRequest, authorized: bool = Depends(verify_api_key)):
+    """
+    INCREMENTAL CURSOR-BASED SEARCH for fast pagination.
+    
+    First request (no cursor):
+      - Executes full search using existing multi-strategy search
+      - Generates search_session_id (UUID)
+      - Caches all results for 30 minutes
+      - Returns first batch_size results with cursor
+    
+    Subsequent requests (with cursor):
+      - Retrieves cached results using search_session_id
+      - Extracts next batch starting from cursor position
+      - Returns batch with next cursor
+    
+    Returns:
+      {
+        "success": true,
+        "results": [...],  # batch of results
+        "cursor": {
+          "next": "base64_cursor_string",  # null if no more results
+          "has_more": bool,
+          "total_available": int
+        },
+        "search_session_id": "uuid",
+        "metadata": {...}
+      }
+    """
+    start_time = time.time()
+    
+    # Extract parameters
+    search_session_id = data.search_session_id
+    cursor_str = data.cursor
+    batch_size = data.batch_size
+    
+    # Decode cursor
+    cursor = decode_cursor(cursor_str)
+    
+    # Try to get cached results
+    cached_data = get_cached_results(search_session_id) if search_session_id else None
+    
+    if cached_data:
+        # ═══════════════════════════════════════════════════════════════════════════
+        # CACHED RESULTS PATH - Fast batch extraction from cache
+        # ═══════════════════════════════════════════════════════════════════════════
+        logger.info(f"[INCREMENTAL SEARCH] Using cached results for session {search_session_id[:8]}...")
+        
+        all_results = cached_data.get("results", [])
+        query_params = cached_data.get("query_params", {})
+        
+        # Extract batch from cached results
+        batch, next_cursor, has_more = extract_batch_from_results(all_results, cursor, batch_size)
+        
+        elapsed = time.time() - start_time
+        
+        return {
+            "success": True,
+            "results": batch,
+            "cursor": {
+                "next": next_cursor,
+                "has_more": has_more,
+                "total_available": len(all_results)
+            },
+            "search_session_id": search_session_id,
+            "metadata": {
+                "elapsed_seconds": round(elapsed, 3),
+                "cache_hit": True,
+                "batch_size": len(batch),
+                "batch_start": cursor.get("index", -1) + 1 if cursor else 0,
+                "query": query_params.get("query", "")
+            }
+        }
+    
+    else:
+        # ═══════════════════════════════════════════════════════════════════════════
+        # FIRST REQUEST PATH - Execute full search and cache results
+        # ═══════════════════════════════════════════════════════════════════════════
+        
+        # Generate new search session ID
+        if not search_session_id:
+            search_session_id = str(uuid.uuid4())
+        
+        logger.info(f"[INCREMENTAL SEARCH] Executing new search for session {search_session_id[:8]}...")
+        
+        # Convert IncrementalSearchRequest to SearchRequest parameters
+        # We'll execute the full search logic inline (calling the search function would be cleaner
+        # but requires refactoring - for now, we'll call the existing search endpoint logic)
+        
+        # Create a SearchRequest object
+        search_request = SearchRequest(
+            query=data.query,
+            words=data.words,
+            word=data.word,
+            top_k=500,  # Get more results for caching (will be limited by max_scanned)
+            video_id=data.video_id,
+            speaker=data.speaker,
+            title=data.title,
+            language=data.language,
+            min_score=data.min_score,
+            time_range=data.time_range,
+            max_scanned=data.max_scanned,
+            search_mode=data.search_mode,
+            filter_type=data.filter_type,
+            filter_year=data.filter_year,
+            filter_month=data.filter_month,
+            filter_date=data.filter_date
+        )
+        
+        # Execute the main search (reuse existing search logic)
+        try:
+            search_response = await search(search_request, authorized=True)
+            
+            # Extract results from search response
+            all_results = search_response.get("results", [])
+            
+            # Cache the results
+            query_params = {
+                "query": data.query,
+                "speaker": data.speaker,
+                "title": data.title,
+                "video_id": data.video_id,
+                "language": data.language,
+                "search_mode": data.search_mode,
+                "filter_type": data.filter_type
+            }
+            cache_search_results(search_session_id, all_results, query_params)
+            
+            # Extract first batch
+            batch, next_cursor, has_more = extract_batch_from_results(all_results, None, batch_size)
+            
+            elapsed = time.time() - start_time
+            
+            return {
+                "success": True,
+                "results": batch,
+                "cursor": {
+                    "next": next_cursor,
+                    "has_more": has_more,
+                    "total_available": len(all_results)
+                },
+                "search_session_id": search_session_id,
+                "metadata": {
+                    "elapsed_seconds": round(elapsed, 3),
+                    "cache_hit": False,
+                    "batch_size": len(batch),
+                    "batch_start": 0,
+                    "query": data.query,
+                    "total_found": search_response.get("total_found", 0),
+                    "search_mode": data.search_mode
+                }
+            }
+            
+        except Exception as e:
+            logger.error(f"Incremental search failed: {str(e)}")
+            raise HTTPException(
+                status_code=500,
+                detail=f"Search execution failed: {str(e)}"
+            )
     
 @app.post("/search-by-title")
 async def search_by_title(data: TitleSearchRequest, authorized: bool = Depends(verify_api_key)):
