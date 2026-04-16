@@ -24,6 +24,9 @@ COPY start.sh .
 # Make startup script executable
 RUN chmod +x start.sh
 
+# Pre-download FastEmbed model during build to avoid slow startup and HuggingFace rate limits at runtime
+RUN python -c "from fastembed import TextEmbedding; model = TextEmbedding(model_name='BAAI/bge-small-en-v1.5'); list(model.embed(['warmup'])); print('FastEmbed model pre-downloaded successfully')"
+
 # Create non-root user for security
 RUN useradd -m -u 1000 appuser && chown -R appuser:appuser /app
 USER appuser

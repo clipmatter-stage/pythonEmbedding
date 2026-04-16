@@ -495,16 +495,20 @@ search_result_cache = TTLCache(maxsize=1000, ttl=1800)  # 30 minutes
 FASTEMBED_MODEL_NAME = os.getenv("FASTEMBED_MODEL", "BAAI/bge-small-en-v1.5")
 FASTEMBED_DIMENSION = 384  # Dimension for bge-small-en-v1.5
 
-logger.info(f"Loading FastEmbed model: {FASTEMBED_MODEL_NAME}...")
-fastembed_model = TextEmbedding(model_name=FASTEMBED_MODEL_NAME)
-logger.info("FastEmbed model loaded successfully")
+# Lazy-loaded to avoid blocking startup; initialized on first use
+_fastembed_model = None
 
-logger.info("Warming up FastEmbed model...")
-_ = list(fastembed_model.embed(["warmup text"]))
-logger.info("FastEmbed model warmed up and ready")
-
-# Reference for fallback in get_openai_embedding
-_fallback_model = fastembed_model
+def get_fastembed_model() -> TextEmbedding:
+    """Return the FastEmbed model, initializing it on first call."""
+    global _fastembed_model
+    if _fastembed_model is None:
+        logger.info(f"Loading FastEmbed model: {FASTEMBED_MODEL_NAME}...")
+        _fastembed_model = TextEmbedding(model_name=FASTEMBED_MODEL_NAME)
+        logger.info("FastEmbed model loaded successfully")
+        logger.info("Warming up FastEmbed model...")
+        _ = list(_fastembed_model.embed(["warmup text"]))
+        logger.info("FastEmbed model warmed up and ready")
+    return _fastembed_model
 
 # ============== CURSOR-BASED PAGINATION FUNCTIONS ==============
 
@@ -1164,7 +1168,7 @@ def get_cached_embedding(text: str) -> List[float]:
             embedding_cache[cache_key] = get_openai_embedding(text)
         else:
             logger.info("Using FastEmbed for query embedding")
-            result = list(fastembed_model.embed([text]))
+            result = list(get_fastembed_model().embed([text]))
             embedding_cache[cache_key] = result[0].tolist() if hasattr(result[0], 'tolist') else list(result[0])
     return embedding_cache[cache_key]
 
@@ -1765,7 +1769,7 @@ async def embed_video(data: EmbedVideoRequest, authorized: bool = Depends(verify
             vectors = get_openai_embeddings_batch(texts_to_embed)
         else:
             logger.info("Using FastEmbed for batch embedding")
-            results_list = list(fastembed_model.embed(texts_to_embed))
+            results_list = list(get_fastembed_model().embed(texts_to_embed))
             vectors = [r.tolist() if hasattr(r, 'tolist') else list(r) for r in results_list]
         
         # GENERATE LLM ENGLISH SUMMARIES for non-English segments (bilingual bridge)
@@ -1921,7 +1925,7 @@ async def embed(data: dict):
         raise HTTPException(status_code=400, detail="Text is required")
     
     # Use FastEmbed for legacy endpoint
-    result = list(fastembed_model.embed([text]))
+    result = list(get_fastembed_model().embed([text]))
     vector = result[0].tolist() if hasattr(result[0], 'tolist') else list(result[0])
     vector_id = f"video_{video_id}_{uuid.uuid4()}" if video_id else str(uuid.uuid4())
 
@@ -4744,7 +4748,7 @@ async def re_embed_all(authorized: bool = Depends(verify_api_key)):
                 if USE_OPENAI_EMBEDDINGS and openai_client:
                     vectors = get_openai_embeddings_batch(texts_to_embed)
                 else:
-                    results_list = list(fastembed_model.embed(texts_to_embed))
+                    results_list = list(get_fastembed_model().embed(texts_to_embed))
                     vectors = [r.tolist() if hasattr(r, 'tolist') else list(r) for r in results_list]
                 
                 # Generate English summaries for non-English content
