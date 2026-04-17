@@ -2713,6 +2713,17 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                         unique_videos = len(set(r["video_id"] for r in simple_results if r.get("video_id")))
                         logger.info(f"[SIMPLE SEARCH POST-RERANK] {len(simple_results)} results from {unique_videos} videos")
 
+            # ── APPLY TOP_K LIMIT with safety cap ──
+            # Cap results to prevent overwhelming the frontend
+            # Safety cap: max 500 results even if user requests more
+            MAX_RESULTS_SIMPLE = 500
+            effective_top_k = min(top_k, MAX_RESULTS_SIMPLE)
+            total_results = len(simple_results)
+            simple_results = simple_results[:effective_top_k]
+            
+            if total_results > effective_top_k:
+                logger.info(f"[SIMPLE SEARCH] Limiting results from {total_results} to {effective_top_k} (top_k={top_k}, max={MAX_RESULTS_SIMPLE})")
+            
             return {
                 "query": query_text,
                 "words": words,
@@ -2720,14 +2731,14 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                 "collection": SEGMENTS_COLLECTION,
                 "search_mode": "simple",
                 "filter_type": filter_type,
-                "total_speaker_hits": len(simple_results) if filter_type == "speaker" else 0,
+                "total_speaker_hits": total_results if filter_type == "speaker" else 0,
                 "total_semantic_hits": 0,
                 "total_keyword_hits": 0,
-                "total_title_hits": len(simple_results) if filter_type == "title" else 0,
-                "total_text_hits": len(simple_results) if filter_type == "text" else 0,
+                "total_title_hits": total_results if filter_type == "title" else 0,
+                "total_text_hits": total_results if filter_type == "text" else 0,
                 "total_exact_phrase_hits": 0,
                 "returned": len(simple_results),
-                "unique_videos": unique_videos,
+                "unique_videos": len(set(r["video_id"] for r in simple_results if r.get("video_id"))),
                 "filters_applied": {
                     "filter_type": filter_type,
                     "video_id": video_id_filter,
