@@ -3101,6 +3101,7 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                     diar_spk = payload.get("diarization_speaker", "")
                     speaker_combined = f"{spk} {diar_spk}".strip()
                     video_title = payload.get("video_title", "")
+                    text = payload.get("text", "")
                     
                     # Fuzzy match speaker name against speaker fields
                     if not fuzzy_match_speaker(speaker_filter, speaker_combined, threshold=70):
@@ -3109,6 +3110,26 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                     # Apply title filter if present
                     if title_filter and not fuzzy_match_text(title_filter, video_title, threshold=60):
                         continue
+                    
+                    # CRITICAL FIX: When both speaker filter AND query are present (parallel search),
+                    # speaker results MUST also match the query text to be included.
+                    # This prevents showing irrelevant videos like "Hafiz Naeem podcast" when searching "00089"
+                    if speaker_parallel_search and query_text:
+                        query_normalized = normalize_for_matching(query_text)
+                        text_normalized = normalize_for_matching(text)
+                        title_normalized = normalize_for_matching(video_title)
+                        
+                        # Check if query appears in text OR title (fuzzy or exact)
+                        query_in_text = (
+                            whole_phrase_match(query_normalized, text_normalized) or
+                            fuzzy_match_text(query_text, text, threshold=65) or
+                            whole_phrase_match(query_normalized, title_normalized) or
+                            fuzzy_match_text(query_text, video_title, threshold=65)
+                        )
+                        
+                        if not query_in_text:
+                            # Query doesn't appear in this segment - skip it
+                            continue
                     
                     # Calculate score based on speaker match quality
                     match_score = fuzz.ratio(speaker_filter.lower(), speaker_combined.lower()) / 100
