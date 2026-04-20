@@ -510,6 +510,14 @@ def get_fastembed_model() -> TextEmbedding:
         logger.info("FastEmbed model warmed up and ready")
     return _fastembed_model
 
+def get_fastembed_embedding(text: str) -> List[float]:
+    """Get a single embedding using FastEmbed (lightweight fallback)."""
+    model = get_fastembed_model()
+    embeddings = list(model.embed(text))
+    if embeddings:
+        return embeddings[0]
+    return []
+
 # ============== CURSOR-BASED PAGINATION FUNCTIONS ==============
 
 import base64
@@ -694,15 +702,21 @@ def get_openai_embedding(text: str, model_name: str = None) -> List[float]:
     """
     Get embedding from OpenAI API with advanced text-embedding-3 models.
     These models provide significantly better semantic understanding.
+    Falls back to FastEmbed on OpenAI failure.
     """
     if not openai_client:
-        raise ValueError("OpenAI client not initialized")
+        logger.warning("OpenAI client not initialized, falling back to FastEmbed")
+        return get_fastembed_embedding(text)
     
     model_name = model_name or OPENAI_EMBEDDING_MODEL
     
     try:
-        # Replace newlines to avoid API issues
+        # Replace newlines and limit text to ~7500 tokens (roughly 30KB)
+        # to avoid token limit errors
         text = text.replace("\n", " ").strip()
+        if len(text) > 30000:
+            logger.warning(f"Text truncated from {len(text)} to 30000 chars for embedding")
+            text = text[:30000]
         
         response = openai_client.embeddings.create(
             input=text,
@@ -712,23 +726,37 @@ def get_openai_embedding(text: str, model_name: str = None) -> List[float]:
         
         return response.data[0].embedding
     except Exception as e:
-        logger.error(f"OpenAI embedding error: {str(e)}")
-        # No fallback - FastEmbed produces 384-dim vectors which fail on 3072-dim collection
-        raise
+        logger.error(f"OpenAI embedding error: {str(e)}. Falling back to FastEmbed")
+        # Fallback to FastEmbed on any OpenAI failure
+        try:
+            embedding = get_fastembed_embedding(text)
+            # Pad FastEmbed 384-dim to 3072-dim to match collection schema
+            return embedding + [0.0] * (EMBEDDING_DIMENSION - len(embedding))
+        except Exception as fallback_error:
+            logger.error(f"FastEmbed fallback also failed: {str(fallback_error)}")
+            raise
 
 def get_openai_embeddings_batch(texts: List[str], model_name: str = None) -> List[List[float]]:
     """
     Get embeddings for multiple texts using OpenAI API.
     Handles sub-batching for large inputs (API limit is 2048 inputs per call).
+    Falls back to FastEmbed on OpenAI failure.
     """
     if not openai_client:
-        raise ValueError("OpenAI client not initialized")
+        logger.warning("OpenAI client not initialized, falling back to FastEmbed batch")
+        return [get_fastembed_embedding(text) for text in texts]
     
     model_name = model_name or OPENAI_EMBEDDING_MODEL
     
     try:
-        # Clean texts
-        cleaned_texts = [text.replace("\n", " ").strip() for text in texts]
+        # Clean texts and truncate to prevent token limit errors
+        cleaned_texts = []
+        for text in texts:
+            text = text.replace("\n", " ").strip()
+            if len(text) > 30000:
+                logger.warning(f"Text truncated from {len(text)} to 30000 chars")
+                text = text[:30000]
+            cleaned_texts.append(text)
         
         # Sub-batch for OpenAI API token limit (max 300,000 tokens per request)
         # Some videos have very long segments (10K+ tokens), so use small batches
@@ -752,9 +780,19 @@ def get_openai_embeddings_batch(texts: List[str], model_name: str = None) -> Lis
         
         return all_embeddings
     except Exception as e:
-        logger.error(f"OpenAI batch embedding error: {str(e)}")
-        # No fallback - FastEmbed produces 384-dim vectors which fail on 3072-dim collection
-        raise
+        logger.error(f"OpenAI batch embedding error: {str(e)}. Falling back to FastEmbed")
+        # Fallback to FastEmbed on any OpenAI failure
+        try:
+            embeddings = []
+            for text in texts:
+                embedding = get_fastembed_embedding(text)
+                # Pad FastEmbed 384-dim to 3072-dim to match collection schema
+                padded = embedding + [0.0] * (EMBEDDING_DIMENSION - len(embedding))
+                embeddings.append(padded)
+            return embeddings
+        except Exception as fallback_error:
+            logger.error(f"FastEmbed batch fallback also failed: {str(fallback_error)}")
+            raise
 
 def expand_query_with_gpt(query: str) -> List[str]:
     """
@@ -833,7 +871,8 @@ Query: "what did Imran Khan say about economy"
             ],
             max_tokens=300,
             temperature=0.1,
-            response_format={"type": "json_object"}
+            response_format={"type": "json_object"},
+            timeout=8.0  # Hard cap: don't block the search pipeline more than 8s
         )
         
         result = json_module.loads(response.choices[0].message.content.strip())
@@ -910,7 +949,8 @@ If searching for a person/topic not in the database, all results will be off-top
             ],
             max_tokens=300,
             temperature=0.0,
-            response_format={"type": "json_object"}
+            response_format={"type": "json_object"},
+            timeout=8.0  # Hard cap: skip validation rather than block the response
         )
         
         result = json_module.loads(response.choices[0].message.content.strip())
@@ -993,7 +1033,8 @@ Be VERY strict. Most results should get low scores if they don't match the query
             ],
             max_tokens=500,
             temperature=0.0,
-            response_format={"type": "json_object"}
+            response_format={"type": "json_object"},
+            timeout=15.0  # Hard cap: return unranked results if reranking is too slow
         )
         
         llm_result = json_module.loads(response.choices[0].message.content.strip())
@@ -4080,7 +4121,9 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
     # Skip reranking for small result sets (not worth the latency) or when we have good matches
     # Protect title-matched and exact-phrase-matched results: they should keep a minimum score floor
     has_high_confidence_results = any(r.get("score", 0) >= 0.8 for r in merged_list[:5])
-    should_rerank = use_reranking and query_text and len(query_text.split()) > 1 and len(merged_list) >= 15 and not has_high_confidence_results
+    # Skip reranking for small top_k (incremental first-page requests use top_k=20)
+    # Reranking 20 results with LLM adds 20-30s latency — not worth it for first page
+    should_rerank = use_reranking and query_text and len(query_text.split()) > 1 and len(merged_list) >= 15 and not has_high_confidence_results and top_k > 20
     
     if should_rerank:
         logger.info(f"Applying LLM reranking to {len(merged_list)} results...")
