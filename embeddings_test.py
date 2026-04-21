@@ -619,7 +619,12 @@ def decode_cursor(cursor_str: Optional[str]) -> Optional[Dict]:
         return None
     
     try:
-        cursor_json = base64.b64decode(cursor_str.encode('utf-8')).decode('utf-8')
+        normalized_cursor = cursor_str.replace('-', '+').replace('_', '/')
+        remainder = len(normalized_cursor) % 4
+        if remainder:
+            normalized_cursor += '=' * (4 - remainder)
+
+        cursor_json = base64.b64decode(normalized_cursor.encode('utf-8')).decode('utf-8')
         cursor_data = json_module.loads(cursor_json)
         return cursor_data
     except Exception as e:
