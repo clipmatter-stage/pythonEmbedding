@@ -4787,6 +4787,8 @@ async def search_incremental(data: IncrementalSearchRequest, authorized: bool = 
             filter_month=data.filter_month,
             filter_date=data.filter_date
         )
+
+        logger.info(f"[SEARCH REQUEST] Created search request: {search_request}")
         
         # Execute the main search (reuse existing search logic)
         try:
@@ -4795,6 +4797,7 @@ async def search_incremental(data: IncrementalSearchRequest, authorized: bool = 
             
             # Extract results from search response
             all_results = search_response.get("results", [])
+            logger.info(f"[FIRST SEARCH] Extracted {len(all_results)} results")
             top_k_used = initial_top_k
             
             # Cache the results with top_k tracking
