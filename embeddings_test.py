@@ -4584,17 +4584,16 @@ async def search_incremental(data: IncrementalSearchRequest, authorized: bool = 
       }
     """
     start_time = time.time()
-    
+
     # Extract parameters
     search_session_id = data.search_session_id
     cursor_str = data.cursor
     batch_size = data.batch_size
-    
+
     # Decode cursor
     cursor = decode_cursor(cursor_str)
 
-    # Recover/normalize session ID from cursor (backward-compatible optimization).
-    # If request session_id conflicts with cursor session_id, cursor wins.
+    # Recover/normalize session ID from cursor.
     cursor_session_id = str(cursor.get("search_session_id")) if cursor and cursor.get("search_session_id") else None
     if cursor_session_id:
         if search_session_id and search_session_id != cursor_session_id:
@@ -4607,103 +4606,38 @@ async def search_incremental(data: IncrementalSearchRequest, authorized: bool = 
             search_session_id = cursor_session_id
             logger.info(f"[INCREMENTAL SEARCH] Recovered session from cursor: {search_session_id[:8]}...")
 
-    # If cursor is present but session is still missing, treat as fresh search.
-    # Using a cursor without session would otherwise force expensive re-search loops.
+    # If cursor is present but session is missing, treat as fresh search.
     if cursor_str and not search_session_id:
         logger.warning("[INCREMENTAL SEARCH] Cursor provided without search_session_id; treating as new search request")
         cursor = None
-    
+
     # Try to get cached results
     cached_data = get_cached_results(search_session_id) if search_session_id else None
-    
+
     if cached_data:
-        # ═══════════════════════════════════════════════════════════════════════════
-        # CACHED RESULTS PATH - Check if cache has enough, else expand query
-        # ═══════════════════════════════════════════════════════════════════════════
-        
         all_results = cached_data.get("results", [])
         query_params = cached_data.get("query_params", {})
-        top_k_used = cached_data.get("top_k_used", 20)
-        
-        # Calculate if cache has enough results for this batch
-        cursor_index = cursor.get("index", -1) if cursor else -1
-        needed_index = cursor_index + batch_size * 3  # Heuristic: need ~3x batch_size results ahead
-        
-        # If cache doesn't have enough results, expand query
-        if needed_index >= len(all_results) and len(all_results) >= top_k_used * 0.9:
-            # We've consumed most of cached results - query for more
-            new_top_k = min(top_k_used + 30, 200)  # Increase by 30, max 200
-            expansion_max_scanned = min(data.max_scanned, 4000)
-            
-            logger.info(
-                f"[INCREMENTAL SEARCH] Cache insufficient (has {len(all_results)}, need ~{needed_index}). "
-                f"Expanding query from top_k={top_k_used} to {new_top_k} with max_scanned={expansion_max_scanned}..."
-            )
-            
-            # Execute expanded search
-            search_request = SearchRequest(
-                query=data.query,
-                words=data.words,
-                word=data.word,
-                top_k=new_top_k,
-                video_id=data.video_id,
-                speaker=data.speaker,
-                title=data.title,
-                language=data.language,
-                min_score=data.min_score,
-                time_range=data.time_range,
-                max_scanned=expansion_max_scanned,
-                search_mode=data.search_mode,
-                filter_type=data.filter_type,
-                filter_year=data.filter_year,
-                filter_month=data.filter_month,
-                filter_date=data.filter_date
-            )
-            
-            try:
-                search_response = await search(search_request, authorized=True)
-                all_results = search_response.get("results", [])
-                
-                # Update cache with expanded results
-                cache_search_results(search_session_id, all_results, query_params, new_top_k)
-                top_k_used = new_top_k
-                
-                logger.info(f"[INCREMENTAL SEARCH] Cache expanded: now {len(all_results)} results (top_k={new_top_k})")
-            except Exception as e:
-                logger.error(f"Failed to expand cache: {str(e)}")
-                # Fall back to existing cached results
-        else:
-            logger.info(f"[INCREMENTAL SEARCH] Using cached results for session {search_session_id[:8]} (has {len(all_results)} results)...")
-        
-        # Extract batch from cached results
+        top_k_used = cached_data.get("top_k_used", len(all_results))
+
+        logger.info(f"[INCREMENTAL SEARCH] Using cached results for session {search_session_id[:8]} (has {len(all_results)} results)...")
+
         batch, next_cursor, has_more = extract_batch_from_results(
             all_results,
             cursor,
             batch_size,
             search_session_id=search_session_id
         )
-        next_cursor, has_more, expansion_pending = maybe_mark_expandable_boundary(
-            batch=batch,
-            next_cursor=next_cursor,
-            has_more=has_more,
-            all_results=all_results,
-            top_k_used=top_k_used,
-            search_session_id=search_session_id,
-            max_top_k=200
-        )
-        
-        # Calculate total unique videos in cached results (for frontend display)
-        unique_video_ids_in_cache = len(set(r.get('video_id') for r in all_results if r.get('video_id')))
-        
+
+        unique_video_ids_in_cache = len(set(r.get("video_id") for r in all_results if r.get("video_id")))
         elapsed = time.time() - start_time
-        
+
         return {
             "success": True,
             "results": batch,
             "cursor": {
                 "next": next_cursor,
                 "has_more": has_more,
-                "total_available": unique_video_ids_in_cache  # FIXED: count unique videos, not segments
+                "total_available": unique_video_ids_in_cache
             },
             "search_session_id": search_session_id,
             "metadata": {
@@ -4713,201 +4647,181 @@ async def search_incremental(data: IncrementalSearchRequest, authorized: bool = 
                 "batch_start": cursor.get("index", -1) + 1 if cursor else 0,
                 "query": query_params.get("query", ""),
                 "top_k_used": top_k_used,
-                "expansion_pending": expansion_pending,
+                "expansion_pending": False,
                 "total_segments_cached": len(all_results),
-                "total_videos_cached": unique_video_ids_in_cache
+                "total_videos_cached": unique_video_ids_in_cache,
+                "fast_path": True
             }
         }
-    
-    else:
-        # ═══════════════════════════════════════════════════════════════════════════
-        # FIRST REQUEST PATH - Execute full search and cache results
-        # ═══════════════════════════════════════════════════════════════════════════
-        
-        # Generate new search session ID
-        if not search_session_id:
-            search_session_id = str(uuid.uuid4())
-        
-        logger.info(f"[INCREMENTAL SEARCH] Executing new search for session {search_session_id[:8]}...")
-        
-        # Convert IncrementalSearchRequest to SearchRequest parameters
-        # We'll execute the full search logic inline (calling the search function would be cleaner
-        # but requires refactoring - for now, we'll call the existing search endpoint logic)
-        
-        # Create a SearchRequest object with SMALL top_k for fast initial response.
-        # If we have a cursor but cache is missing (multi-replica scenario), recover by
-        # querying deeper and resuming from cursor index instead of replaying page 1.
-        cursor_index = int(cursor.get("index", -1)) if cursor and cursor.get("index") is not None else -1
-        cursor_recovery_mode = cursor is not None and cursor_index >= 0
 
-        initial_top_k = 20  # default first-page size
-        if cursor_recovery_mode:
-            needed_top_k = cursor_index + (batch_size * 3) + 1
-            initial_top_k = min(max(50, needed_top_k), 200)
-            logger.info(
-                f"[INCREMENTAL SEARCH] Cache miss with cursor recovery: index={cursor_index}, "
-                f"batch_size={batch_size}, top_k={initial_top_k}"
-            )
+    # ═══════════════════════════════════════════════════════════════════════════
+    # FIRST REQUEST PATH - FAST FLOW ONLY
+    #   1) Generate embedding once
+    #   2) Run one Qdrant vector query
+    #   3) Return/cached results for pagination
+    # ═══════════════════════════════════════════════════════════════════════════
+    if not search_session_id:
+        search_session_id = str(uuid.uuid4())
 
-        # Cap scan budget for first page so incremental mode stays responsive.
-        # Full-depth scanning can be expanded progressively on later cursor calls.
-        query_text = (data.query or "").strip()
-        query_word_count = len([w for w in query_text.split() if w.strip()])
-        has_alias = bool(detect_person_alias(query_text) or detect_person_alias(data.speaker or ""))
-        if cursor_recovery_mode:
-            initial_max_scanned = min(data.max_scanned, 4000)
-        elif has_alias:
-            initial_max_scanned = min(data.max_scanned, 2500)
-        elif query_word_count <= 2:
-            initial_max_scanned = min(data.max_scanned, 1800)
-        else:
-            initial_max_scanned = min(data.max_scanned, 3000)
+    logger.info(f"[INCREMENTAL SEARCH] Executing FAST search for session {search_session_id[:8]}...")
 
-        logger.info(
-            f"[INCREMENTAL SEARCH] First-page scan cap: requested={data.max_scanned}, "
-            f"effective={initial_max_scanned}, words={query_word_count}, alias={has_alias}, "
-            f"cursor_recovery={cursor_recovery_mode}"
+    # Build a single semantic query from query/words.
+    query_text = (data.query or "").strip()
+    if not query_text and data.words:
+        query_text = " ".join(w for w in data.words if isinstance(w, str) and w.strip()).strip()
+
+    if not query_text:
+        raise HTTPException(
+            status_code=400,
+            detail="Either 'query' or non-empty 'words' is required for incremental search"
         )
 
-        search_request = SearchRequest(
-            query=data.query,
-            words=data.words,
-            word=data.word,
-            top_k=initial_top_k,  # FAST: Query only 20 instead of 200
-            video_id=data.video_id,
-            speaker=data.speaker,
-            title=data.title,
-            language=data.language,
-            min_score=data.min_score,
-            time_range=data.time_range,
-            max_scanned=initial_max_scanned,
-            search_mode=data.search_mode,
-            filter_type=data.filter_type,
-            filter_year=data.filter_year,
-            filter_month=data.filter_month,
-            filter_date=data.filter_date
-        )
+    # Cursor recovery on cache miss: fetch deeper in one call.
+    cursor_index = int(cursor.get("index", -1)) if cursor and cursor.get("index") is not None else -1
+    cursor_recovery_mode = cursor is not None and cursor_index >= 0
 
-        logger.info(f"[SEARCH REQUEST] Created search request: {search_request}")
-        
-        # Execute the main search (reuse existing search logic)
-        try:
-            search_response = await search(search_request, authorized=True)
-            total_found = search_response.get("total_found", 0)
-            
-            # Extract results from search response
-            all_results = search_response.get("results", [])
-            logger.info(f"[FIRST SEARCH] Extracted {len(all_results)} results")
-            top_k_used = initial_top_k
-            
-            # Cache the results with top_k tracking
-            query_params = {
-                "query": data.query,
-                "speaker": data.speaker,
-                "title": data.title,
-                "video_id": data.video_id,
-                "language": data.language,
-                "search_mode": data.search_mode,
-                "filter_type": data.filter_type
-            }
-            cache_search_results(search_session_id, all_results, query_params, top_k_used)
+    initial_top_k = max(20, batch_size * 4)
+    if data.speaker or data.title:
+        initial_top_k = max(initial_top_k, 60)  # extra headroom for post-filtering
+    if cursor_recovery_mode:
+        initial_top_k = max(initial_top_k, cursor_index + (batch_size * 3) + 1)
+    initial_top_k = min(initial_top_k, 200)
 
-            # Extract batch. On cursor recovery, resume from cursor position.
-            extraction_cursor = cursor if cursor_recovery_mode else None
-            batch, next_cursor, has_more = extract_batch_from_results(
-                all_results,
-                extraction_cursor,
-                batch_size,
-                search_session_id=search_session_id
-            )
+    # Build exact filters for one query.
+    filter_conditions = []
+    if data.video_id is not None:
+        filter_conditions.append(FieldCondition(key="video_id", match=MatchValue(value=data.video_id)))
+    if data.language:
+        filter_conditions.append(FieldCondition(key="language", match=MatchValue(value=data.language)))
+    if data.time_range:
+        start_time_filter = data.time_range.get("start")
+        end_time_filter = data.time_range.get("end")
+        if start_time_filter is not None:
+            filter_conditions.append(FieldCondition(key="start_time", range=models.Range(gte=start_time_filter)))
+        if end_time_filter is not None:
+            filter_conditions.append(FieldCondition(key="end_time", range=models.Range(lte=end_time_filter)))
+    search_filter = Filter(must=filter_conditions) if filter_conditions else None
 
-            # If we resumed from cursor but got no batch, try one deeper expansion once.
-            if cursor_recovery_mode and not batch and top_k_used < 200:
-                recovery_top_k = min(max(top_k_used + 30, cursor_index + (batch_size * 3) + 1), 200)
-                if recovery_top_k > top_k_used:
-                    logger.info(
-                        f"[INCREMENTAL SEARCH] Cursor recovery expansion: top_k {top_k_used} -> {recovery_top_k}"
-                    )
-                    recovery_request = SearchRequest(
-                        query=data.query,
-                        words=data.words,
-                        word=data.word,
-                        top_k=recovery_top_k,
-                        video_id=data.video_id,
-                        speaker=data.speaker,
-                        title=data.title,
-                        language=data.language,
-                        min_score=data.min_score,
-                        time_range=data.time_range,
-                        max_scanned=min(data.max_scanned, 4000),
-                        search_mode=data.search_mode,
-                        filter_type=data.filter_type,
-                        filter_year=data.filter_year,
-                        filter_month=data.filter_month,
-                        filter_date=data.filter_date
-                    )
-                    recovery_response = await search(recovery_request, authorized=True)
-                    total_found = recovery_response.get("total_found", total_found)
-                    all_results = recovery_response.get("results", [])
-                    top_k_used = recovery_top_k
-                    cache_search_results(search_session_id, all_results, query_params, top_k_used)
-                    batch, next_cursor, has_more = extract_batch_from_results(
-                        all_results,
-                        extraction_cursor,
-                        batch_size,
-                        search_session_id=search_session_id
-                    )
+    # 1) One embedding generation
+    query_vector = get_cached_embedding(query_text)
 
-            logger.info(f"[FIRST SEARCH] Extracted batch: {len(batch)} segments, {len(set(r.get('video_id') for r in batch if r.get('video_id')))} videos, has_more={has_more}")
-            
-            next_cursor, has_more, expansion_pending = maybe_mark_expandable_boundary(
-                batch=batch,
-                next_cursor=next_cursor,
-                has_more=has_more,
-                all_results=all_results,
-                top_k_used=top_k_used,
-                search_session_id=search_session_id,
-                max_top_k=200
-            )
-            
-            logger.info(f"[FIRST SEARCH] After expandability check: has_more={has_more}, expansion_pending={expansion_pending}, cursor={'present' if next_cursor else 'none'}")
-            
-            # Calculate total unique videos in cached results (for frontend display)
-            unique_video_ids_in_cache = len(set(r.get('video_id') for r in all_results if r.get('video_id')))
-            
-            elapsed = time.time() - start_time
-            
-            return {
-                "success": True,
-                "results": batch,
-                "cursor": {
-                    "next": next_cursor,
-                    "has_more": has_more,
-                    "total_available": unique_video_ids_in_cache  # FIXED: count unique videos, not segments
-                },
-                "search_session_id": search_session_id,
-                "metadata": {
-                    "elapsed_seconds": round(elapsed, 3),
-                    "cache_hit": False,
-                    "batch_size": len(batch),
-                    "batch_start": cursor_index + 1 if cursor_recovery_mode else 0,
-                    "query": data.query,
-                    "total_found": total_found,
-                    "search_mode": data.search_mode,
-                    "top_k_used": top_k_used,
-                    "expansion_pending": expansion_pending,
-                    "total_segments_cached": len(all_results),
-                    "total_videos_cached": unique_video_ids_in_cache,
-                    "cursor_recovery_mode": cursor_recovery_mode
-                }
-            }
-            
-        except Exception as e:
-            logger.error(f"Incremental search failed: {str(e)}")
-            raise HTTPException(
-                status_code=500,
-                detail=f"Search execution failed: {str(e)}"
-            )
+    # 2) One Qdrant query
+    search_params = SearchParams(hnsw_ef=64, exact=False)
+    retrieval_threshold = max(data.min_score * 0.85, 0.35)
+    sem_search_response = qdrant_client.query_points(
+        collection_name=SEGMENTS_COLLECTION,
+        query=query_vector,
+        limit=initial_top_k,
+        score_threshold=retrieval_threshold,
+        query_filter=search_filter,
+        with_payload=True,
+        with_vectors=False,
+        search_params=search_params
+    )
+
+    # 3) Return normalized results (light post-filtering only)
+    all_results = []
+    for r in sem_search_response.points:
+        payload = r.payload or {}
+        speaker = payload.get("speaker", "")
+        diarization_speaker = payload.get("diarization_speaker", "")
+        video_title = payload.get("video_title", "")
+
+        if data.speaker:
+            speaker_combined = f"{speaker} {diarization_speaker}".strip()
+            if not fuzzy_match_speaker(data.speaker, speaker_combined, threshold=70):
+                continue
+        if data.title and not fuzzy_match_text(data.title, video_title, threshold=60):
+            continue
+
+        start_val = payload.get("start_time", 0)
+        end_val = payload.get("end_time", 0)
+        all_results.append({
+            "id": r.id,
+            "segment_ids": [r.id],
+            "match_count": 1,
+            "is_exact_phrase_match": False,
+            "is_multi_match": False,
+            "matched_terms": [],
+            "score": round(float(getattr(r, "score", 0.0)), 4),
+            "match_types": ["semantic"],
+            "matched_field": "semantic_vector",
+            "fuzzy_score": 0.0,
+            "matched_words_count": 0,
+            "video_id": payload.get("video_id"),
+            "video_title": video_title,
+            "speaker": speaker,
+            "diarization_speaker": diarization_speaker,
+            "start_time": start_val,
+            "end_time": end_val,
+            "duration": round((end_val or 0) - (start_val or 0), 2),
+            "text": payload.get("text", ""),
+            "text_length": payload.get("text_length", 0),
+            "summary_en": payload.get("summary_en", ""),
+            "youtube_url": payload.get("youtube_url", ""),
+            "language": payload.get("language", ""),
+            "created_at": payload.get("created_at"),
+            "llm_relevance_score": None,
+            "youtube_url_timestamped": f"{payload.get('youtube_url', '')}?t={int(start_val or 0)}" if payload.get("youtube_url") else ""
+        })
+
+    all_results.sort(key=lambda x: (x.get("score", 0), -x.get("start_time", 0)), reverse=True)
+
+    # Cache the full retrieved set for cursor pagination.
+    query_params = {
+        "query": data.query,
+        "speaker": data.speaker,
+        "title": data.title,
+        "video_id": data.video_id,
+        "language": data.language,
+        "search_mode": data.search_mode,
+        "filter_type": data.filter_type
+    }
+    cache_search_results(search_session_id, all_results, query_params, initial_top_k)
+
+    extraction_cursor = cursor if cursor_recovery_mode else None
+    batch, next_cursor, has_more = extract_batch_from_results(
+        all_results,
+        extraction_cursor,
+        batch_size,
+        search_session_id=search_session_id
+    )
+
+    unique_video_ids_in_cache = len(set(r.get("video_id") for r in all_results if r.get("video_id")))
+    elapsed = time.time() - start_time
+
+    logger.info(
+        f"[INCREMENTAL FAST] done: query_points=1, llm_calls=0, "
+        f"cached={len(all_results)}, batch={len(batch)}, videos={unique_video_ids_in_cache}"
+    )
+
+    return {
+        "success": True,
+        "results": batch,
+        "cursor": {
+            "next": next_cursor,
+            "has_more": has_more,
+            "total_available": unique_video_ids_in_cache
+        },
+        "search_session_id": search_session_id,
+        "metadata": {
+            "elapsed_seconds": round(elapsed, 3),
+            "cache_hit": False,
+            "batch_size": len(batch),
+            "batch_start": cursor_index + 1 if cursor_recovery_mode else 0,
+            "query": data.query,
+            "total_found": len(all_results),
+            "search_mode": data.search_mode,
+            "top_k_used": initial_top_k,
+            "expansion_pending": False,
+            "total_segments_cached": len(all_results),
+            "total_videos_cached": unique_video_ids_in_cache,
+            "cursor_recovery_mode": cursor_recovery_mode,
+            "fast_path": True,
+            "llm_calls": 0,
+            "qdrant_queries": 1
+        }
+    }
     
 @app.post("/search-by-title")
 async def search_by_title(data: TitleSearchRequest, authorized: bool = Depends(verify_api_key)):
