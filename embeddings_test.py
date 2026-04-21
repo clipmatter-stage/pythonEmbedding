@@ -4676,12 +4676,31 @@ async def search_incremental(data: IncrementalSearchRequest, authorized: bool = 
             detail="Either 'query' or non-empty 'words' is required for incremental search"
         )
 
+    # Person alias support (fast-path safe): expand short aliases to canonical name once.
+    # This improves semantic recall for queries like "hnr" without adding extra queries.
+    alias_person_key = detect_person_alias(query_text) or detect_person_alias(data.speaker or "")
+    alias_speaker_variants = []
+    effective_query_text = query_text
+    effective_speaker_filter = data.speaker
+    if alias_person_key and alias_person_key in PERSON_ALIASES:
+        person_data = PERSON_ALIASES[alias_person_key]
+        canonical = person_data.get("canonical", "")
+        alias_speaker_variants = person_data.get("speaker_variants", [])
+        if canonical and canonical.lower() not in effective_query_text.lower():
+            effective_query_text = f"{effective_query_text} {canonical}".strip()
+        if effective_speaker_filter:
+            effective_speaker_filter = canonical or effective_speaker_filter
+        logger.info(
+            f"[INCREMENTAL FAST] Alias detected '{alias_person_key}': "
+            f"query expanded to '{effective_query_text[:80]}'"
+        )
+
     # Cursor recovery on cache miss: fetch deeper in one call.
     cursor_index = int(cursor.get("index", -1)) if cursor and cursor.get("index") is not None else -1
     cursor_recovery_mode = cursor is not None and cursor_index >= 0
 
     initial_top_k = max(20, batch_size * 4)
-    if data.speaker or data.title:
+    if effective_speaker_filter or data.title:
         initial_top_k = max(initial_top_k, 60)  # extra headroom for post-filtering
     if cursor_recovery_mode:
         initial_top_k = max(initial_top_k, cursor_index + (batch_size * 3) + 1)
@@ -4703,7 +4722,7 @@ async def search_incremental(data: IncrementalSearchRequest, authorized: bool = 
     search_filter = Filter(must=filter_conditions) if filter_conditions else None
 
     # 1) One embedding generation
-    query_vector = get_cached_embedding(query_text)
+    query_vector = get_cached_embedding(effective_query_text)
 
     # 2) One Qdrant query
     search_params = SearchParams(hnsw_ef=64, exact=False)
@@ -4727,9 +4746,15 @@ async def search_incremental(data: IncrementalSearchRequest, authorized: bool = 
         diarization_speaker = payload.get("diarization_speaker", "")
         video_title = payload.get("video_title", "")
 
-        if data.speaker:
+        if effective_speaker_filter:
             speaker_combined = f"{speaker} {diarization_speaker}".strip()
-            if not fuzzy_match_speaker(data.speaker, speaker_combined, threshold=70):
+            speaker_ok = fuzzy_match_speaker(effective_speaker_filter, speaker_combined, threshold=70)
+            if not speaker_ok and alias_speaker_variants:
+                speaker_ok = any(
+                    fuzzy_match_speaker(variant, speaker_combined, threshold=70)
+                    for variant in alias_speaker_variants
+                )
+            if not speaker_ok:
                 continue
         if data.title and not fuzzy_match_text(data.title, video_title, threshold=60):
             continue
@@ -4770,7 +4795,10 @@ async def search_incremental(data: IncrementalSearchRequest, authorized: bool = 
     # Cache the full retrieved set for cursor pagination.
     query_params = {
         "query": data.query,
+        "effective_query": effective_query_text,
         "speaker": data.speaker,
+        "effective_speaker": effective_speaker_filter,
+        "alias_person_key": alias_person_key,
         "title": data.title,
         "video_id": data.video_id,
         "language": data.language,
