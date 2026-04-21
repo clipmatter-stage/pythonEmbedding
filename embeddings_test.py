@@ -47,6 +47,7 @@ if not QDRANT_URL or not QDRANT_API_KEY:
 USE_OPENAI_EMBEDDINGS = os.getenv("USE_OPENAI_EMBEDDINGS", "true").lower() == "true"
 OPENAI_EMBEDDING_MODEL = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-large")  # Using large model for best quality
 EMBEDDING_DIMENSION = int(os.getenv("EMBEDDING_DIMENSION", "3072"))  # 3072 dimensions for text-embedding-3-large
+ENSURE_INDEXES_ON_STARTUP = os.getenv("ENSURE_INDEXES_ON_STARTUP", "false").lower() == "true"
 
 # ============== STOP WORDS FOR KEYWORD SEARCH ==============
 # Common words that should be filtered out to speed up keyword search
@@ -319,6 +320,77 @@ def expand_query_with_aliases(query: str) -> Tuple[str, List[str]]:
     # Keep the original query but also inject the canonical name
     expanded = f"{query} {canonical}" if canonical.lower() not in query.lower() else query
     return expanded, extra_terms
+
+
+def is_strict_person_alias_query(raw_query: str, person_key: Optional[str]) -> bool:
+    """
+    True when the ORIGINAL user query is a short known alias for a detected person
+    (e.g. "hnr"), where we should enforce tighter relevance precision.
+    """
+    if not raw_query or not person_key or person_key not in PERSON_ALIASES:
+        return False
+
+    query_words = [normalize_word(w) for w in raw_query.split() if normalize_word(w)]
+    if not query_words or len(query_words) > 2:
+        return False
+
+    normalized_query = normalize_word(raw_query)
+    alias_terms = {
+        normalize_word(a)
+        for a in PERSON_ALIASES[person_key].get("aliases", [])
+        if normalize_word(a)
+    }
+    return normalized_query in alias_terms
+
+
+def result_has_person_alias_signal(result: Dict, person_key: str) -> bool:
+    """
+    Decide if a result has a strong textual/speaker signal for the detected person.
+    Used to filter out semantically-related but wrong-person results for short aliases.
+    """
+    person = PERSON_ALIASES.get(person_key)
+    if not person:
+        return True
+
+    canonical = person.get("canonical", "")
+    speaker_text = normalize_for_matching(f"{result.get('speaker', '')} {result.get('diarization_speaker', '')}")
+    title_text = normalize_for_matching(result.get("video_title", ""))
+    body_text = normalize_for_matching((result.get("text", "") or "")[:900])
+
+    # Strongest signal: direct/fuzzy speaker name match.
+    if canonical and speaker_text and fuzzy_match_speaker(canonical, speaker_text, threshold=68):
+        return True
+
+    # Phrase-level checks (canonical + a few known variants).
+    phrase_candidates = [canonical] + person.get("speaker_variants", [])[:5]
+    seen_phrases = set()
+    normalized_phrases = []
+    for phrase in phrase_candidates:
+        p = normalize_for_matching(phrase)
+        if p and len(p) >= 5 and p not in seen_phrases:
+            seen_phrases.add(p)
+            normalized_phrases.append(p)
+
+    for phrase in normalized_phrases:
+        if whole_phrase_match(phrase, speaker_text):
+            return True
+        if whole_phrase_match(phrase, title_text):
+            return True
+        if whole_phrase_match(phrase, body_text):
+            return True
+
+    # Token-level checks as fallback.
+    canonical_tokens = [normalize_word(t) for t in canonical.split() if len(normalize_word(t)) >= 4]
+    if not canonical_tokens:
+        return False
+
+    speaker_hits = sum(1 for t in canonical_tokens if whole_word_match(t, speaker_text))
+    if speaker_hits >= 1:
+        return True
+
+    title_hits = sum(1 for t in canonical_tokens if whole_word_match(t, title_text))
+    body_hits = sum(1 for t in canonical_tokens if whole_word_match(t, body_text))
+    return (title_hits + body_hits) >= 2
 
 
 # ============== Initialize OpenAI client if enabled
@@ -1750,7 +1822,10 @@ def ensure_indexes_http():
 # Replace the old ensure_indexes call with this
 create_segments_collection()
 create_legacy_collection()
-ensure_indexes_http()  # Use HTTP version instead
+if ENSURE_INDEXES_ON_STARTUP:
+    ensure_indexes_http()  # Optional: heavy and noisy on multi-replica startups
+else:
+    logger.info("Skipping startup index creation (ENSURE_INDEXES_ON_STARTUP=false)")
 
 
 def parse_search_query(query:  str) -> Dict: 
@@ -2125,6 +2200,7 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
     Example: query="junaid" will search for "junaid" in both transcript text AND speaker names
     """
     query_text = data.query
+    raw_query_text = (query_text or "").strip()  # Preserve original user query before alias expansion
     words = data.words
     word = data.word
     top_k = data.top_k
@@ -2923,8 +2999,10 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
     use_query_expansion = os.getenv("USE_QUERY_EXPANSION", "true").lower() == "true"
     use_reranking = os.getenv("USE_RERANKING", "true").lower() == "true"
     use_llm_understanding = os.getenv("USE_LLM_UNDERSTANDING", "true").lower() == "true"
-    normalized_query = normalize_word(query_text) if query_text else ""
-    single_word_query = bool(normalized_query and len(query_text.split()) == 1 and len(normalized_query) >= 2)
+    query_source_for_length = raw_query_text or query_text or ""
+    normalized_query = normalize_word(query_source_for_length) if query_source_for_length else ""
+    single_word_query = bool(normalized_query and len(query_source_for_length.split()) == 1 and len(normalized_query) >= 2)
+    strict_alias_query = is_strict_person_alias_query(raw_query_text, alias_person_key)
     # Always enable scan strategies for known person aliases — we need speaker/keyword/title search
     is_person_alias_query = alias_person_key is not None
     use_scan_strategies = (not openai_only_search) or single_word_query or is_person_alias_query
@@ -3239,7 +3317,7 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
     # This runs BEFORE semantic search to prioritize exact transcript matches
     # When user searches "before Windows 95, 1984", we find segments with that exact text
     exact_phrase_results = []
-    if use_scan_strategies and query_text and len(query_text.strip()) >= 5:
+    if use_scan_strategies and query_text and len(query_text.strip()) >= 5 and not strict_alias_query:
         try:
             exact_phrase = normalize_for_matching(query_text.strip())
             logger.info(f"Exact phrase search for: '{exact_phrase[:60]}'")
@@ -4150,6 +4228,26 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
         ),
         reverse=True
     )
+
+    # Tighten precision for short alias queries (e.g. "hnr") so unrelated videos
+    # from broad semantic similarity don't leak into top results.
+    if strict_alias_query and alias_person_key:
+        filtered_alias_results = [
+            r for r in merged_list
+            if result_has_person_alias_signal(r, alias_person_key)
+        ]
+        if filtered_alias_results:
+            removed_count = len(merged_list) - len(filtered_alias_results)
+            merged_list = filtered_alias_results
+            logger.info(
+                f"[ALIAS PRECISION] strict alias filter applied for '{alias_person_key}': "
+                f"kept={len(merged_list)}, removed={removed_count}"
+            )
+        else:
+            logger.warning(
+                f"[ALIAS PRECISION] strict alias filter removed all results for '{alias_person_key}'; "
+                f"falling back to unfiltered merged list"
+            )
     
     # ADVANCED: Apply LLM reranking if enabled (replaces Cohere English-only reranker)
     # Skip reranking for small result sets (not worth the latency) or when we have good matches
@@ -4338,11 +4436,14 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
         # Skip validation if we have verified matches (exact phrase or title matches)
         has_verified_matches = exact_phrase_count > 0 or title_match_count > 0
         has_explicit_keyword_hits = len(keyword_results) > 0
-        skip_validation_for_short_query = query_word_count <= 1
+        skip_validation_for_short_query = query_word_count <= 1 and not strict_alias_query
+        validation_query = query_text
+        if strict_alias_query and alias_person_key:
+            validation_query = PERSON_ALIASES[alias_person_key].get("canonical", query_text)
         
         if not has_verified_matches and not has_explicit_keyword_hits and not skip_validation_for_short_query and use_reranking and openai_client:
             # Validate if top results are actually relevant to the query
-            relevance_check = validate_query_relevance(query_text, consolidated_segments[:5])
+            relevance_check = validate_query_relevance(validation_query, consolidated_segments[:5])
             
             # If ALL top results are irrelevant, return empty result set
             if not relevance_check["is_relevant"]:
@@ -4487,11 +4588,19 @@ async def search_incremental(data: IncrementalSearchRequest, authorized: bool = 
     # Decode cursor
     cursor = decode_cursor(cursor_str)
 
-    # Recover session ID from cursor (backward-compatible optimization)
-    # This allows pagination to continue even when frontend forgets to send search_session_id.
-    if not search_session_id and cursor and cursor.get("search_session_id"):
-        search_session_id = str(cursor.get("search_session_id"))
-        logger.info(f"[INCREMENTAL SEARCH] Recovered session from cursor: {search_session_id[:8]}...")
+    # Recover/normalize session ID from cursor (backward-compatible optimization).
+    # If request session_id conflicts with cursor session_id, cursor wins.
+    cursor_session_id = str(cursor.get("search_session_id")) if cursor and cursor.get("search_session_id") else None
+    if cursor_session_id:
+        if search_session_id and search_session_id != cursor_session_id:
+            logger.warning(
+                f"[INCREMENTAL SEARCH] Session mismatch: request={search_session_id[:8]}... "
+                f"cursor={cursor_session_id[:8]}...; using cursor session"
+            )
+            search_session_id = cursor_session_id
+        elif not search_session_id:
+            search_session_id = cursor_session_id
+            logger.info(f"[INCREMENTAL SEARCH] Recovered session from cursor: {search_session_id[:8]}...")
 
     # If cursor is present but session is still missing, treat as fresh search.
     # Using a cursor without session would otherwise force expensive re-search loops.
@@ -5402,6 +5511,7 @@ async def root():
             "USE_LLM_UNDERSTANDING": "true/false (default: true) - GPT-4o-mini query parsing",
             "USE_RERANKING": "true/false (default: true) - GPT-4o-mini reranking",
             "USE_QUERY_EXPANSION": "true/false (default: true) - expanded via LLM understanding",
+            "ENSURE_INDEXES_ON_STARTUP": "true/false (default: false) - create payload indexes at startup (can be noisy/slow on multi-replica deployments)",
             "FASTEMBED_MODEL": "FastEmbed model name (default: BAAI/bge-small-en-v1.5)",
             "EMBEDDING_DIMENSION": "3072 for OpenAI large, 1536 for small",
         },
