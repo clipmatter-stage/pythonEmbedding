@@ -637,7 +637,7 @@ def extract_batch_from_results(results: List[Dict], cursor: Optional[Dict], batc
             index=end_index
         )
     
-    logger.info(f"Batch extracted: start={start_index}, end={end_index + 1}, segments={len(batch)}, unique_videos={len(unique_video_ids)}, has_more={has_more}")
+    logger.info(f"[BATCH EXTRACTION] start={start_index}, end={end_index}, total_results={len(results)}, segments_extracted={len(batch)}, unique_videos={len(unique_video_ids)}, requested_batch_size={batch_size}, has_more={has_more}")
     return batch, next_cursor, has_more
 
 def can_expand_incremental_cache(results_count: int, top_k_used: int, max_top_k: int = 200) -> bool:
@@ -647,11 +647,25 @@ def can_expand_incremental_cache(results_count: int, top_k_used: int, max_top_k:
 
     We only do this when:
       1) We have not yet reached max_top_k
-      2) Current result count is near the queried top_k (likely capped)
+      2) Current result count is at least 50% of queried top_k (likely has more potential)
+      
+    FIXED: Lowered threshold from 90% to 50% to handle cases where first search
+    with top_k=20 returns fewer results but could still find more with expansion.
     """
     if top_k_used >= max_top_k:
+        logger.info(f"[EXPANDABILITY] No expansion: already at max_top_k={max_top_k}")
         return False
-    return results_count >= max(1, int(top_k_used * 0.9))
+    # For small initial queries (top_k <= 30), be very liberal about expansion
+    if top_k_used <= 30:
+        threshold = max(1, int(top_k_used * 0.3))
+        expandable = results_count >= threshold
+        logger.info(f"[EXPANDABILITY] Small query check: results={results_count}, top_k={top_k_used}, threshold={threshold}, expandable={expandable}")
+        return expandable
+    # For larger queries, use 50% threshold
+    threshold = max(1, int(top_k_used * 0.5))
+    expandable = results_count >= threshold
+    logger.info(f"[EXPANDABILITY] Large query check: results={results_count}, top_k={top_k_used}, threshold={threshold}, expandable={expandable}")
+    return expandable
 
 def maybe_mark_expandable_boundary(
     batch: List[Dict],
@@ -671,14 +685,17 @@ def maybe_mark_expandable_boundary(
     """
     # If normal pagination already has more, do nothing.
     if has_more:
+        logger.info(f"[EXPANDABLE BOUNDARY] Normal pagination active, has_more=True already")
         return next_cursor, has_more, False
 
     # No batch means nothing was returned; do not force continuation.
     if not batch or not all_results:
+        logger.info(f"[EXPANDABLE BOUNDARY] No batch or results, skipping")
         return next_cursor, has_more, False
 
     # If cache does not look capped/expandable, do nothing.
     if not can_expand_incremental_cache(len(all_results), top_k_used, max_top_k=max_top_k):
+        logger.info(f"[EXPANDABLE BOUNDARY] Cache not expandable (results={len(all_results)}, top_k={top_k_used})")
         return next_cursor, has_more, False
 
     boundary_index = len(all_results) - 1
@@ -690,8 +707,8 @@ def maybe_mark_expandable_boundary(
     )
 
     logger.info(
-        f"[INCREMENTAL SEARCH] Reached expandable boundary at index={boundary_index}; "
-        f"exposing cursor to allow next request expansion (top_k={top_k_used}, results={len(all_results)})."
+        f"[EXPANDABLE BOUNDARY] Creating expansion cursor at index={boundary_index}; "
+        f"exposing has_more=True to allow next request to expand (top_k={top_k_used} → {min(top_k_used+30, max_top_k)}, results={len(all_results)})."
     )
 
     return boundary_cursor, True, True
@@ -3153,23 +3170,23 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                         continue
                     
                     # CRITICAL FIX: When both speaker filter AND query are present (parallel search),
-                    # speaker results MUST also match the query text to be included.
-                    # This prevents showing irrelevant videos like "Hafiz Naeem podcast" when searching "00089"
+                    # speaker results MUST also match the query text IN THE TRANSCRIPT to be included.
+                    # This prevents showing irrelevant videos like "Hafiz Naeem podcast" when searching "00089".
+                    # 
+                    # FIXED: Only check transcript text, NOT video titles.
+                    # User is searching for what the speaker SAID, not video metadata.
                     if speaker_parallel_search and query_text:
                         query_normalized = normalize_for_matching(query_text)
                         text_normalized = normalize_for_matching(text)
-                        title_normalized = normalize_for_matching(video_title)
                         
-                        # Check if query appears in text OR title (fuzzy or exact)
+                        # Check if query appears in TRANSCRIPT TEXT only (not title)
                         query_in_text = (
                             whole_phrase_match(query_normalized, text_normalized) or
-                            fuzzy_match_text(query_text, text, threshold=65) or
-                            whole_phrase_match(query_normalized, title_normalized) or
-                            fuzzy_match_text(query_text, video_title, threshold=65)
+                            fuzzy_match_text(query_text, text, threshold=65)
                         )
                         
                         if not query_in_text:
-                            # Query doesn't appear in this segment - skip it
+                            # Query doesn't appear in this segment's transcript - skip it
                             continue
                     
                     # Calculate score based on speaker match quality
@@ -3804,12 +3821,19 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
             raise HTTPException(status_code=500, detail=f"Keyword search error: {str(e)}")
 
     # Strategy 3: Title matching — search video titles for the query
-    # Runs when either:
+    # ONLY runs when user explicitly requests title search:
     # 1. User provides explicit title_filter (e.g., title:2023)
-    # 2. User searches with query_text (automatic title search with lower priority)
-    # This ensures searching "2023" finds videos with "2023" in the title
-    title_query = title_filter or query_text or ""
-    if use_scan_strategies and title_query and len(title_query.strip()) >= 2:  # Reduced from 3 to 2 for short queries like "2023"
+    # 2. Simple mode with filter_type='title'
+    # 
+    # FIXED: Removed automatic title matching for regular semantic/transcript searches
+    # to prevent irrelevant title matches when searching transcript content.
+    # Users searching "00089" in transcript should NOT get "Hafiz Naeem Podcast" videos.
+    title_query = title_filter or ""
+    explicit_title_search = bool(title_filter)  # Only search titles if explicitly requested
+    
+    logger.info(f"[TITLE SEARCH] explicit={explicit_title_search}, title_filter='{title_filter}', will_run={explicit_title_search and title_query and len(title_query.strip()) >= 2}")
+    
+    if use_scan_strategies and explicit_title_search and title_query and len(title_query.strip()) >= 2:
         try:
             logger.info(f"Title matching search for: '{title_query[:120]}'")
             
@@ -4522,6 +4546,9 @@ async def search_incremental(data: IncrementalSearchRequest, authorized: bool = 
             max_top_k=200
         )
         
+        # Calculate total unique videos in cached results (for frontend display)
+        unique_video_ids_in_cache = len(set(r.get('video_id') for r in all_results if r.get('video_id')))
+        
         elapsed = time.time() - start_time
         
         return {
@@ -4530,7 +4557,7 @@ async def search_incremental(data: IncrementalSearchRequest, authorized: bool = 
             "cursor": {
                 "next": next_cursor,
                 "has_more": has_more,
-                "total_available": len(all_results)
+                "total_available": unique_video_ids_in_cache  # FIXED: count unique videos, not segments
             },
             "search_session_id": search_session_id,
             "metadata": {
@@ -4540,7 +4567,9 @@ async def search_incremental(data: IncrementalSearchRequest, authorized: bool = 
                 "batch_start": cursor.get("index", -1) + 1 if cursor else 0,
                 "query": query_params.get("query", ""),
                 "top_k_used": top_k_used,
-                "expansion_pending": expansion_pending
+                "expansion_pending": expansion_pending,
+                "total_segments_cached": len(all_results),
+                "total_videos_cached": unique_video_ids_in_cache
             }
         }
     
@@ -4601,6 +4630,8 @@ async def search_incremental(data: IncrementalSearchRequest, authorized: bool = 
             
             # Extract first batch
             batch, next_cursor, has_more = extract_batch_from_results(all_results, None, batch_size)
+            logger.info(f"[FIRST SEARCH] Extracted batch: {len(batch)} segments, {len(set(r.get('video_id') for r in batch if r.get('video_id')))} videos, has_more={has_more}")
+            
             next_cursor, has_more, expansion_pending = maybe_mark_expandable_boundary(
                 batch=batch,
                 next_cursor=next_cursor,
@@ -4610,6 +4641,11 @@ async def search_incremental(data: IncrementalSearchRequest, authorized: bool = 
                 max_top_k=200
             )
             
+            logger.info(f"[FIRST SEARCH] After expandability check: has_more={has_more}, expansion_pending={expansion_pending}, cursor={'present' if next_cursor else 'none'}")
+            
+            # Calculate total unique videos in cached results (for frontend display)
+            unique_video_ids_in_cache = len(set(r.get('video_id') for r in all_results if r.get('video_id')))
+            
             elapsed = time.time() - start_time
             
             return {
@@ -4618,7 +4654,7 @@ async def search_incremental(data: IncrementalSearchRequest, authorized: bool = 
                 "cursor": {
                     "next": next_cursor,
                     "has_more": has_more,
-                    "total_available": len(all_results)
+                    "total_available": unique_video_ids_in_cache  # FIXED: count unique videos, not segments
                 },
                 "search_session_id": search_session_id,
                 "metadata": {
@@ -4630,7 +4666,9 @@ async def search_incremental(data: IncrementalSearchRequest, authorized: bool = 
                     "total_found": search_response.get("total_found", 0),
                     "search_mode": data.search_mode,
                     "top_k_used": initial_top_k,
-                    "expansion_pending": expansion_pending
+                    "expansion_pending": expansion_pending,
+                    "total_segments_cached": len(all_results),
+                    "total_videos_cached": unique_video_ids_in_cache
                 }
             }
             
