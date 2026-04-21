@@ -4704,6 +4704,9 @@ async def search_incremental(data: IncrementalSearchRequest, authorized: bool = 
         initial_top_k = max(initial_top_k, 60)  # extra headroom for post-filtering
     if cursor_recovery_mode:
         initial_top_k = max(initial_top_k, cursor_index + (batch_size * 3) + 1)
+    # Person queries need broader candidate pools to avoid under-returning videos.
+    if alias_person_key:
+        initial_top_k = max(initial_top_k, 140)
     initial_top_k = min(initial_top_k, 200)
 
     # Build exact filters for one query.
@@ -4727,6 +4730,10 @@ async def search_incremental(data: IncrementalSearchRequest, authorized: bool = 
     # 2) One Qdrant query
     search_params = SearchParams(hnsw_ef=64, exact=False)
     retrieval_threshold = max(data.min_score * 0.85, 0.35)
+    if alias_person_key:
+        # Relax threshold for known person aliases to improve recall.
+        # Ranking below applies an alias-signal boost to keep relevant hits near top.
+        retrieval_threshold = max(data.min_score * 0.55, 0.18)
     sem_search_response = qdrant_client.query_points(
         collection_name=SEGMENTS_COLLECTION,
         query=query_vector,
@@ -4761,6 +4768,22 @@ async def search_incremental(data: IncrementalSearchRequest, authorized: bool = 
 
         start_val = payload.get("start_time", 0)
         end_val = payload.get("end_time", 0)
+        raw_score = float(getattr(r, "score", 0.0))
+        match_types = ["semantic"]
+        if alias_person_key:
+            alias_signal = result_has_person_alias_signal(
+                {
+                    "speaker": speaker,
+                    "diarization_speaker": diarization_speaker,
+                    "video_title": video_title,
+                    "text": payload.get("text", ""),
+                },
+                alias_person_key
+            )
+            if alias_signal:
+                raw_score = min(raw_score + 0.10, 1.0)
+                match_types.append("alias_signal")
+
         all_results.append({
             "id": r.id,
             "segment_ids": [r.id],
@@ -4768,8 +4791,8 @@ async def search_incremental(data: IncrementalSearchRequest, authorized: bool = 
             "is_exact_phrase_match": False,
             "is_multi_match": False,
             "matched_terms": [],
-            "score": round(float(getattr(r, "score", 0.0)), 4),
-            "match_types": ["semantic"],
+            "score": round(raw_score, 4),
+            "match_types": match_types,
             "matched_field": "semantic_vector",
             "fuzzy_score": 0.0,
             "matched_words_count": 0,
