@@ -4729,15 +4729,29 @@ async def search_incremental(data: IncrementalSearchRequest, authorized: bool = 
         # We'll execute the full search logic inline (calling the search function would be cleaner
         # but requires refactoring - for now, we'll call the existing search endpoint logic)
         
-        # Create a SearchRequest object with SMALL top_k for fast initial response
-        initial_top_k = 20  # Query only 20 results initially (~4-5 seconds)
+        # Create a SearchRequest object with SMALL top_k for fast initial response.
+        # If we have a cursor but cache is missing (multi-replica scenario), recover by
+        # querying deeper and resuming from cursor index instead of replaying page 1.
+        cursor_index = int(cursor.get("index", -1)) if cursor and cursor.get("index") is not None else -1
+        cursor_recovery_mode = cursor is not None and cursor_index >= 0
+
+        initial_top_k = 20  # default first-page size
+        if cursor_recovery_mode:
+            needed_top_k = cursor_index + (batch_size * 3) + 1
+            initial_top_k = min(max(50, needed_top_k), 200)
+            logger.info(
+                f"[INCREMENTAL SEARCH] Cache miss with cursor recovery: index={cursor_index}, "
+                f"batch_size={batch_size}, top_k={initial_top_k}"
+            )
 
         # Cap scan budget for first page so incremental mode stays responsive.
         # Full-depth scanning can be expanded progressively on later cursor calls.
         query_text = (data.query or "").strip()
         query_word_count = len([w for w in query_text.split() if w.strip()])
         has_alias = bool(detect_person_alias(query_text) or detect_person_alias(data.speaker or ""))
-        if has_alias:
+        if cursor_recovery_mode:
+            initial_max_scanned = min(data.max_scanned, 4000)
+        elif has_alias:
             initial_max_scanned = min(data.max_scanned, 2500)
         elif query_word_count <= 2:
             initial_max_scanned = min(data.max_scanned, 1800)
@@ -4746,7 +4760,8 @@ async def search_incremental(data: IncrementalSearchRequest, authorized: bool = 
 
         logger.info(
             f"[INCREMENTAL SEARCH] First-page scan cap: requested={data.max_scanned}, "
-            f"effective={initial_max_scanned}, words={query_word_count}, alias={has_alias}"
+            f"effective={initial_max_scanned}, words={query_word_count}, alias={has_alias}, "
+            f"cursor_recovery={cursor_recovery_mode}"
         )
 
         search_request = SearchRequest(
@@ -4771,9 +4786,11 @@ async def search_incremental(data: IncrementalSearchRequest, authorized: bool = 
         # Execute the main search (reuse existing search logic)
         try:
             search_response = await search(search_request, authorized=True)
+            total_found = search_response.get("total_found", 0)
             
             # Extract results from search response
             all_results = search_response.get("results", [])
+            top_k_used = initial_top_k
             
             # Cache the results with top_k tracking
             query_params = {
@@ -4785,15 +4802,54 @@ async def search_incremental(data: IncrementalSearchRequest, authorized: bool = 
                 "search_mode": data.search_mode,
                 "filter_type": data.filter_type
             }
-            cache_search_results(search_session_id, all_results, query_params, initial_top_k)
-            
-            # Extract first batch
+            cache_search_results(search_session_id, all_results, query_params, top_k_used)
+
+            # Extract batch. On cursor recovery, resume from cursor position.
+            extraction_cursor = cursor if cursor_recovery_mode else None
             batch, next_cursor, has_more = extract_batch_from_results(
                 all_results,
-                None,
+                extraction_cursor,
                 batch_size,
                 search_session_id=search_session_id
             )
+
+            # If we resumed from cursor but got no batch, try one deeper expansion once.
+            if cursor_recovery_mode and not batch and top_k_used < 200:
+                recovery_top_k = min(max(top_k_used + 30, cursor_index + (batch_size * 3) + 1), 200)
+                if recovery_top_k > top_k_used:
+                    logger.info(
+                        f"[INCREMENTAL SEARCH] Cursor recovery expansion: top_k {top_k_used} -> {recovery_top_k}"
+                    )
+                    recovery_request = SearchRequest(
+                        query=data.query,
+                        words=data.words,
+                        word=data.word,
+                        top_k=recovery_top_k,
+                        video_id=data.video_id,
+                        speaker=data.speaker,
+                        title=data.title,
+                        language=data.language,
+                        min_score=data.min_score,
+                        time_range=data.time_range,
+                        max_scanned=min(data.max_scanned, 4000),
+                        search_mode=data.search_mode,
+                        filter_type=data.filter_type,
+                        filter_year=data.filter_year,
+                        filter_month=data.filter_month,
+                        filter_date=data.filter_date
+                    )
+                    recovery_response = await search(recovery_request, authorized=True)
+                    total_found = recovery_response.get("total_found", total_found)
+                    all_results = recovery_response.get("results", [])
+                    top_k_used = recovery_top_k
+                    cache_search_results(search_session_id, all_results, query_params, top_k_used)
+                    batch, next_cursor, has_more = extract_batch_from_results(
+                        all_results,
+                        extraction_cursor,
+                        batch_size,
+                        search_session_id=search_session_id
+                    )
+
             logger.info(f"[FIRST SEARCH] Extracted batch: {len(batch)} segments, {len(set(r.get('video_id') for r in batch if r.get('video_id')))} videos, has_more={has_more}")
             
             next_cursor, has_more, expansion_pending = maybe_mark_expandable_boundary(
@@ -4801,7 +4857,7 @@ async def search_incremental(data: IncrementalSearchRequest, authorized: bool = 
                 next_cursor=next_cursor,
                 has_more=has_more,
                 all_results=all_results,
-                top_k_used=initial_top_k,
+                top_k_used=top_k_used,
                 search_session_id=search_session_id,
                 max_top_k=200
             )
@@ -4826,14 +4882,15 @@ async def search_incremental(data: IncrementalSearchRequest, authorized: bool = 
                     "elapsed_seconds": round(elapsed, 3),
                     "cache_hit": False,
                     "batch_size": len(batch),
-                    "batch_start": 0,
+                    "batch_start": cursor_index + 1 if cursor_recovery_mode else 0,
                     "query": data.query,
-                    "total_found": search_response.get("total_found", 0),
+                    "total_found": total_found,
                     "search_mode": data.search_mode,
-                    "top_k_used": initial_top_k,
+                    "top_k_used": top_k_used,
                     "expansion_pending": expansion_pending,
                     "total_segments_cached": len(all_results),
-                    "total_videos_cached": unique_video_ids_in_cache
+                    "total_videos_cached": unique_video_ids_in_cache,
+                    "cursor_recovery_mode": cursor_recovery_mode
                 }
             }
             
