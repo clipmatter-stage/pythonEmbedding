@@ -522,16 +522,18 @@ def get_fastembed_embedding(text: str) -> List[float]:
 
 import base64
 
-def encode_cursor(segment_id: str, score: float, index: int) -> str:
+def encode_cursor(segment_id: str, score: float, index: int, search_session_id: Optional[str] = None) -> str:
     """
     Encode cursor as base64 JSON string.
-    Cursor format: {id: segment_id, score: score, index: position_in_results}
+    Cursor format: {id: segment_id, score: score, index: position_in_results, search_session_id?: uuid}
     """
     cursor_data = {
         "id": segment_id,
         "score": float(score),
         "index": int(index)
     }
+    if search_session_id:
+        cursor_data["search_session_id"] = search_session_id
     cursor_json = json_module.dumps(cursor_data)
     cursor_b64 = base64.b64encode(cursor_json.encode('utf-8')).decode('utf-8')
     return cursor_b64
@@ -581,7 +583,12 @@ def cache_search_results(search_session_id: str, results: List[Dict], query_para
     search_result_cache[search_session_id] = cache_data
     logger.info(f"Cached {len(results)} results (top_k={top_k_used}) for session {search_session_id[:8]}...")
 
-def extract_batch_from_results(results: List[Dict], cursor: Optional[Dict], batch_size: int) -> Tuple[List[Dict], Optional[str], bool]:
+def extract_batch_from_results(
+    results: List[Dict],
+    cursor: Optional[Dict],
+    batch_size: int,
+    search_session_id: Optional[str] = None
+) -> Tuple[List[Dict], Optional[str], bool]:
     """
     Extract a batch of results starting from cursor position.
     Returns segments until we have batch_size unique VIDEO groups (not raw segments).
@@ -634,7 +641,8 @@ def extract_batch_from_results(results: List[Dict], cursor: Optional[Dict], batc
         next_cursor = encode_cursor(
             segment_id=last_result.get('id', ''),
             score=last_result.get('score', 0.0),
-            index=end_index
+            index=end_index,
+            search_session_id=search_session_id
         )
     
     logger.info(f"[BATCH EXTRACTION] start={start_index}, end={end_index}, total_results={len(results)}, segments_extracted={len(batch)}, unique_videos={len(unique_video_ids)}, requested_batch_size={batch_size}, has_more={has_more}")
@@ -673,6 +681,7 @@ def maybe_mark_expandable_boundary(
     has_more: bool,
     all_results: List[Dict],
     top_k_used: int,
+    search_session_id: Optional[str] = None,
     max_top_k: int = 200
 ) -> Tuple[Optional[str], bool, bool]:
     """
@@ -703,7 +712,8 @@ def maybe_mark_expandable_boundary(
     boundary_cursor = encode_cursor(
         segment_id=boundary_result.get('id', ''),
         score=boundary_result.get('score', 0.0),
-        index=boundary_index
+        index=boundary_index,
+        search_session_id=search_session_id
     )
 
     logger.info(
@@ -4476,6 +4486,18 @@ async def search_incremental(data: IncrementalSearchRequest, authorized: bool = 
     
     # Decode cursor
     cursor = decode_cursor(cursor_str)
+
+    # Recover session ID from cursor (backward-compatible optimization)
+    # This allows pagination to continue even when frontend forgets to send search_session_id.
+    if not search_session_id and cursor and cursor.get("search_session_id"):
+        search_session_id = str(cursor.get("search_session_id"))
+        logger.info(f"[INCREMENTAL SEARCH] Recovered session from cursor: {search_session_id[:8]}...")
+
+    # If cursor is present but session is still missing, treat as fresh search.
+    # Using a cursor without session would otherwise force expensive re-search loops.
+    if cursor_str and not search_session_id:
+        logger.warning("[INCREMENTAL SEARCH] Cursor provided without search_session_id; treating as new search request")
+        cursor = None
     
     # Try to get cached results
     cached_data = get_cached_results(search_session_id) if search_session_id else None
@@ -4497,8 +4519,12 @@ async def search_incremental(data: IncrementalSearchRequest, authorized: bool = 
         if needed_index >= len(all_results) and len(all_results) >= top_k_used * 0.9:
             # We've consumed most of cached results - query for more
             new_top_k = min(top_k_used + 30, 200)  # Increase by 30, max 200
+            expansion_max_scanned = min(data.max_scanned, 4000)
             
-            logger.info(f"[INCREMENTAL SEARCH] Cache insufficient (has {len(all_results)}, need ~{needed_index}). Expanding query from top_k={top_k_used} to {new_top_k}...")
+            logger.info(
+                f"[INCREMENTAL SEARCH] Cache insufficient (has {len(all_results)}, need ~{needed_index}). "
+                f"Expanding query from top_k={top_k_used} to {new_top_k} with max_scanned={expansion_max_scanned}..."
+            )
             
             # Execute expanded search
             search_request = SearchRequest(
@@ -4512,7 +4538,7 @@ async def search_incremental(data: IncrementalSearchRequest, authorized: bool = 
                 language=data.language,
                 min_score=data.min_score,
                 time_range=data.time_range,
-                max_scanned=data.max_scanned,
+                max_scanned=expansion_max_scanned,
                 search_mode=data.search_mode,
                 filter_type=data.filter_type,
                 filter_year=data.filter_year,
@@ -4536,13 +4562,19 @@ async def search_incremental(data: IncrementalSearchRequest, authorized: bool = 
             logger.info(f"[INCREMENTAL SEARCH] Using cached results for session {search_session_id[:8]} (has {len(all_results)} results)...")
         
         # Extract batch from cached results
-        batch, next_cursor, has_more = extract_batch_from_results(all_results, cursor, batch_size)
+        batch, next_cursor, has_more = extract_batch_from_results(
+            all_results,
+            cursor,
+            batch_size,
+            search_session_id=search_session_id
+        )
         next_cursor, has_more, expansion_pending = maybe_mark_expandable_boundary(
             batch=batch,
             next_cursor=next_cursor,
             has_more=has_more,
             all_results=all_results,
             top_k_used=top_k_used,
+            search_session_id=search_session_id,
             max_top_k=200
         )
         
@@ -4590,6 +4622,24 @@ async def search_incremental(data: IncrementalSearchRequest, authorized: bool = 
         
         # Create a SearchRequest object with SMALL top_k for fast initial response
         initial_top_k = 20  # Query only 20 results initially (~4-5 seconds)
+
+        # Cap scan budget for first page so incremental mode stays responsive.
+        # Full-depth scanning can be expanded progressively on later cursor calls.
+        query_text = (data.query or "").strip()
+        query_word_count = len([w for w in query_text.split() if w.strip()])
+        has_alias = bool(detect_person_alias(query_text) or detect_person_alias(data.speaker or ""))
+        if has_alias:
+            initial_max_scanned = min(data.max_scanned, 2500)
+        elif query_word_count <= 2:
+            initial_max_scanned = min(data.max_scanned, 1800)
+        else:
+            initial_max_scanned = min(data.max_scanned, 3000)
+
+        logger.info(
+            f"[INCREMENTAL SEARCH] First-page scan cap: requested={data.max_scanned}, "
+            f"effective={initial_max_scanned}, words={query_word_count}, alias={has_alias}"
+        )
+
         search_request = SearchRequest(
             query=data.query,
             words=data.words,
@@ -4601,7 +4651,7 @@ async def search_incremental(data: IncrementalSearchRequest, authorized: bool = 
             language=data.language,
             min_score=data.min_score,
             time_range=data.time_range,
-            max_scanned=data.max_scanned,
+            max_scanned=initial_max_scanned,
             search_mode=data.search_mode,
             filter_type=data.filter_type,
             filter_year=data.filter_year,
@@ -4629,7 +4679,12 @@ async def search_incremental(data: IncrementalSearchRequest, authorized: bool = 
             cache_search_results(search_session_id, all_results, query_params, initial_top_k)
             
             # Extract first batch
-            batch, next_cursor, has_more = extract_batch_from_results(all_results, None, batch_size)
+            batch, next_cursor, has_more = extract_batch_from_results(
+                all_results,
+                None,
+                batch_size,
+                search_session_id=search_session_id
+            )
             logger.info(f"[FIRST SEARCH] Extracted batch: {len(batch)} segments, {len(set(r.get('video_id') for r in batch if r.get('video_id')))} videos, has_more={has_more}")
             
             next_cursor, has_more, expansion_pending = maybe_mark_expandable_boundary(
@@ -4638,6 +4693,7 @@ async def search_incremental(data: IncrementalSearchRequest, authorized: bool = 
                 has_more=has_more,
                 all_results=all_results,
                 top_k_used=initial_top_k,
+                search_session_id=search_session_id,
                 max_top_k=200
             )
             
