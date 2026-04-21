@@ -1695,7 +1695,7 @@ LEGACY_COLLECTION = "text_embeddings"
 
 
 logger.info("Connecting to Qdrant...")
-qdrant_client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY, timeout=30)
+qdrant_client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY, timeout=120)
 logger.info("Connected to Qdrant successfully")
 
 def create_segments_collection():
@@ -1806,7 +1806,7 @@ def ensure_indexes_http():
             }
             
             try:
-                response = requests.put(url, json=payload, headers=headers, timeout=30)
+                response = requests.put(url, json=payload, headers=headers, timeout=120)
                 
                 if response.status_code == 200:
                     logger.info(f"  ✓ Created index for '{field_name}'")
@@ -5582,11 +5582,20 @@ async def root():
 
 if __name__ == "__main__":
     import uvicorn
+    import os
+
     port = int(os.getenv("PORT", 9000))
+
     logger.info(f"Starting FastAPI Video Elastic Search Service on port {port}...")
     logger.info(f"Qdrant URL: {QDRANT_URL}")
     logger.info(f"Collections: {SEGMENTS_COLLECTION}, {LEGACY_COLLECTION}")
     logger.info("Features: Fuzzy search, typo tolerance, query caching")
-    uvicorn.run(app, host="0.0.0.0", port=port)
+
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=port,
+        timeout_keep_alive=120
+    )
 
 
