@@ -2235,6 +2235,28 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
     # simple filters into semantic mode, otherwise simple behavior becomes inconsistent.
 
     # ═══════════════════════════════════════════════════════════════════════════
+    # AUTO-ROUTE NUMERIC QUERIES TO SIMPLE TEXT SEARCH
+    # Semantic embeddings cannot represent pure numbers/years (e.g. "2013", "15").
+    # The cosine similarity of a year embedding against any document is ~0.1–0.2,
+    # far below the 0.35 retrieval threshold — semantic search always returns 0 results.
+    # Simple text search uses Qdrant MatchText + whole_word_match which handles
+    # numbers reliably. Auto-route here when no special non-text filter is active.
+    # ═══════════════════════════════════════════════════════════════════════════
+    if search_mode == "semantic" and not filter_type:
+        _raw_q = (data.query or "").strip()
+        # Detect pure-numeric query: digits only (allow commas, dots, hyphens as separators)
+        _is_numeric_query = bool(_raw_q) and all(
+            w.replace(',', '').replace('.', '').replace('-', '').isdigit()
+            for w in _raw_q.split()
+            if w.strip()
+        )
+        if _is_numeric_query:
+            logger.info(f"[AUTO-ROUTE] Numeric query '{_raw_q}' detected — routing to simple text search (semantic embeddings don't represent numbers)")
+            search_mode = "simple"
+            filter_type = "text"
+            # Preserve existing filters; query_text already set above
+
+    # ═══════════════════════════════════════════════════════════════════════════
     # SIMPLE SEARCH MODE — structured filters only, no vector/LLM operations.
     # Only one filter is active at a time. Returns results from Qdrant scroll.
     # Eligibility: processing_status=completed, approval_status=approved, is_archived=false
@@ -4754,6 +4776,35 @@ async def search_incremental(data: IncrementalSearchRequest, authorized: bool = 
             status_code=400,
             detail="Either 'query' or non-empty 'words' is required for incremental search"
         )
+
+    # ── AUTO-ROUTE NUMERIC QUERIES ────────────────────────────────────────────
+    # Pure numeric queries (e.g. "2013", "15") have no semantic meaning that
+    # vector embeddings can capture. Their cosine similarity against any document
+    # is ~0.1–0.2, well below the 0.35 threshold → always 0 semantic results.
+    # Redirect to the full /search endpoint logic via SearchRequest so the
+    # simple text filter (whole_word_match + Qdrant MatchText) handles it.
+    _is_numeric_incremental = bool(query_text) and all(
+        w.replace(',', '').replace('.', '').replace('-', '').isdigit()
+        for w in query_text.split() if w.strip()
+    )
+    if _is_numeric_incremental:
+        logger.info(f"[INCREMENTAL AUTO-ROUTE] Numeric query '{query_text}' → delegating to simple text search")
+        delegate_req = SearchRequest(
+            query=query_text,
+            words=list(data.words) if data.words else [],
+            top_k=data.top_k or 200,
+            video_id=data.video_id,
+            speaker=data.speaker,
+            title=data.title,
+            language=data.language,
+            min_score=data.min_score,
+            time_range=data.time_range,
+            max_scanned=max(data.max_scanned, 50000),
+            search_mode="simple",
+            filter_type="text",
+        )
+        return await search(delegate_req, authorized=True)
+    # ── END AUTO-ROUTE ────────────────────────────────────────────────────────
 
     # Person alias support (fast-path safe): expand short aliases to canonical name once.
     # This improves semantic recall for queries like "hnr" without adding extra queries.
