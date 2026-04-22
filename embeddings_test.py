@@ -478,6 +478,7 @@ class IncrementalSearchRequest(BaseModel):
     filter_year: Optional[int] = Field(default=None, ge=1900, le=2100)
     filter_month: Optional[int] = Field(default=None, ge=1, le=12)
     filter_date: Optional[str] = Field(default=None, max_length=20)
+    top_k: Optional[int] = Field(default=None, ge=1, le=1000, description="Max segments to fetch from Qdrant")
     # Cursor-based pagination fields
     cursor: Optional[str] = Field(default=None, description="Base64-encoded cursor for pagination")
     batch_size: int = Field(default=10, ge=1, le=50, description="Number of results per batch")
@@ -4706,8 +4707,12 @@ async def search_incremental(data: IncrementalSearchRequest, authorized: bool = 
         initial_top_k = max(initial_top_k, cursor_index + (batch_size * 3) + 1)
     # Person queries need broader candidate pools to avoid under-returning videos.
     if alias_person_key:
-        initial_top_k = max(initial_top_k, 140)
-    initial_top_k = min(initial_top_k, 200)
+        initial_top_k = max(initial_top_k, 500)
+    # Caller (PHP) can override initial_top_k by sending top_k explicitly.
+    if data.top_k is not None:
+        initial_top_k = max(initial_top_k, data.top_k)
+    # Hard cap: 1000 segments is more than enough for any single query.
+    initial_top_k = min(initial_top_k, 1000)
 
     # Build exact filters for one query.
     filter_conditions = []
