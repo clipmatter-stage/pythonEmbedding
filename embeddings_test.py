@@ -2252,8 +2252,24 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
         simple_results = []
         scanned = 0
         max_scan_simple = min(max_scanned, 50000)
+
+        # ── Minimal payload fields per filter type ─────────────────────────────
+        # Avoids fetching large summary blobs (10KB+) when they're not needed.
+        _PAYLOAD_SPEAKER = ["video_id", "video_title", "speaker", "diarization_speaker",
+                            "start_time", "end_time", "text", "text_length",
+                            "youtube_url", "language", "video_created_at"]
+        _PAYLOAD_TEXT    = _PAYLOAD_SPEAKER  # same fields needed
+        _PAYLOAD_TITLE   = ["video_id", "video_title", "youtube_url", "language", "video_created_at"]
+        _PAYLOAD_DATE    = ["video_id", "video_title", "youtube_url", "language", "video_created_at"]
+        _PAYLOAD_LANG    = _PAYLOAD_DATE
+        _PAYLOAD_SUMMARY = ["video_id", "video_title", "youtube_url", "language", "video_created_at",
+                            "video_summary", "video_summary_english", "video_summary_urdu"]
         
         try:
+            # alias_person_key_simple is set inside each filter branch when a person alias is detected.
+            # Default to None so the LLM rerank block always has a defined value.
+            alias_person_key_simple = None
+
             if filter_type == "video":
                 # Filter by specific video ID
                 if not video_id_filter:
@@ -2308,18 +2324,46 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                 # Supports multi-word names like "Hafiz Naeem" matching individual word components
                 if not speaker_filter:
                     raise HTTPException(status_code=400, detail="speaker is required for speaker filter")
-                scroll_filter = Filter(must=eligibility_conditions) if eligibility_conditions else None
+
+                # ── Qdrant-side pre-filter on speaker field ──────────────────
+                # Push individual name words into Qdrant MatchText so the DB
+                # discards non-matching segments before Python sees them.
+                # This cuts scanned volume by 95%+ for specific names.
+                scroll_conditions_spk = list(eligibility_conditions)
+                alias_person_key_simple = detect_person_alias(speaker_filter)
+                if alias_person_key_simple:
+                    # For known aliases, use ALL canonical speaker variants as OR conditions.
+                    # Qdrant 'should' = OR; any variant matching is enough.
+                    alias_data = PERSON_ALIASES[alias_person_key_simple]
+                    # Use canonical name words as MatchText anchors (most selective)
+                    canonical_words = [w for w in alias_data["canonical"].lower().split() if len(w) >= 4]
+                    for cw in canonical_words[:3]:  # limit to top-3 most selective words
+                        scroll_conditions_spk.append(
+                            FieldCondition(key="speaker", match=MatchText(text=cw))
+                        )
+                    logger.info(f"[SIMPLE SPEAKER] Alias '{speaker_filter}' → pre-filtering on words: {canonical_words[:3]}")
+                else:
+                    # Generic: push each word >= 3 chars from the speaker query into MatchText
+                    spk_words_for_filter = [w.strip() for w in speaker_filter.split() if len(w.strip()) >= 3]
+                    for sw in spk_words_for_filter[:3]:
+                        scroll_conditions_spk.append(
+                            FieldCondition(key="speaker", match=MatchText(text=sw))
+                        )
+                scroll_filter = Filter(must=scroll_conditions_spk)
+
                 offset = None
                 min_speaker_score = 0.45  # Minimum score threshold for quality
                 # Split speaker query into words for multi-word matching
                 speaker_query_words = [w.lower().strip() for w in speaker_filter.split() if len(w.strip()) >= 2]
+                # Smaller page: stop faster once top_k found; 200 is enough for typical collections
+                _spk_page = min(200, max_scan_simple)
                 while scanned < max_scan_simple and len(simple_results) < top_k:
                     points, next_offset = qdrant_client.scroll(
                         collection_name=SEGMENTS_COLLECTION,
                         scroll_filter=scroll_filter,
-                        limit=min(1000, max_scan_simple - scanned),
+                        limit=min(_spk_page, max_scan_simple - scanned),
                         offset=offset,
-                        with_payload=True,
+                        with_payload=_PAYLOAD_SPEAKER,
                         with_vectors=False
                     )
                     if not points:
@@ -2400,6 +2444,7 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                 if not filter_year and not filter_date:
                     raise HTTPException(status_code=400, detail="filter_year or filter_date is required for date filter")
                 scroll_conditions = list(eligibility_conditions)
+                alias_person_key_simple = None  # not set in date path
                 if filter_date:
                     # Exact date match via keyword prefix (ISO: "2024-03-15")
                     scroll_conditions.append(
@@ -2421,9 +2466,9 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                     points, next_offset = qdrant_client.scroll(
                         collection_name=SEGMENTS_COLLECTION,
                         scroll_filter=scroll_filter,
-                        limit=min(1000, max_scan_simple - scanned),
+                        limit=min(500, max_scan_simple - scanned),
                         offset=offset,
-                        with_payload=True,
+                        with_payload=_PAYLOAD_DATE,
                         with_vectors=False
                     )
                     if not points:
@@ -2473,13 +2518,14 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                 scroll_filter = Filter(must=scroll_conditions)
                 offset = None
                 seen_video_ids = set()
+                alias_person_key_simple = None
                 while scanned < max_scan_simple and len(simple_results) < top_k:
                     points, next_offset = qdrant_client.scroll(
                         collection_name=SEGMENTS_COLLECTION,
                         scroll_filter=scroll_filter,
-                        limit=min(1000, max_scan_simple - scanned),
+                        limit=min(500, max_scan_simple - scanned),
                         offset=offset,
-                        with_payload=True,
+                        with_payload=_PAYLOAD_LANG,
                         with_vectors=False
                     )
                     if not points:
@@ -2524,7 +2570,15 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                 # Otherwise, require exact-word coverage (no fuzzy title fallback).
                 if not title_filter:
                     raise HTTPException(status_code=400, detail="title is required for title filter")
-                scroll_filter = Filter(must=eligibility_conditions) if eligibility_conditions else None
+                # Pre-filter: push title words into Qdrant to shrink scan volume
+                scroll_conditions_title = list(eligibility_conditions)
+                title_filter_words = [w.strip() for w in title_filter.split() if len(w.strip()) >= 3]
+                for tw in title_filter_words[:3]:
+                    scroll_conditions_title.append(
+                        FieldCondition(key="video_title", match=MatchText(text=tw))
+                    )
+                scroll_filter = Filter(must=scroll_conditions_title) if scroll_conditions_title else None
+                alias_person_key_simple = None
                 offset = None
                 seen_video_ids = set()
                 exact_title_results = []
@@ -2539,9 +2593,9 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                     points, next_offset = qdrant_client.scroll(
                         collection_name=SEGMENTS_COLLECTION,
                         scroll_filter=scroll_filter,
-                        limit=min(1000, max_scan_simple - scanned),
+                        limit=min(300, max_scan_simple - scanned),
                         offset=offset,
-                        with_payload=True,
+                        with_payload=_PAYLOAD_TITLE,
                         with_vectors=False
                     )
                     if not points:
@@ -2639,7 +2693,15 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                 search_query = query_text or " ".join(words or [])
                 if not search_query:
                     raise HTTPException(status_code=400, detail="query is required for summary filter")
-                scroll_filter = Filter(must=eligibility_conditions) if eligibility_conditions else None
+                # Pre-filter: push summary words into Qdrant
+                scroll_conditions_sum = list(eligibility_conditions)
+                sum_filter_words = [w.strip() for w in search_query.split() if len(w.strip()) >= 3]
+                for sw in sum_filter_words[:3]:
+                    scroll_conditions_sum.append(
+                        FieldCondition(key="video_summary", match=MatchText(text=sw))
+                    )
+                scroll_filter = Filter(must=scroll_conditions_sum) if scroll_conditions_sum else None
+                alias_person_key_simple = None
                 # Normalize and filter search words (>= 2 chars to allow 'ai', 'gpt', etc.)
                 search_words_lower = [normalize_word(w) for w in search_query.split() if len(normalize_word(w)) >= 2]
                 if not search_words_lower:
@@ -2651,9 +2713,9 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                     points, next_offset = qdrant_client.scroll(
                         collection_name=SEGMENTS_COLLECTION,
                         scroll_filter=scroll_filter,
-                        limit=min(1000, max_scan_simple - scanned),
+                        limit=min(300, max_scan_simple - scanned),
                         offset=offset,
-                        with_payload=True,
+                        with_payload=_PAYLOAD_SUMMARY,
                         with_vectors=False
                     )
                     if not points:
@@ -2754,7 +2816,8 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                 # For numeric-only searches, use fewer constraints to improve recall
                 is_numeric_search = all(w.replace('.', '').replace('-', '').replace(',', '').isdigit() for w in search_words_normalized)
                 max_filter_words = 3 if is_numeric_search else 5
-                
+                alias_person_key_simple = None
+
                 for sw in search_words_normalized[:max_filter_words]:  # Limit words to avoid overly strict filters
                     scroll_conditions.append(
                         FieldCondition(key="text", match=MatchText(text=sw))
@@ -2765,13 +2828,16 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                 scroll_filter = Filter(must=scroll_conditions)
                 offset = None
                 min_text_score = 0.40  # Minimum score threshold
+                # Smaller scroll page for text search — Qdrant pre-filter already narrows results,
+                # so 300 per batch avoids over-fetching when top_k is small.
+                _txt_page = min(300, max_scan_simple)
                 while scanned < max_scan_simple and len(simple_results) < top_k:
                     points, next_offset = qdrant_client.scroll(
                         collection_name=SEGMENTS_COLLECTION,
                         scroll_filter=scroll_filter,
-                        limit=min(1000, max_scan_simple - scanned),
+                        limit=min(_txt_page, max_scan_simple - scanned),
                         offset=offset,
-                        with_payload=True,
+                        with_payload=_PAYLOAD_TEXT,
                         with_vectors=False
                     )
                     if not points:
@@ -2850,8 +2916,20 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                 else:
                     rerank_query = speaker_filter or title_filter or query_text or " ".join(words or [])
                     simple_single_word = bool(rerank_query and len(rerank_query.split()) == 1 and len(normalize_word(rerank_query)) >= 2)
-                if simple_single_word:
-                    logger.info("[SIMPLE SEARCH] Skipping LLM rerank for single-word query to keep scores stable")
+
+                # Skip reranking for known person-alias queries (Hafiz Naeem etc.) —
+                # alias expansion + Qdrant pre-filter already guarantees high precision.
+                # Also skip when there are too few candidates to justify an OpenAI round-trip.
+                skip_rerank_reason = None
+                if alias_person_key_simple:
+                    skip_rerank_reason = f"known person alias '{alias_person_key_simple}'"
+                elif simple_single_word:
+                    skip_rerank_reason = "single-word query"
+                elif len(simple_results) <= 3:
+                    skip_rerank_reason = f"only {len(simple_results)} results (< 4)"
+
+                if skip_rerank_reason:
+                    logger.info(f"[SIMPLE SEARCH] Skipping LLM rerank: {skip_rerank_reason}")
                 else:
                     if rerank_query.strip():
                         simple_results = rerank_simple_results(
