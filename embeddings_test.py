@@ -435,7 +435,7 @@ class SearchRequest(BaseModel):
     query: str = Field(default="", max_length=1000)
     words: List[str] = Field(default=[])
     word: Optional[str] = Field(default=None, max_length=200)
-    top_k: int = Field(default=20, ge=1, le=500)
+    top_k: int = Field(default=20, ge=1, le=1000)
     video_id: Optional[int] = Field(default=None, gt=0)
     speaker: Optional[str] = Field(default=None, max_length=200)
     title: Optional[str] = Field(default=None, max_length=500)
@@ -5570,5 +5570,3 @@ if __name__ == "__main__":
         port=port,
         timeout_keep_alive=120
     )
-
-
