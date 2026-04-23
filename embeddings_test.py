@@ -4951,19 +4951,29 @@ async def search_incremental(data: IncrementalSearchRequest, authorized: bool = 
             f"query expanded to '{effective_query_text[:80]}'"
         )
 
+    # Short-query mode: improve recall for 1-3 term queries while staying on one-query fast path.
+    short_query_terms_fast = [
+        normalize_word(w)
+        for w in query_text.split()
+        if len(normalize_word(w)) >= 2 and normalize_word(w) not in STOP_WORDS
+    ]
+    is_short_query_fast = data.search_mode == "semantic" and 1 <= len(short_query_terms_fast) <= 3
+
     initial_top_k = max(20, batch_size * 4)
     if effective_speaker_filter or data.title:
         initial_top_k = max(initial_top_k, 60)  # extra headroom for post-filtering
     if cursor_recovery_mode:
         initial_top_k = max(initial_top_k, cursor_index + (batch_size * 3) + 1)
+    if is_short_query_fast:
+        initial_top_k = max(initial_top_k, 180)
     # Person queries need broader candidate pools to avoid under-returning videos.
     if alias_person_key:
-        initial_top_k = max(initial_top_k, 500)
+        initial_top_k = max(initial_top_k, 300)
     # Caller (PHP) can override initial_top_k by sending top_k explicitly.
     if data.top_k is not None:
         initial_top_k = max(initial_top_k, data.top_k)
-    # Hard cap: 1000 segments is more than enough for any single query.
-    initial_top_k = min(initial_top_k, 1000)
+    # Hard cap: keep bounded for latency; short queries still get enough candidates.
+    initial_top_k = min(initial_top_k, 600)
 
     # Build exact filters for one query.
     filter_conditions = []
@@ -4986,17 +4996,26 @@ async def search_incremental(data: IncrementalSearchRequest, authorized: bool = 
     # 2) One Qdrant query
     search_params = SearchParams(hnsw_ef=64, exact=False)
     retrieval_threshold = max(data.min_score * 0.85, 0.35)
+    if is_short_query_fast and not alias_person_key:
+        retrieval_threshold = max(data.min_score * 0.60, 0.20)
     if alias_person_key:
         # Relax threshold for known person aliases to improve recall.
         # Ranking below applies an alias-signal boost to keep relevant hits near top.
         retrieval_threshold = max(data.min_score * 0.55, 0.18)
+
+    minimal_payload_fields = [
+        "video_id", "video_title", "speaker", "diarization_speaker",
+        "start_time", "end_time", "text", "text_length", "summary_en",
+        "youtube_url", "language", "created_at"
+    ]
+
     sem_search_response = qdrant_client.query_points(
         collection_name=SEGMENTS_COLLECTION,
         query=query_vector,
         limit=initial_top_k,
         score_threshold=retrieval_threshold,
         query_filter=search_filter,
-        with_payload=True,
+        with_payload=minimal_payload_fields,
         with_vectors=False,
         search_params=search_params
     )
@@ -5026,6 +5045,27 @@ async def search_incremental(data: IncrementalSearchRequest, authorized: bool = 
         end_val = payload.get("end_time", 0)
         raw_score = float(getattr(r, "score", 0.0))
         match_types = ["semantic"]
+
+        # Add lightweight lexical signal for short semantic queries.
+        if is_short_query_fast:
+            all_text = normalize_for_matching(
+                f"{payload.get('text', '')[:900]} {video_title} {speaker} {diarization_speaker}"
+            )
+            lexical_hits = 0
+            for term in short_query_terms_fast:
+                if whole_word_match(term, all_text):
+                    lexical_hits += 1
+                elif len(term) >= 4 and fuzzy_word_match(term, all_text, threshold=90) > 0:
+                    lexical_hits += 1
+
+            if lexical_hits > 0:
+                raw_score = min(raw_score + min(0.04 * lexical_hits, 0.12), 1.0)
+                match_types.append("short_query_lexical_hit")
+            elif not alias_person_key:
+                # Penalize semantic-only drift for short non-alias queries.
+                raw_score = max(raw_score - 0.08, 0.0)
+                match_types.append("short_query_no_lexical_hit")
+
         if alias_person_key:
             alias_signal = result_has_person_alias_signal(
                 {
@@ -5125,6 +5165,8 @@ async def search_incremental(data: IncrementalSearchRequest, authorized: bool = 
             "total_videos_cached": unique_video_ids_in_cache,
             "cursor_recovery_mode": cursor_recovery_mode,
             "fast_path": True,
+            "short_query_mode": is_short_query_fast,
+            "effective_retrieval_threshold": round(retrieval_threshold, 4),
             "llm_calls": 0,
             "qdrant_queries": 1
         }
