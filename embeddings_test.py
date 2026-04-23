@@ -49,7 +49,7 @@ OPENAI_EMBEDDING_MODEL = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-l
 EMBEDDING_DIMENSION = int(os.getenv("EMBEDDING_DIMENSION", "3072"))  # 3072 dimensions for text-embedding-3-large
 # Enable by default so existing collections get all payload/text indexes on boot.
 # Set ENSURE_INDEXES_ON_STARTUP=false on specific deployments if you need to skip it.
-ENSURE_INDEXES_ON_STARTUP = os.getenv("ENSURE_INDEXES_ON_STARTUP", "true").lower() == "true"
+ENSURE_INDEXES_ON_STARTUP = os.getenv("ENSURE_INDEXES_ON_STARTUP", "false").lower() == "true"
 
 # ============== STOP WORDS FOR KEYWORD SEARCH ==============
 # Common words that should be filtered out to speed up keyword search
