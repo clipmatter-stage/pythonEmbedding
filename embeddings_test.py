@@ -99,7 +99,7 @@ STOP_WORDS = frozenset({
     "fact", "facts", "hand", "hands", "side", "sides", "world", "life", "being",
     # Urdu common words (transliterated)
     "hai", "hain", "tha", "thi", "the", "ka", "ki", "ke", "ko", "ne", "se", "mein", "par",
-    "aur", "ya", "lekin", "jo", "jab", "kya", "kaise", "kahan", "yeh", "woh", "koi", "kuch",
+    "aur", "ya", "lekin", "jo", "jab", "kya", "kaise", "kahan", "yeh", "woh", "koi", "kuch","kach",
 })
 
 # ============== PERSON NAME ALIASES ==============
