@@ -50,6 +50,7 @@ OPENAI_API_KEY=sk-your-openai-key
 USE_OPENAI_EMBEDDINGS=true
 OPENAI_EMBEDDING_MODEL=text-embedding-3-large
 EMBEDDING_DIMENSION=3072
+ENSURE_INDEXES_ON_STARTUP=true
 
 # Cohere (Optional but highly recommended)
 COHERE_API_KEY=your-cohere-key
@@ -64,6 +65,8 @@ RATE_LIMIT_REQUESTS=100
 RATE_LIMIT_WINDOW=60
 LOG_LEVEL=INFO
 ```
+
+`ENSURE_INDEXES_ON_STARTUP=true` is recommended so Qdrant payload/text indexes are created on boot for faster filtering and keyword queries.
 
 ### 2. Install Dependencies
 

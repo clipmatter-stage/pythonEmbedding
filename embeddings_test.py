@@ -47,7 +47,9 @@ if not QDRANT_URL or not QDRANT_API_KEY:
 USE_OPENAI_EMBEDDINGS = os.getenv("USE_OPENAI_EMBEDDINGS", "true").lower() == "true"
 OPENAI_EMBEDDING_MODEL = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-large")  # Using large model for best quality
 EMBEDDING_DIMENSION = int(os.getenv("EMBEDDING_DIMENSION", "3072"))  # 3072 dimensions for text-embedding-3-large
-ENSURE_INDEXES_ON_STARTUP = os.getenv("ENSURE_INDEXES_ON_STARTUP", "false").lower() == "true"
+# Enable by default so existing collections get all payload/text indexes on boot.
+# Set ENSURE_INDEXES_ON_STARTUP=false on specific deployments if you need to skip it.
+ENSURE_INDEXES_ON_STARTUP = os.getenv("ENSURE_INDEXES_ON_STARTUP", "true").lower() == "true"
 
 # ============== STOP WORDS FOR KEYWORD SEARCH ==============
 # Common words that should be filtered out to speed up keyword search
@@ -1829,7 +1831,7 @@ def ensure_indexes_http():
 create_segments_collection()
 create_legacy_collection()
 if ENSURE_INDEXES_ON_STARTUP:
-    ensure_indexes_http()  # Optional: heavy and noisy on multi-replica startups
+    ensure_indexes_http()  # Enabled by default for faster query performance on existing collections
 else:
     logger.info("Skipping startup index creation (ENSURE_INDEXES_ON_STARTUP=false)")
 
@@ -5790,7 +5792,7 @@ async def root():
             "USE_LLM_UNDERSTANDING": "true/false (default: true) - GPT-4o-mini query parsing",
             "USE_RERANKING": "true/false (default: true) - GPT-4o-mini reranking",
             "USE_QUERY_EXPANSION": "true/false (default: true) - expanded via LLM understanding",
-            "ENSURE_INDEXES_ON_STARTUP": "true/false (default: false) - create payload indexes at startup (can be noisy/slow on multi-replica deployments)",
+            "ENSURE_INDEXES_ON_STARTUP": "true/false (default: true) - create payload/text indexes at startup for faster query/filter performance (set false to skip)",
             "FASTEMBED_MODEL": "FastEmbed model name (default: BAAI/bge-small-en-v1.5)",
             "EMBEDDING_DIMENSION": "3072 for OpenAI large, 1536 for small",
         },
