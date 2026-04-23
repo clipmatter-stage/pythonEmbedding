@@ -4814,33 +4814,36 @@ async def search_incremental(data: IncrementalSearchRequest, authorized: bool = 
 
     # ── AUTO-ROUTE CERTAIN QUERIES TO FULL SEARCH ────────────────────────────
     # 1) Pure numeric queries ("2013", "15") have weak semantic vectors.
-    # 2) Short Urdu/non-Latin queries (1-3 words) often need lexical fallback (keyword scan)
-    #    in addition to vector similarity.
+    # 2) Short semantic queries (1-3 meaningful words; English or non-English)
+    #    often need lexical fallback (keyword scan) in addition to vector similarity.
     # For both classes, delegate to /search logic, then re-wrap into incremental
     # response format with cache + cursor.
     query_tokens_incremental = [normalize_word(w) for w in query_text.split()]
     query_tokens_incremental = [w for w in query_tokens_incremental if w]
     query_word_count_incremental = len(query_tokens_incremental)
-    has_non_ascii_query = any(ord(ch) > 127 for ch in query_text)
+    short_query_terms_incremental = [
+        w for w in query_tokens_incremental
+        if len(w) >= 2 and w not in STOP_WORDS
+    ]
 
     _is_numeric_incremental = bool(query_text) and all(
         w.replace(',', '').replace('.', '').replace('-', '').isdigit()
         for w in query_text.split() if w.strip()
     )
-    _is_short_urdu_incremental = (
+    _is_short_semantic_incremental = (
         data.search_mode == "semantic"
         and 1 <= query_word_count_incremental <= 3
-        and has_non_ascii_query
+        and len(short_query_terms_incremental) >= 1
     )
 
-    if _is_numeric_incremental or _is_short_urdu_incremental:
+    if _is_numeric_incremental or _is_short_semantic_incremental:
         route_reason = "numeric_simple_text" if _is_numeric_incremental else (
-            "single_word_urdu_semantic_keyword" if query_word_count_incremental == 1 else "short_urdu_semantic_keyword"
+            "single_word_semantic_keyword" if query_word_count_incremental == 1 else "short_semantic_keyword"
         )
         logger.info(f"[INCREMENTAL AUTO-ROUTE] Query '{query_text[:80]}' → delegating to full search ({route_reason})")
 
         delegate_top_k = max(data.top_k or 200, 200)
-        if _is_short_urdu_incremental:
+        if _is_short_semantic_incremental:
             delegate_top_k = min(delegate_top_k, 600)
         elif _is_numeric_incremental:
             delegate_top_k = min(delegate_top_k, 400)
