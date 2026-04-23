@@ -47,8 +47,6 @@ if not QDRANT_URL or not QDRANT_API_KEY:
 USE_OPENAI_EMBEDDINGS = os.getenv("USE_OPENAI_EMBEDDINGS", "true").lower() == "true"
 OPENAI_EMBEDDING_MODEL = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-large")  # Using large model for best quality
 EMBEDDING_DIMENSION = int(os.getenv("EMBEDDING_DIMENSION", "3072"))  # 3072 dimensions for text-embedding-3-large
-# Enable by default so existing collections get all payload/text indexes on boot.
-# Set ENSURE_INDEXES_ON_STARTUP=false on specific deployments if you need to skip it.
 ENSURE_INDEXES_ON_STARTUP = os.getenv("ENSURE_INDEXES_ON_STARTUP", "false").lower() == "true"
 
 # ============== STOP WORDS FOR KEYWORD SEARCH ==============
@@ -101,7 +99,7 @@ STOP_WORDS = frozenset({
     "fact", "facts", "hand", "hands", "side", "sides", "world", "life", "being",
     # Urdu common words (transliterated)
     "hai", "hain", "tha", "thi", "the", "ka", "ki", "ke", "ko", "ne", "se", "mein", "par",
-    "aur", "ya", "lekin", "jo", "jab", "kya", "kaise", "kahan", "yeh", "woh", "koi", "kuch","kach",
+    "aur", "ya", "lekin", "jo", "jab", "kya", "kaise", "kahan", "yeh", "woh", "koi", "kuch",
 })
 
 # ============== PERSON NAME ALIASES ==============
@@ -1831,7 +1829,7 @@ def ensure_indexes_http():
 create_segments_collection()
 create_legacy_collection()
 if ENSURE_INDEXES_ON_STARTUP:
-    ensure_indexes_http()  # Enabled by default for faster query performance on existing collections
+    ensure_indexes_http()  # Optional: heavy and noisy on multi-replica startups
 else:
     logger.info("Skipping startup index creation (ENSURE_INDEXES_ON_STARTUP=false)")
 
@@ -4838,7 +4836,9 @@ async def search_incremental(data: IncrementalSearchRequest, authorized: bool = 
         and len(short_query_terms_incremental) >= 1
     )
 
-    if _is_numeric_incremental or _is_short_semantic_incremental:
+    incremental_allow_delegation = os.getenv("INCREMENTAL_ALLOW_DELEGATION", "false").lower() == "true"
+
+    if incremental_allow_delegation and (_is_numeric_incremental or _is_short_semantic_incremental):
         route_reason = "numeric_simple_text" if _is_numeric_incremental else (
             "single_word_semantic_keyword" if query_word_count_incremental == 1 else "short_semantic_keyword"
         )
@@ -4926,6 +4926,11 @@ async def search_incremental(data: IncrementalSearchRequest, authorized: bool = 
                 "qdrant_queries": 0
             }
         }
+    elif _is_numeric_incremental or _is_short_semantic_incremental:
+        logger.info(
+            f"[INCREMENTAL FAST] Auto-delegation disabled; staying on one-query fast path "
+            f"(numeric={_is_numeric_incremental}, short_query={_is_short_semantic_incremental})"
+        )
 
     # Person alias support (fast-path safe): expand short aliases to canonical name once.
     # This improves semantic recall for queries like "hnr" without adding extra queries.
@@ -5792,7 +5797,7 @@ async def root():
             "USE_LLM_UNDERSTANDING": "true/false (default: true) - GPT-4o-mini query parsing",
             "USE_RERANKING": "true/false (default: true) - GPT-4o-mini reranking",
             "USE_QUERY_EXPANSION": "true/false (default: true) - expanded via LLM understanding",
-            "ENSURE_INDEXES_ON_STARTUP": "true/false (default: true) - create payload/text indexes at startup for faster query/filter performance (set false to skip)",
+            "ENSURE_INDEXES_ON_STARTUP": "true/false (default: false) - create payload indexes at startup (can be noisy/slow on multi-replica deployments)",
             "FASTEMBED_MODEL": "FastEmbed model name (default: BAAI/bge-small-en-v1.5)",
             "EMBEDDING_DIMENSION": "3072 for OpenAI large, 1536 for small",
         },
