@@ -4814,7 +4814,7 @@ async def search_incremental(data: IncrementalSearchRequest, authorized: bool = 
 
     # ── AUTO-ROUTE CERTAIN QUERIES TO FULL SEARCH ────────────────────────────
     # 1) Pure numeric queries ("2013", "15") have weak semantic vectors.
-    # 2) Short Urdu queries (2-3 words) often need lexical fallback (keyword scan)
+    # 2) Short Urdu/non-Latin queries (1-3 words) often need lexical fallback (keyword scan)
     #    in addition to vector similarity.
     # For both classes, delegate to /search logic, then re-wrap into incremental
     # response format with cache + cursor.
@@ -4829,12 +4829,14 @@ async def search_incremental(data: IncrementalSearchRequest, authorized: bool = 
     )
     _is_short_urdu_incremental = (
         data.search_mode == "semantic"
-        and 2 <= query_word_count_incremental <= 3
+        and 1 <= query_word_count_incremental <= 3
         and has_non_ascii_query
     )
 
     if _is_numeric_incremental or _is_short_urdu_incremental:
-        route_reason = "numeric_simple_text" if _is_numeric_incremental else "short_urdu_semantic_keyword"
+        route_reason = "numeric_simple_text" if _is_numeric_incremental else (
+            "single_word_urdu_semantic_keyword" if query_word_count_incremental == 1 else "short_urdu_semantic_keyword"
+        )
         logger.info(f"[INCREMENTAL AUTO-ROUTE] Query '{query_text[:80]}' → delegating to full search ({route_reason})")
 
         delegate_top_k = max(data.top_k or 200, 200)
