@@ -3107,11 +3107,15 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
     use_llm_understanding = os.getenv("USE_LLM_UNDERSTANDING", "true").lower() == "true"
     query_source_for_length = raw_query_text or query_text or ""
     normalized_query = normalize_word(query_source_for_length) if query_source_for_length else ""
-    single_word_query = bool(normalized_query and len(query_source_for_length.split()) == 1 and len(normalized_query) >= 2)
+    query_tokens_for_strategy = [normalize_word(token) for token in query_source_for_length.split()]
+    query_tokens_for_strategy = [token for token in query_tokens_for_strategy if token]
+    query_word_count_for_strategy = len(query_tokens_for_strategy)
+    single_word_query = bool(normalized_query and query_word_count_for_strategy == 1 and len(normalized_query) >= 2)
+    short_query_scan = 2 <= query_word_count_for_strategy <= 3
     strict_alias_query = is_strict_person_alias_query(raw_query_text, alias_person_key)
     # Always enable scan strategies for known person aliases — we need speaker/keyword/title search
     is_person_alias_query = alias_person_key is not None
-    use_scan_strategies = (not openai_only_search) or single_word_query or is_person_alias_query
+    use_scan_strategies = (not openai_only_search) or single_word_query or short_query_scan or is_person_alias_query
 
     if openai_only_search:
         # Keep semantic search responsive by constraining expensive fallbacks.
@@ -3120,10 +3124,14 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
             # Person searches need more scanning to find all speaker/title/text matches
             max_scanned = min(max_scanned, 50000)
             logger.info(f"[OPENAI-ONLY] Person alias detected ('{alias_person_key}'): enabling all scan strategies, max_scanned={max_scanned}")
-        else:
-            max_scanned = min(max_scanned, 12000 if single_word_query else 5000)
-        if single_word_query:
+        elif single_word_query:
+            max_scanned = min(max_scanned, 12000)
             logger.info("[OPENAI-ONLY] Single-word query detected: enabling lightweight keyword fallback")
+        elif short_query_scan:
+            max_scanned = min(max_scanned, 18000)
+            logger.info("[OPENAI-ONLY] Short query (2-3 words) detected: enabling scan fallback for lexical recall")
+        else:
+            max_scanned = min(max_scanned, 5000)
     
     # LLM QUERY UNDERSTANDING — parse intent, detect language, extract speaker
     query_intent = None
@@ -3642,18 +3650,27 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                     # and penalize results where they don't.
                     query_words_in_result = False
                     if query_text:
-                        text_lower = (text or "").lower()
-                        title_lower = (video_title or "").lower()
-                        speaker_lower = f"{speaker} {diarization_speaker}".lower()
-                        summary_lower = (payload.get("summary_en") or "").lower()
-                        all_text = f"{text_lower} {title_lower} {speaker_lower} {summary_lower}"
+                        text_norm = normalize_for_matching(text or "")
+                        title_norm = normalize_for_matching(video_title or "")
+                        speaker_norm = normalize_for_matching(f"{speaker} {diarization_speaker}")
+                        summary_norm = normalize_for_matching(payload.get("summary_en") or "")
+                        all_text = f"{text_norm} {title_norm} {speaker_norm} {summary_norm}"
                         
                         # Check if ANY query word appears in the result (whole word or safe variant)
-                        query_words = [w.lower().strip() for w in query_text.split() if len(w.strip()) >= 3]
-                        for qw in query_words:
-                            if whole_word_match(qw, all_text) or word_variant_match(qw, all_text):
-                                query_words_in_result = True
-                                break
+                        query_words = []
+                        for raw_qw in query_text.split():
+                            normalized_qw = normalize_word(raw_qw)
+                            if len(normalized_qw) >= 2:
+                                query_words.append(normalized_qw)
+
+                        # If all query tokens normalize away (very short/noisy), avoid unfair penalties.
+                        if not query_words:
+                            query_words_in_result = True
+                        else:
+                            for qw in query_words:
+                                if whole_word_match(qw, all_text) or word_variant_match(qw, all_text):
+                                    query_words_in_result = True
+                                    break
                     
                     # Apply query-presence penalty for SHORT queries (1-2 words)
                     # Short queries are specific searches ("mufti", "drone", "bill gates") — user expects
@@ -3680,7 +3697,11 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                     lexical_closeness = 0.0
                     if query_text:
                         all_text = f"{text or ''} {video_title or ''} {speaker or ''} {diarization_speaker or ''} {payload.get('summary_en') or ''}"
-                        lexical_query_words = [w for w in query_text.split() if len(normalize_word(w)) >= 3]
+                        lexical_query_words = []
+                        for raw_word in query_text.split():
+                            normalized_word = normalize_word(raw_word)
+                            if len(normalized_word) >= 2:
+                                lexical_query_words.append(normalized_word)
                         if lexical_query_words:
                             close_threshold = 78 if len(lexical_query_words) <= 2 else 82
                             lexical_closeness = query_closeness_score(lexical_query_words, all_text, threshold=close_threshold)
@@ -3742,8 +3763,18 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
     # Strategy 2: Keyword search
     # For single-word queries, also use the query itself as a keyword fallback.
     search_words = list(words) if words else []
-    if query_text and len(query_text.split()) == 1:
-        search_words.append(query_text)
+
+    query_terms_for_keyword = []
+    if query_text:
+        for raw_qw in query_text.split():
+            normalized_qw = normalize_word(raw_qw)
+            if len(normalized_qw) >= 2:
+                query_terms_for_keyword.append(normalized_qw)
+
+    # In openai-only mode, short queries depend on lexical fallback for recall.
+    # If frontend words are sparse/missing, derive terms from the query directly.
+    if query_terms_for_keyword and (len(query_terms_for_keyword) == 1 or (len(query_terms_for_keyword) <= 3 and len(search_words) < 2)):
+        search_words.extend(query_terms_for_keyword)
     
     # Clean up search words: normalize quotes/dashes, strip punctuation, remove too-short words and stop words
     search_words = sorted(set(
@@ -4777,34 +4808,117 @@ async def search_incremental(data: IncrementalSearchRequest, authorized: bool = 
             detail="Either 'query' or non-empty 'words' is required for incremental search"
         )
 
-    # ── AUTO-ROUTE NUMERIC QUERIES ────────────────────────────────────────────
-    # Pure numeric queries (e.g. "2013", "15") have no semantic meaning that
-    # vector embeddings can capture. Their cosine similarity against any document
-    # is ~0.1–0.2, well below the 0.35 threshold → always 0 semantic results.
-    # Redirect to the full /search endpoint logic via SearchRequest so the
-    # simple text filter (whole_word_match + Qdrant MatchText) handles it.
+    # Cursor recovery state (for cache-miss continuation scenarios).
+    cursor_index = int(cursor.get("index", -1)) if cursor and cursor.get("index") is not None else -1
+    cursor_recovery_mode = cursor is not None and cursor_index >= 0
+
+    # ── AUTO-ROUTE CERTAIN QUERIES TO FULL SEARCH ────────────────────────────
+    # 1) Pure numeric queries ("2013", "15") have weak semantic vectors.
+    # 2) Short Urdu queries (2-3 words) often need lexical fallback (keyword scan)
+    #    in addition to vector similarity.
+    # For both classes, delegate to /search logic, then re-wrap into incremental
+    # response format with cache + cursor.
+    query_tokens_incremental = [normalize_word(w) for w in query_text.split()]
+    query_tokens_incremental = [w for w in query_tokens_incremental if w]
+    query_word_count_incremental = len(query_tokens_incremental)
+    has_non_ascii_query = any(ord(ch) > 127 for ch in query_text)
+
     _is_numeric_incremental = bool(query_text) and all(
         w.replace(',', '').replace('.', '').replace('-', '').isdigit()
         for w in query_text.split() if w.strip()
     )
-    if _is_numeric_incremental:
-        logger.info(f"[INCREMENTAL AUTO-ROUTE] Numeric query '{query_text}' → delegating to simple text search")
+    _is_short_urdu_incremental = (
+        data.search_mode == "semantic"
+        and 2 <= query_word_count_incremental <= 3
+        and has_non_ascii_query
+    )
+
+    if _is_numeric_incremental or _is_short_urdu_incremental:
+        route_reason = "numeric_simple_text" if _is_numeric_incremental else "short_urdu_semantic_keyword"
+        logger.info(f"[INCREMENTAL AUTO-ROUTE] Query '{query_text[:80]}' → delegating to full search ({route_reason})")
+
+        delegate_top_k = max(data.top_k or 200, 200)
+        if _is_short_urdu_incremental:
+            delegate_top_k = min(delegate_top_k, 600)
+        elif _is_numeric_incremental:
+            delegate_top_k = min(delegate_top_k, 400)
+
         delegate_req = SearchRequest(
             query=query_text,
             words=list(data.words) if data.words else [],
-            top_k=data.top_k or 200,
+            top_k=delegate_top_k,
             video_id=data.video_id,
             speaker=data.speaker,
             title=data.title,
             language=data.language,
             min_score=data.min_score,
             time_range=data.time_range,
-            max_scanned=max(data.max_scanned, 50000),
-            search_mode="simple",
-            filter_type="text",
+            max_scanned=max(data.max_scanned, 50000 if _is_numeric_incremental else 18000),
+            search_mode="simple" if _is_numeric_incremental else "semantic",
+            filter_type="text" if _is_numeric_incremental else data.filter_type,
+            filter_year=data.filter_year,
+            filter_month=data.filter_month,
+            filter_date=data.filter_date,
         )
-        return await search(delegate_req, authorized=True)
-    # ── END AUTO-ROUTE ────────────────────────────────────────────────────────
+
+        delegated = await search(delegate_req, authorized=True)
+        delegated_results = delegated.get("results", []) if isinstance(delegated, dict) else []
+
+        delegated_query_params = {
+            "query": data.query,
+            "effective_query": query_text,
+            "speaker": data.speaker,
+            "effective_speaker": data.speaker,
+            "alias_person_key": None,
+            "title": data.title,
+            "video_id": data.video_id,
+            "language": data.language,
+            "search_mode": delegate_req.search_mode,
+            "filter_type": delegate_req.filter_type,
+            "delegated_route_reason": route_reason,
+        }
+        cache_search_results(search_session_id, delegated_results, delegated_query_params, delegate_req.top_k)
+
+        extraction_cursor = cursor if cursor_recovery_mode else None
+        batch, next_cursor, has_more = extract_batch_from_results(
+            delegated_results,
+            extraction_cursor,
+            batch_size,
+            search_session_id=search_session_id
+        )
+
+        unique_video_ids_in_cache = len(set(r.get("video_id") for r in delegated_results if r.get("video_id")))
+        elapsed = time.time() - start_time
+
+        return {
+            "success": True,
+            "results": batch,
+            "cursor": {
+                "next": next_cursor,
+                "has_more": has_more,
+                "total_available": unique_video_ids_in_cache
+            },
+            "search_session_id": search_session_id,
+            "metadata": {
+                "elapsed_seconds": round(elapsed, 3),
+                "cache_hit": False,
+                "batch_size": len(batch),
+                "batch_start": cursor_index + 1 if cursor_recovery_mode else 0,
+                "query": data.query or query_text,
+                "total_found": len(delegated_results),
+                "search_mode": delegate_req.search_mode,
+                "top_k_used": delegate_req.top_k,
+                "expansion_pending": False,
+                "total_segments_cached": len(delegated_results),
+                "total_videos_cached": unique_video_ids_in_cache,
+                "cursor_recovery_mode": cursor_recovery_mode,
+                "fast_path": False,
+                "delegated_full_search": True,
+                "delegated_reason": route_reason,
+                "llm_calls": 0,
+                "qdrant_queries": 0
+            }
+        }
 
     # Person alias support (fast-path safe): expand short aliases to canonical name once.
     # This improves semantic recall for queries like "hnr" without adding extra queries.
@@ -4824,10 +4938,6 @@ async def search_incremental(data: IncrementalSearchRequest, authorized: bool = 
             f"[INCREMENTAL FAST] Alias detected '{alias_person_key}': "
             f"query expanded to '{effective_query_text[:80]}'"
         )
-
-    # Cursor recovery on cache miss: fetch deeper in one call.
-    cursor_index = int(cursor.get("index", -1)) if cursor and cursor.get("index") is not None else -1
-    cursor_recovery_mode = cursor is not None and cursor_index >= 0
 
     initial_top_k = max(20, batch_size * 4)
     if effective_speaker_filter or data.title:
