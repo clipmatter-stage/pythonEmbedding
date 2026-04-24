@@ -561,6 +561,9 @@ embedding_cache = TTLCache(maxsize=1000, ttl=3600)
 # Key: search_session_id (UUID), Value: {results: List[Dict], query_params: Dict, timestamp: float}
 search_result_cache = TTLCache(maxsize=1000, ttl=1800)  # 30 minutes
 
+# Cache for expensive text-index health checks (5 minutes)
+index_health_cache = TTLCache(maxsize=16, ttl=300)
+
 # ============== FASTEMBED MODEL (lightweight CPU fallback) ==============
 # FastEmbed: ~200MB RAM vs ~2GB for sentence-transformers+PyTorch
 # BAAI/bge-small-en-v1.5 is fast and English-focused (384-dim)
@@ -1688,6 +1691,262 @@ def calculate_combined_score(semantic_score: float, keyword_match: bool, fuzzy_s
     if fuzzy_score > 0:
         base_score += fuzzy_score * 0.05  # Small fuzzy bonus
     return min(base_score, 1.0)  # Cap at 1.0
+
+
+def classify_query_shape(query_text: str, search_mode: str = "semantic", alias_person_key: Optional[str] = None) -> Dict:
+    """
+    Shared query-shape classifier used by both /search and /search/incremental.
+    Keeps short-query behavior consistent across both endpoints.
+    """
+    raw_query = (query_text or "").strip()
+    raw_tokens = [w for w in raw_query.split() if w.strip()]
+    normalized_tokens = [normalize_word(w) for w in raw_tokens]
+    normalized_tokens = [w for w in normalized_tokens if w]
+
+    short_terms = [
+        w for w in normalized_tokens
+        if len(w) >= 2 and w not in STOP_WORDS
+    ]
+
+    is_numeric_query = bool(raw_tokens) and all(
+        token.replace(',', '').replace('.', '').replace('-', '').isdigit()
+        for token in raw_tokens
+    )
+
+    is_short_semantic_query = (
+        search_mode == "semantic"
+        and 1 <= len(normalized_tokens) <= 3
+        and len(short_terms) >= 1
+    )
+
+    return {
+        "raw_query": raw_query,
+        "token_count": len(normalized_tokens),
+        "tokens": normalized_tokens,
+        "short_terms": short_terms,
+        "is_numeric_query": is_numeric_query,
+        "is_short_semantic_query": is_short_semantic_query,
+        "is_alias_query": bool(alias_person_key),
+        "alias_person_key": alias_person_key,
+    }
+
+
+def compute_retrieval_threshold(min_score: float, is_short_semantic_query: bool = False, is_alias_query: bool = False) -> float:
+    """
+    Shared retrieval threshold policy used by both /search and /search/incremental.
+    """
+    threshold = max(min_score * 0.85, 0.35)
+    if is_alias_query:
+        return max(min_score * 0.55, 0.18)
+    if is_short_semantic_query:
+        return max(min_score * 0.60, 0.20)
+    return threshold
+
+
+def collect_short_query_lexical_evidence(short_terms: List[str], payload: Dict, fuzzy_threshold: int = 90) -> Dict:
+    """
+    Collect lightweight lexical evidence for short-query reranking/backstop.
+    """
+    if not short_terms:
+        return {
+            "matched_terms": [],
+            "total_hits": 0,
+            "exact_hits": 0,
+            "fuzzy_hits": 0,
+            "coverage": 0.0,
+            "matched_fields": [],
+            "has_signal": False,
+        }
+
+    text_field = normalize_for_matching((payload.get("text") or "")[:1400])
+    title_field = normalize_for_matching(payload.get("video_title") or "")
+    speaker_field = normalize_for_matching(
+        f"{payload.get('speaker', '')} {payload.get('diarization_speaker', '')}"
+    )
+    summary_field = normalize_for_matching(payload.get("summary_en") or "")
+
+    fields = {
+        "text": text_field,
+        "video_title": title_field,
+        "speaker": speaker_field,
+        "summary_en": summary_field,
+    }
+
+    matched_terms = []
+    matched_fields = set()
+    exact_hits = 0
+    fuzzy_hits = 0
+
+    for term in short_terms:
+        matched = False
+        for field_name, field_value in fields.items():
+            if not field_value:
+                continue
+
+            if whole_word_match(term, field_value) or word_variant_match(term, field_value):
+                exact_hits += 1
+                matched_fields.add(field_name)
+                matched = True
+                break
+
+            if len(term) >= 4 and fuzzy_word_match(term, field_value, threshold=fuzzy_threshold) > 0:
+                fuzzy_hits += 1
+                matched_fields.add(field_name)
+                matched = True
+                break
+
+        if matched:
+            matched_terms.append(term)
+
+    total_hits = len(matched_terms)
+    coverage = total_hits / max(len(short_terms), 1)
+    return {
+        "matched_terms": matched_terms,
+        "total_hits": total_hits,
+        "exact_hits": exact_hits,
+        "fuzzy_hits": fuzzy_hits,
+        "coverage": round(coverage, 4),
+        "matched_fields": sorted(matched_fields),
+        "has_signal": total_hits > 0,
+    }
+
+
+def apply_short_query_score_tuning(results: List[Dict], short_terms: List[str], is_alias_query: bool = False) -> List[Dict]:
+    """
+    Balanced reranking for short queries:
+      - preserve semantic score as base
+      - modest lexical bonus when evidence exists
+      - lexical-missing penalty for non-alias queries
+    """
+    if not results or not short_terms:
+        return results
+
+    tuned = []
+    for result in results:
+        entry = result.copy()
+        score = float(entry.get("score", 0.0) or 0.0)
+        lexical_hits = int(entry.get("short_query_lexical_hits", 0) or 0)
+        lexical_coverage = float(entry.get("short_query_lexical_coverage", 0.0) or 0.0)
+
+        match_types = list(entry.get("match_types", []))
+
+        if lexical_hits > 0:
+            lexical_bonus = min(0.02 * lexical_hits + (0.06 * lexical_coverage), 0.12)
+            score = min(score + lexical_bonus, 1.0)
+            if "short_query_lexical_hit" not in match_types:
+                match_types.append("short_query_lexical_hit")
+        elif not is_alias_query:
+            penalty = 0.10 if len(short_terms) <= 2 else 0.07
+            score = max(score - penalty, 0.0)
+            if "short_query_no_lexical_hit" not in match_types:
+                match_types.append("short_query_no_lexical_hit")
+
+        entry["score"] = round(score, 4)
+        entry["match_types"] = match_types
+        tuned.append(entry)
+
+    tuned.sort(key=lambda x: (x.get("score", 0), -x.get("start_time", 0)), reverse=True)
+    return tuned
+
+
+def merge_segment_candidates(primary_results: List[Dict], secondary_results: List[Dict]) -> List[Dict]:
+    """
+    Merge candidate segment lists by segment id while preserving best score and
+    aggregating match metadata.
+    """
+    merged = {}
+
+    def _merge_one(candidate: Dict):
+        candidate_id = candidate.get("id")
+        if candidate_id is None:
+            return
+
+        incoming = candidate.copy()
+        incoming_match_types = list(incoming.get("match_types", []))
+
+        if candidate_id not in merged:
+            incoming["match_types"] = incoming_match_types
+            merged[candidate_id] = incoming
+            return
+
+        existing = merged[candidate_id]
+        existing["score"] = max(float(existing.get("score", 0.0)), float(incoming.get("score", 0.0)))
+        existing["match_types"] = sorted(set(list(existing.get("match_types", [])) + incoming_match_types))
+
+        existing_hits = int(existing.get("short_query_lexical_hits", 0) or 0)
+        incoming_hits = int(incoming.get("short_query_lexical_hits", 0) or 0)
+        existing["short_query_lexical_hits"] = max(existing_hits, incoming_hits)
+
+        existing_cov = float(existing.get("short_query_lexical_coverage", 0.0) or 0.0)
+        incoming_cov = float(incoming.get("short_query_lexical_coverage", 0.0) or 0.0)
+        existing["short_query_lexical_coverage"] = max(existing_cov, incoming_cov)
+
+        existing_fields = set(existing.get("short_query_matched_fields", []) or [])
+        incoming_fields = set(incoming.get("short_query_matched_fields", []) or [])
+        existing["short_query_matched_fields"] = sorted(existing_fields | incoming_fields)
+
+    for item in primary_results:
+        _merge_one(item)
+    for item in secondary_results:
+        _merge_one(item)
+
+    merged_results = list(merged.values())
+    merged_results.sort(key=lambda x: (x.get("score", 0), -x.get("start_time", 0)), reverse=True)
+    return merged_results
+
+
+def detect_text_index_health(required_fields: Optional[List[str]] = None) -> Dict:
+    """
+    Best-effort inspection of Qdrant payload schema to determine whether the
+    required full-text indexes are present for MatchText-based lexical backstop.
+    """
+    fields = required_fields or ["text", "video_title", "speaker", "diarization_speaker"]
+    cache_key = "|".join(sorted(fields))
+    cached = index_health_cache.get(cache_key)
+    if cached:
+        return cached
+
+    health = {
+        "required_fields": fields,
+        "indexed_fields": [],
+        "missing_fields": list(fields),
+        "is_healthy": False,
+        "warning": None,
+    }
+
+    try:
+        collection_info = qdrant_client.get_collection(collection_name=SEGMENTS_COLLECTION)
+        payload_schema = getattr(collection_info, "payload_schema", None) or {}
+
+        if hasattr(payload_schema, "model_dump"):
+            payload_schema = payload_schema.model_dump()
+        elif hasattr(payload_schema, "dict"):
+            payload_schema = payload_schema.dict()
+        elif not isinstance(payload_schema, dict):
+            payload_schema = {}
+
+        indexed_fields = []
+        for field_name in fields:
+            schema_entry = payload_schema.get(field_name)
+            if not schema_entry:
+                continue
+            schema_repr = str(schema_entry).lower()
+            if "text" in schema_repr:
+                indexed_fields.append(field_name)
+
+        missing_fields = [f for f in fields if f not in indexed_fields]
+        health["indexed_fields"] = indexed_fields
+        health["missing_fields"] = missing_fields
+        health["is_healthy"] = len(missing_fields) == 0
+        if missing_fields:
+            health["warning"] = f"Missing text indexes for fields: {', '.join(missing_fields)}"
+
+    except Exception as exc:
+        health["warning"] = f"Could not inspect text index health: {str(exc)}"
+        health["error"] = str(exc)
+
+    index_health_cache[cache_key] = health
+    return health
 
 # ============== END ELASTIC SEARCH HELPERS ==============
 
@@ -3106,12 +3365,11 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
     use_reranking = os.getenv("USE_RERANKING", "true").lower() == "true"
     use_llm_understanding = os.getenv("USE_LLM_UNDERSTANDING", "true").lower() == "true"
     query_source_for_length = raw_query_text or query_text or ""
+    query_shape = classify_query_shape(query_source_for_length, search_mode=search_mode, alias_person_key=alias_person_key)
+    query_word_count_for_strategy = int(query_shape.get("token_count", 0))
     normalized_query = normalize_word(query_source_for_length) if query_source_for_length else ""
-    query_tokens_for_strategy = [normalize_word(token) for token in query_source_for_length.split()]
-    query_tokens_for_strategy = [token for token in query_tokens_for_strategy if token]
-    query_word_count_for_strategy = len(query_tokens_for_strategy)
     single_word_query = bool(normalized_query and query_word_count_for_strategy == 1 and len(normalized_query) >= 2)
-    short_query_scan = 2 <= query_word_count_for_strategy <= 3
+    short_query_scan = bool(query_shape.get("is_short_semantic_query") and query_word_count_for_strategy >= 2)
     strict_alias_query = is_strict_person_alias_query(raw_query_text, alias_person_key)
     # Always enable scan strategies for known person aliases — we need speaker/keyword/title search
     is_person_alias_query = alias_person_key is not None
@@ -3582,7 +3840,11 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                 # We want to retrieve results that have at least some semantic similarity.
                 # For queries like "bill gates" in a database without Bill Gates content,
                 # this prevents retrieving completely unrelated Pakistan politics videos.
-                retrieval_threshold = max(min_score * 0.85, 0.35)  # e.g. 0.35 * 0.85 = 0.30 (raised from 0.26)
+                retrieval_threshold = compute_retrieval_threshold(
+                    min_score=min_score,
+                    is_short_semantic_query=bool(query_shape.get("is_short_semantic_query")),
+                    is_alias_query=is_person_alias_query,
+                )
                 
                 sem_search_response = qdrant_client.query_points(
                     collection_name=SEGMENTS_COLLECTION,
@@ -4782,7 +5044,12 @@ async def search_incremental(data: IncrementalSearchRequest, authorized: bool = 
                 "expansion_pending": False,
                 "total_segments_cached": len(all_results),
                 "total_videos_cached": unique_video_ids_in_cache,
-                "fast_path": True
+                "fast_path": True,
+                "query_shape": query_params.get("query_shape"),
+                "lexical_backstop_requested": bool(query_params.get("lexical_backstop_requested", False)),
+                "lexical_backstop_applied": bool(query_params.get("lexical_backstop_applied", False)),
+                "lexical_backstop_reason": query_params.get("lexical_backstop_reason"),
+                "diagnostics_warnings": query_params.get("diagnostics_warnings", []),
             }
         }
 
@@ -4818,23 +5085,10 @@ async def search_incremental(data: IncrementalSearchRequest, authorized: bool = 
     #    often need lexical fallback (keyword scan) in addition to vector similarity.
     # For both classes, delegate to /search logic, then re-wrap into incremental
     # response format with cache + cursor.
-    query_tokens_incremental = [normalize_word(w) for w in query_text.split()]
-    query_tokens_incremental = [w for w in query_tokens_incremental if w]
-    query_word_count_incremental = len(query_tokens_incremental)
-    short_query_terms_incremental = [
-        w for w in query_tokens_incremental
-        if len(w) >= 2 and w not in STOP_WORDS
-    ]
-
-    _is_numeric_incremental = bool(query_text) and all(
-        w.replace(',', '').replace('.', '').replace('-', '').isdigit()
-        for w in query_text.split() if w.strip()
-    )
-    _is_short_semantic_incremental = (
-        data.search_mode == "semantic"
-        and 1 <= query_word_count_incremental <= 3
-        and len(short_query_terms_incremental) >= 1
-    )
+    initial_query_shape = classify_query_shape(query_text, search_mode=data.search_mode)
+    query_word_count_incremental = int(initial_query_shape.get("token_count", 0))
+    _is_numeric_incremental = bool(initial_query_shape.get("is_numeric_query"))
+    _is_short_semantic_incremental = bool(initial_query_shape.get("is_short_semantic_query"))
 
     incremental_allow_delegation = os.getenv("INCREMENTAL_ALLOW_DELEGATION", "false").lower() == "true"
 
@@ -4922,6 +5176,13 @@ async def search_incremental(data: IncrementalSearchRequest, authorized: bool = 
                 "fast_path": False,
                 "delegated_full_search": True,
                 "delegated_reason": route_reason,
+                "query_shape": {
+                    "token_count": int(initial_query_shape.get("token_count", 0)),
+                    "short_terms": list(initial_query_shape.get("short_terms", [])),
+                    "is_numeric_query": bool(initial_query_shape.get("is_numeric_query")),
+                    "is_short_semantic_query": bool(initial_query_shape.get("is_short_semantic_query")),
+                },
+                "diagnostics_warnings": [],
                 "llm_calls": 0,
                 "qdrant_queries": 0
             }
@@ -4952,12 +5213,13 @@ async def search_incremental(data: IncrementalSearchRequest, authorized: bool = 
         )
 
     # Short-query mode: improve recall for 1-3 term queries while staying on one-query fast path.
-    short_query_terms_fast = [
-        normalize_word(w)
-        for w in query_text.split()
-        if len(normalize_word(w)) >= 2 and normalize_word(w) not in STOP_WORDS
-    ]
-    is_short_query_fast = data.search_mode == "semantic" and 1 <= len(short_query_terms_fast) <= 3
+    fast_query_shape = classify_query_shape(
+        query_text=query_text,
+        search_mode=data.search_mode,
+        alias_person_key=alias_person_key,
+    )
+    short_query_terms_fast = list(fast_query_shape.get("short_terms", []))
+    is_short_query_fast = bool(fast_query_shape.get("is_short_semantic_query"))
 
     initial_top_k = max(20, batch_size * 4)
     if effective_speaker_filter or data.title:
@@ -4995,13 +5257,18 @@ async def search_incremental(data: IncrementalSearchRequest, authorized: bool = 
 
     # 2) One Qdrant query
     search_params = SearchParams(hnsw_ef=64, exact=False)
-    retrieval_threshold = max(data.min_score * 0.85, 0.35)
-    if is_short_query_fast and not alias_person_key:
-        retrieval_threshold = max(data.min_score * 0.60, 0.20)
-    if alias_person_key:
-        # Relax threshold for known person aliases to improve recall.
-        # Ranking below applies an alias-signal boost to keep relevant hits near top.
-        retrieval_threshold = max(data.min_score * 0.55, 0.18)
+    retrieval_threshold = compute_retrieval_threshold(
+        min_score=data.min_score,
+        is_short_semantic_query=is_short_query_fast,
+        is_alias_query=bool(alias_person_key),
+    )
+
+    diagnostics_warnings = []
+    lexical_backstop_requested = False
+    lexical_backstop_applied = False
+    lexical_backstop_added = 0
+    lexical_backstop_scanned = 0
+    lexical_backstop_reason = None
 
     minimal_payload_fields = [
         "video_id", "video_title", "speaker", "diarization_speaker",
@@ -5045,25 +5312,24 @@ async def search_incremental(data: IncrementalSearchRequest, authorized: bool = 
         end_val = payload.get("end_time", 0)
         raw_score = float(getattr(r, "score", 0.0))
         match_types = ["semantic"]
+        lexical_evidence = {
+            "total_hits": 0,
+            "coverage": 0.0,
+            "matched_fields": [],
+            "has_signal": False,
+        }
 
         # Add lightweight lexical signal for short semantic queries.
         if is_short_query_fast:
-            all_text = normalize_for_matching(
-                f"{payload.get('text', '')[:900]} {video_title} {speaker} {diarization_speaker}"
-            )
-            lexical_hits = 0
-            for term in short_query_terms_fast:
-                if whole_word_match(term, all_text):
-                    lexical_hits += 1
-                elif len(term) >= 4 and fuzzy_word_match(term, all_text, threshold=90) > 0:
-                    lexical_hits += 1
+            lexical_evidence = collect_short_query_lexical_evidence(short_query_terms_fast, payload, fuzzy_threshold=90)
+            lexical_hits = int(lexical_evidence.get("total_hits", 0))
 
             if lexical_hits > 0:
-                raw_score = min(raw_score + min(0.04 * lexical_hits, 0.12), 1.0)
+                raw_score = min(raw_score + min(0.03 * lexical_hits, 0.09), 1.0)
                 match_types.append("short_query_lexical_hit")
             elif not alias_person_key:
                 # Penalize semantic-only drift for short non-alias queries.
-                raw_score = max(raw_score - 0.08, 0.0)
+                raw_score = max(raw_score - 0.06, 0.0)
                 match_types.append("short_query_no_lexical_hit")
 
         if alias_person_key:
@@ -5106,10 +5372,203 @@ async def search_incremental(data: IncrementalSearchRequest, authorized: bool = 
             "language": payload.get("language", ""),
             "created_at": payload.get("created_at"),
             "llm_relevance_score": None,
+            "short_query_lexical_hits": int(lexical_evidence.get("total_hits", 0)),
+            "short_query_lexical_coverage": float(lexical_evidence.get("coverage", 0.0) or 0.0),
+            "short_query_matched_fields": list(lexical_evidence.get("matched_fields", []) or []),
             "youtube_url_timestamped": f"{payload.get('youtube_url', '')}?t={int(start_val or 0)}" if payload.get("youtube_url") else ""
         })
 
     all_results.sort(key=lambda x: (x.get("score", 0), -x.get("start_time", 0)), reverse=True)
+
+    # Bounded lexical backstop for short non-alias semantic queries.
+    # Trigger only when vector retrieval looks weak (few unique videos or weak top-score cluster).
+    if is_short_query_fast and short_query_terms_fast and not alias_person_key:
+        vector_unique_videos = len(set(r.get("video_id") for r in all_results if r.get("video_id")))
+        top_scores = [float(r.get("score", 0.0) or 0.0) for r in all_results[:6]]
+        strongest_score = top_scores[0] if top_scores else 0.0
+        avg_top_score = (sum(top_scores) / len(top_scores)) if top_scores else 0.0
+
+        low_unique_yield = vector_unique_videos < max(3, min(8, batch_size))
+        weak_top_cluster = (
+            not top_scores
+            or strongest_score < max(data.min_score + 0.06, 0.42)
+            or (len(top_scores) >= 3 and avg_top_score < max(data.min_score + 0.03, 0.38))
+        )
+
+        if low_unique_yield or weak_top_cluster:
+            lexical_backstop_requested = True
+            reason_parts = []
+            if low_unique_yield:
+                reason_parts.append("low_unique_video_yield")
+            if weak_top_cluster:
+                reason_parts.append("weak_top_score_cluster")
+            lexical_backstop_reason = "+".join(reason_parts)
+
+            index_health = detect_text_index_health([
+                "text", "video_title", "speaker", "diarization_speaker"
+            ])
+            if index_health.get("warning"):
+                diagnostics_warnings.append(index_health["warning"])
+
+            try:
+                lexical_max_scan = min(
+                    max(data.max_scanned, 1500),
+                    int(os.getenv("INCREMENTAL_LEXICAL_BACKSTOP_MAX_SCAN", "3000"))
+                )
+                lexical_target = max(batch_size * 8, 60)
+                if low_unique_yield:
+                    lexical_target = max(lexical_target, 90)
+
+                lexical_should_conditions = []
+                for term in short_query_terms_fast[:4]:
+                    lexical_should_conditions.extend([
+                        FieldCondition(key="text", match=MatchText(text=term)),
+                        FieldCondition(key="video_title", match=MatchText(text=term)),
+                        FieldCondition(key="speaker", match=MatchText(text=term)),
+                        FieldCondition(key="diarization_speaker", match=MatchText(text=term)),
+                        FieldCondition(key="summary_en", match=MatchText(text=term)),
+                    ])
+
+                lexical_scroll_filter = Filter(
+                    must=filter_conditions if filter_conditions else None,
+                    should=lexical_should_conditions,
+                )
+
+                existing_ids = {r.get("id") for r in all_results}
+                lexical_candidates = []
+                offset = None
+                scanned_local = 0
+
+                while scanned_local < lexical_max_scan and len(lexical_candidates) < lexical_target:
+                    points, next_offset = qdrant_client.scroll(
+                        collection_name=SEGMENTS_COLLECTION,
+                        scroll_filter=lexical_scroll_filter,
+                        limit=min(300, lexical_max_scan - scanned_local),
+                        offset=offset,
+                        with_payload=minimal_payload_fields,
+                        with_vectors=False,
+                    )
+
+                    if not points:
+                        break
+
+                    for point in points:
+                        scanned_local += 1
+                        if point.id in existing_ids:
+                            continue
+
+                        payload = point.payload or {}
+                        speaker = payload.get("speaker", "")
+                        diarization_speaker = payload.get("diarization_speaker", "")
+                        video_title = payload.get("video_title", "")
+
+                        if effective_speaker_filter:
+                            speaker_combined = f"{speaker} {diarization_speaker}".strip()
+                            speaker_ok = fuzzy_match_speaker(effective_speaker_filter, speaker_combined, threshold=70)
+                            if not speaker_ok and alias_speaker_variants:
+                                speaker_ok = any(
+                                    fuzzy_match_speaker(variant, speaker_combined, threshold=70)
+                                    for variant in alias_speaker_variants
+                                )
+                            if not speaker_ok:
+                                continue
+
+                        if data.title and not fuzzy_match_text(data.title, video_title, threshold=60):
+                            continue
+
+                        lexical_evidence = collect_short_query_lexical_evidence(
+                            short_query_terms_fast,
+                            payload,
+                            fuzzy_threshold=90,
+                        )
+                        if not lexical_evidence.get("has_signal"):
+                            continue
+
+                        matched_fields = lexical_evidence.get("matched_fields", [])
+                        coverage = float(lexical_evidence.get("coverage", 0.0) or 0.0)
+                        exact_hits = int(lexical_evidence.get("exact_hits", 0) or 0)
+
+                        field_bonus = 0.0
+                        if "video_title" in matched_fields or "speaker" in matched_fields:
+                            field_bonus += 0.06
+                        if "text" in matched_fields:
+                            field_bonus += 0.03
+
+                        lexical_score = min(
+                            max(data.min_score * 0.95, 0.33)
+                            + (coverage * 0.28)
+                            + (0.02 * exact_hits)
+                            + field_bonus,
+                            0.86,
+                        )
+
+                        start_val = payload.get("start_time", 0)
+                        end_val = payload.get("end_time", 0)
+                        lexical_candidates.append({
+                            "id": point.id,
+                            "segment_ids": [point.id],
+                            "match_count": 1,
+                            "is_exact_phrase_match": False,
+                            "is_multi_match": False,
+                            "matched_terms": [],
+                            "score": round(lexical_score, 4),
+                            "match_types": ["incremental_lexical_backstop", "short_query_lexical_hit"],
+                            "matched_field": matched_fields[0] if matched_fields else "text",
+                            "fuzzy_score": round(min(coverage, 1.0), 4),
+                            "matched_words_count": 0,
+                            "video_id": payload.get("video_id"),
+                            "video_title": video_title,
+                            "speaker": speaker,
+                            "diarization_speaker": diarization_speaker,
+                            "start_time": start_val,
+                            "end_time": end_val,
+                            "duration": round((end_val or 0) - (start_val or 0), 2),
+                            "text": payload.get("text", ""),
+                            "text_length": payload.get("text_length", 0),
+                            "summary_en": payload.get("summary_en", ""),
+                            "youtube_url": payload.get("youtube_url", ""),
+                            "language": payload.get("language", ""),
+                            "created_at": payload.get("created_at"),
+                            "llm_relevance_score": None,
+                            "short_query_lexical_hits": int(lexical_evidence.get("total_hits", 0) or 0),
+                            "short_query_lexical_coverage": coverage,
+                            "short_query_matched_fields": list(matched_fields),
+                            "youtube_url_timestamped": f"{payload.get('youtube_url', '')}?t={int(start_val or 0)}" if payload.get("youtube_url") else "",
+                        })
+                        existing_ids.add(point.id)
+
+                    if not next_offset:
+                        break
+                    offset = next_offset
+
+                lexical_backstop_scanned = scanned_local
+                lexical_backstop_added = len(lexical_candidates)
+
+                if lexical_candidates:
+                    all_results = merge_segment_candidates(all_results, lexical_candidates)
+                    lexical_backstop_applied = True
+                    logger.info(
+                        f"[INCREMENTAL LEXICAL BACKSTOP] added={lexical_backstop_added}, "
+                        f"scanned={lexical_backstop_scanned}, reason={lexical_backstop_reason}, "
+                        f"pre_merge_videos={vector_unique_videos}"
+                    )
+                else:
+                    logger.info(
+                        f"[INCREMENTAL LEXICAL BACKSTOP] no candidates found; "
+                        f"scanned={lexical_backstop_scanned}, reason={lexical_backstop_reason}"
+                    )
+
+            except Exception as backstop_error:
+                warning_msg = f"Lexical backstop failed: {str(backstop_error)}"
+                diagnostics_warnings.append(warning_msg)
+                logger.warning(f"[INCREMENTAL LEXICAL BACKSTOP] {warning_msg}")
+
+    if is_short_query_fast and short_query_terms_fast:
+        all_results = apply_short_query_score_tuning(
+            all_results,
+            short_query_terms_fast,
+            is_alias_query=bool(alias_person_key),
+        )
 
     # Cache the full retrieved set for cursor pagination.
     query_params = {
@@ -5122,7 +5581,17 @@ async def search_incremental(data: IncrementalSearchRequest, authorized: bool = 
         "video_id": data.video_id,
         "language": data.language,
         "search_mode": data.search_mode,
-        "filter_type": data.filter_type
+        "filter_type": data.filter_type,
+        "query_shape": {
+            "token_count": int(fast_query_shape.get("token_count", 0)),
+            "short_terms": short_query_terms_fast,
+            "is_short_semantic_query": bool(is_short_query_fast),
+            "is_numeric_query": bool(fast_query_shape.get("is_numeric_query")),
+        },
+        "lexical_backstop_requested": lexical_backstop_requested,
+        "lexical_backstop_applied": lexical_backstop_applied,
+        "lexical_backstop_reason": lexical_backstop_reason,
+        "diagnostics_warnings": diagnostics_warnings,
     }
     cache_search_results(search_session_id, all_results, query_params, initial_top_k)
 
@@ -5166,7 +5635,20 @@ async def search_incremental(data: IncrementalSearchRequest, authorized: bool = 
             "cursor_recovery_mode": cursor_recovery_mode,
             "fast_path": True,
             "short_query_mode": is_short_query_fast,
+            "short_query_terms": short_query_terms_fast,
+            "query_shape": {
+                "token_count": int(fast_query_shape.get("token_count", 0)),
+                "is_short_semantic_query": bool(fast_query_shape.get("is_short_semantic_query")),
+                "is_numeric_query": bool(fast_query_shape.get("is_numeric_query")),
+                "is_alias_query": bool(alias_person_key),
+            },
             "effective_retrieval_threshold": round(retrieval_threshold, 4),
+            "lexical_backstop_requested": lexical_backstop_requested,
+            "lexical_backstop_applied": lexical_backstop_applied,
+            "lexical_backstop_reason": lexical_backstop_reason,
+            "lexical_backstop_added": lexical_backstop_added,
+            "lexical_backstop_scanned": lexical_backstop_scanned,
+            "diagnostics_warnings": diagnostics_warnings,
             "llm_calls": 0,
             "qdrant_queries": 1
         }
@@ -5836,6 +6318,8 @@ async def root():
             "OPENAI_API_KEY": "Required for embeddings, query understanding, and reranking",
             "USE_OPENAI_EMBEDDINGS": "true/false (default: true)",
             "OPENAI_ONLY_SEARCH": "true/false (default: true) - route content filters to semantic and skip scan-heavy fallbacks",
+            "INCREMENTAL_ALLOW_DELEGATION": "true/false (default: false) - allow /search/incremental to delegate short/numeric queries to full /search pipeline",
+            "INCREMENTAL_LEXICAL_BACKSTOP_MAX_SCAN": "Max scroll scan for short-query lexical backstop in incremental mode (default: 3000)",
             "USE_LLM_UNDERSTANDING": "true/false (default: true) - GPT-4o-mini query parsing",
             "USE_RERANKING": "true/false (default: true) - GPT-4o-mini reranking",
             "USE_QUERY_EXPANSION": "true/false (default: true) - expanded via LLM understanding",
