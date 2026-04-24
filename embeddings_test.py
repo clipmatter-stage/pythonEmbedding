@@ -5534,20 +5534,44 @@ async def search_incremental(data: IncrementalSearchRequest, authorized: bool = 
         strongest_score = top_scores[0] if top_scores else 0.0
         avg_top_score = (sum(top_scores) / len(top_scores)) if top_scores else 0.0
 
+        top_lexical_window = all_results[:18]
+        multi_term_short_query = len(short_query_terms_fast) >= 2
+        required_multi_term_hits = min(2, len(short_query_terms_fast)) if multi_term_short_query else 1
+        top_full_term_coverage_hits = 0
+        top_partial_term_coverage_hits = 0
+
+        if multi_term_short_query and top_lexical_window:
+            for candidate in top_lexical_window:
+                lexical_hits = int(candidate.get("short_query_lexical_hits", 0) or 0)
+                lexical_coverage = float(candidate.get("short_query_lexical_coverage", 0.0) or 0.0)
+
+                if lexical_hits >= required_multi_term_hits or lexical_coverage >= 0.95:
+                    top_full_term_coverage_hits += 1
+                elif lexical_hits >= 1 or lexical_coverage >= 0.5:
+                    top_partial_term_coverage_hits += 1
+
         low_unique_yield = vector_unique_videos < max(3, min(8, batch_size))
         weak_top_cluster = (
             not top_scores
             or strongest_score < max(data.min_score + 0.06, 0.42)
             or (len(top_scores) >= 3 and avg_top_score < max(data.min_score + 0.03, 0.38))
         )
+        missing_multi_term_coverage = (
+            multi_term_short_query
+            and bool(top_lexical_window)
+            and top_full_term_coverage_hits == 0
+            and top_partial_term_coverage_hits <= max(1, len(top_lexical_window) // 4)
+        )
 
-        if low_unique_yield or weak_top_cluster:
+        if low_unique_yield or weak_top_cluster or missing_multi_term_coverage:
             lexical_backstop_requested = True
             reason_parts = []
             if low_unique_yield:
                 reason_parts.append("low_unique_video_yield")
             if weak_top_cluster:
                 reason_parts.append("weak_top_score_cluster")
+            if missing_multi_term_coverage:
+                reason_parts.append("missing_multi_term_coverage")
             lexical_backstop_reason = "+".join(reason_parts)
 
             index_health = detect_text_index_health([
@@ -5564,6 +5588,8 @@ async def search_incremental(data: IncrementalSearchRequest, authorized: bool = 
                 lexical_target = max(batch_size * 8, 60)
                 if low_unique_yield:
                     lexical_target = max(lexical_target, 90)
+                if missing_multi_term_coverage:
+                    lexical_target = max(lexical_target, 120)
 
                 lexical_should_conditions = []
                 for term in short_query_terms_fast[:4]:
@@ -5629,6 +5655,11 @@ async def search_incremental(data: IncrementalSearchRequest, authorized: bool = 
                         )
                         if not lexical_evidence.get("has_signal"):
                             continue
+
+                        if missing_multi_term_coverage:
+                            required_backstop_hits = min(2, len(short_query_terms_fast))
+                            if int(lexical_evidence.get("total_hits", 0) or 0) < required_backstop_hits:
+                                continue
 
                         matched_fields = lexical_evidence.get("matched_fields", [])
                         coverage = float(lexical_evidence.get("coverage", 0.0) or 0.0)
