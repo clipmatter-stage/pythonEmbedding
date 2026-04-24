@@ -3111,13 +3111,25 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                 search_query = query_text or " ".join(words or [])
                 if not search_query:
                     raise HTTPException(status_code=400, detail="Please enter search text")
-                
-                # Normalize and filter search words (>= 1 char to allow single digits like '1', '2', '5')
-                # BUT skip stop words to avoid overly broad matches
-                search_words_raw = [w.strip() for w in search_query.split() if w.strip()]
+
+                # Build terms from BOTH query and words payload.
+                # This is important for mixed alphanumeric fallback payloads where words may
+                # carry split variants (e.g. ["120hz", "120", "hz"]).
+                query_terms_raw = [w.strip() for w in (query_text or "").split() if w.strip()]
+                words_terms_raw = []
+                for entry in (words or []):
+                    if isinstance(entry, str):
+                        words_terms_raw.extend([w.strip() for w in entry.split() if w.strip()])
+
+                search_words_raw = query_terms_raw + words_terms_raw
+                if not search_words_raw:
+                    search_words_raw = [w.strip() for w in search_query.split() if w.strip()]
+
+                # Normalize and filter search words (>= 1 char to allow single digits like
+                # '1', '2', '5'), but skip stop words to avoid overly broad matches.
                 search_words_normalized = []
                 skipped_words = []
-                
+
                 for w in search_words_raw:
                     normalized = normalize_word(w)
                     # Skip empty results
@@ -3128,6 +3140,9 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                         skipped_words.append(w)
                         continue
                     search_words_normalized.append(normalized)
+
+                # Keep stable order, remove duplicates.
+                search_words_normalized = list(dict.fromkeys(search_words_normalized))
                 
                 if not search_words_normalized:
                     if skipped_words:
@@ -3140,8 +3155,26 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                             status_code=400, 
                             detail="Please enter valid search text (letters, numbers, or meaningful words)"
                         )
+
+                normalized_query_token = normalize_word(search_query)
+                is_mixed_alnum_single_token = bool(
+                    normalized_query_token
+                    and len([w for w in search_query.split() if w.strip()]) == 1
+                    and re.search(r"[a-zA-Z]", normalized_query_token)
+                    and re.search(r"\d", normalized_query_token)
+                )
+
+                search_terms_for_matching = list(search_words_normalized)
+                if is_mixed_alnum_single_token:
+                    expanded_terms = expand_short_query_terms(search_words_normalized)
+                    if expanded_terms:
+                        search_terms_for_matching = expanded_terms
                 
-                logger.info(f"Text search: query='{search_query}' → normalized_terms={search_words_normalized} (skipped: {skipped_words})")
+                logger.info(
+                    f"Text search: query='{search_query}' → normalized_terms={search_words_normalized}, "
+                    f"matching_terms={search_terms_for_matching}, mixed_alnum={is_mixed_alnum_single_token} "
+                    f"(skipped: {skipped_words})"
+                )
                 # Build Qdrant scroll with text match conditions (Qdrant pre-filtering)
                 scroll_conditions = list(eligibility_conditions)
                 # Add MatchText for each search word on the 'text' field
@@ -3150,14 +3183,34 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                 max_filter_words = 3 if is_numeric_search else 5
                 alias_person_key_simple = None
 
-                for sw in search_words_normalized[:max_filter_words]:  # Limit words to avoid overly strict filters
-                    scroll_conditions.append(
+                if is_mixed_alnum_single_token:
+                    max_filter_words = max(max_filter_words, 5)
+
+                prefilter_terms = search_terms_for_matching[:max_filter_words]
+
+                if is_mixed_alnum_single_token and prefilter_terms:
+                    # For mixed single tokens like "120hz", use OR prefilter so either
+                    # compound or split variants can enter scoring stage.
+                    text_should_conditions = [
                         FieldCondition(key="text", match=MatchText(text=sw))
+                        for sw in prefilter_terms
+                    ]
+                    scroll_filter = Filter(
+                        must=scroll_conditions if scroll_conditions else None,
+                        should=text_should_conditions,
                     )
+                else:
+                    for sw in prefilter_terms:  # Limit words to avoid overly strict filters
+                        scroll_conditions.append(
+                            FieldCondition(key="text", match=MatchText(text=sw))
+                        )
+                    scroll_filter = Filter(must=scroll_conditions)
                 
                 if is_numeric_search:
                     logger.info(f"Numeric-only search detected: using relaxed filtering (max {max_filter_words} terms)")
-                scroll_filter = Filter(must=scroll_conditions)
+                elif is_mixed_alnum_single_token:
+                    logger.info(f"Mixed alnum text search detected: using OR prefilter terms={prefilter_terms}")
+
                 offset = None
                 min_text_score = 0.40  # Minimum score threshold
                 # Smaller scroll page for text search — Qdrant pre-filter already narrows results,
@@ -3184,21 +3237,61 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                         seg_text_normalized = normalize_for_matching(seg_text)
                         # WHOLE-WORD matching: prevents 'tan' matching 'pakistan', 'dance' matching 'abundance'
                         # For numeric searches, also check substring matches to catch numbers embedded in text
-                        matched_count = 0
-                        for w in search_words_normalized:
+                        matched_count = 0.0
+                        matched_numeric_token = False
+                        matched_alpha_token = False
+                        matched_compound_token = False
+
+                        for w in search_terms_for_matching:
+                            term_is_numeric = w.replace('.', '').replace('-', '').replace(',', '').isdigit()
+                            term_has_alpha = bool(re.search(r"[a-zA-Z]", w))
+
                             if whole_word_match(w, seg_text_normalized):
                                 matched_count += 1
+                                if term_is_numeric:
+                                    matched_numeric_token = True
+                                if term_has_alpha:
+                                    matched_alpha_token = True
+                                if normalized_query_token and w == normalized_query_token:
+                                    matched_compound_token = True
                             elif is_numeric_search and w in seg_text_normalized:
                                 # Allow substring match for numbers (e.g., "15" in "15th" or "2015")
                                 matched_count += 0.7  # Slightly lower weight for substring match
+                                matched_numeric_token = True
+                            elif is_mixed_alnum_single_token and len(w) >= 2 and w in seg_text_normalized:
+                                # For mixed tokens (e.g. 120hz), allow bounded substring evidence
+                                # from tokenized variants.
+                                matched_count += 0.55
+                                if term_is_numeric:
+                                    matched_numeric_token = True
+                                if term_has_alpha:
+                                    matched_alpha_token = True
+                                if normalized_query_token and w == normalized_query_token:
+                                    matched_compound_token = True
                         
                         if matched_count == 0:
                             continue
+
+                        # Guardrail: mixed alnum query must either match as a compound token
+                        # or include both numeric and alphabetic signal.
+                        if is_mixed_alnum_single_token and not (matched_compound_token or (matched_numeric_token and matched_alpha_token)):
+                            continue
                         
                         # Calculate accurate score: require high word coverage
-                        match_score = matched_count / max(len(search_words_normalized), 1)
-                        # Enforce minimum quality threshold (lower for numeric searches)
-                        effective_min_score = min_text_score * 0.7 if is_numeric_search else min_text_score
+                        effective_term_count = max(len(search_terms_for_matching), 1)
+                        if is_mixed_alnum_single_token and effective_term_count >= 3:
+                            # Do not over-penalize split variants when one strong compound hit exists.
+                            effective_term_count -= 1
+
+                        match_score = matched_count / effective_term_count
+                        # Enforce minimum quality threshold (lower for numeric and mixed alnum searches)
+                        if is_mixed_alnum_single_token:
+                            effective_min_score = 0.30 if matched_compound_token else 0.45
+                        elif is_numeric_search:
+                            effective_min_score = min_text_score * 0.7
+                        else:
+                            effective_min_score = min_text_score
+
                         if match_score < effective_min_score:
                             continue
                         simple_results.append({
