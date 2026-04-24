@@ -1693,6 +1693,55 @@ def calculate_combined_score(semantic_score: float, keyword_match: bool, fuzzy_s
     return min(base_score, 1.0)  # Cap at 1.0
 
 
+def expand_short_query_terms(short_terms: List[str]) -> List[str]:
+    """
+    Expand short query terms for lexical matching/backstop.
+
+    Handles mixed alphanumeric tokens so queries like "120hz" can match
+    transcript forms such as "120 hz" by expanding into:
+      ["120hz", "120", "hz"]
+    """
+    expanded_terms: List[str] = []
+    seen_terms = set()
+
+    def _add_term(term: str):
+        normalized_term = normalize_word(term)
+        if not normalized_term:
+            return
+
+        is_numeric_token = normalized_term.replace('.', '', 1).isdigit()
+        if not is_numeric_token and normalized_term in STOP_WORDS:
+            return
+
+        # Keep numeric tokens even if short; require len>=2 for non-numeric.
+        if len(normalized_term) < 2 and not is_numeric_token:
+            return
+
+        if normalized_term in seen_terms:
+            return
+
+        seen_terms.add(normalized_term)
+        expanded_terms.append(normalized_term)
+
+    for term in short_terms:
+        base_term = normalize_word(term)
+        if not base_term:
+            continue
+
+        _add_term(base_term)
+
+        # Split punctuation-delimited variants (e.g. "120-hz", "usb_c").
+        for part in re.split(r"[\s\-_./]+", base_term):
+            _add_term(part)
+
+        # Split mixed alphanumeric variants (e.g. "120hz" -> "120", "hz").
+        if re.search(r"[a-zA-Z]", base_term) and re.search(r"\d", base_term):
+            for piece in re.findall(r"[a-zA-Z]+|\d+", base_term):
+                _add_term(piece)
+
+    return expanded_terms
+
+
 def classify_query_shape(query_text: str, search_mode: str = "semantic", alias_person_key: Optional[str] = None) -> Dict:
     """
     Shared query-shape classifier used by both /search and /search/incremental.
@@ -1707,6 +1756,7 @@ def classify_query_shape(query_text: str, search_mode: str = "semantic", alias_p
         w for w in normalized_tokens
         if len(w) >= 2 and w not in STOP_WORDS
     ]
+    lexical_terms = expand_short_query_terms(short_terms)
 
     is_numeric_query = bool(raw_tokens) and all(
         token.replace(',', '').replace('.', '').replace('-', '').isdigit()
@@ -1724,6 +1774,7 @@ def classify_query_shape(query_text: str, search_mode: str = "semantic", alias_p
         "token_count": len(normalized_tokens),
         "tokens": normalized_tokens,
         "short_terms": short_terms,
+        "lexical_terms": lexical_terms,
         "is_numeric_query": is_numeric_query,
         "is_short_semantic_query": is_short_semantic_query,
         "is_alias_query": bool(alias_person_key),
@@ -3367,6 +3418,7 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
     query_source_for_length = raw_query_text or query_text or ""
     query_shape = classify_query_shape(query_source_for_length, search_mode=search_mode, alias_person_key=alias_person_key)
     query_word_count_for_strategy = int(query_shape.get("token_count", 0))
+    query_terms_for_presence = list(query_shape.get("lexical_terms", [])) if query_shape.get("is_short_semantic_query") else []
     normalized_query = normalize_word(query_source_for_length) if query_source_for_length else ""
     single_word_query = bool(normalized_query and query_word_count_for_strategy == 1 and len(normalized_query) >= 2)
     short_query_scan = bool(query_shape.get("is_short_semantic_query") and query_word_count_for_strategy >= 2)
@@ -3919,11 +3971,12 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                         all_text = f"{text_norm} {title_norm} {speaker_norm} {summary_norm}"
                         
                         # Check if ANY query word appears in the result (whole word or safe variant)
-                        query_words = []
-                        for raw_qw in query_text.split():
-                            normalized_qw = normalize_word(raw_qw)
-                            if len(normalized_qw) >= 2:
-                                query_words.append(normalized_qw)
+                        query_words = list(query_terms_for_presence)
+                        if not query_words:
+                            for raw_qw in query_text.split():
+                                normalized_qw = normalize_word(raw_qw)
+                                if len(normalized_qw) >= 2:
+                                    query_words.append(normalized_qw)
 
                         # If all query tokens normalize away (very short/noisy), avoid unfair penalties.
                         if not query_words:
@@ -5218,7 +5271,7 @@ async def search_incremental(data: IncrementalSearchRequest, authorized: bool = 
         search_mode=data.search_mode,
         alias_person_key=alias_person_key,
     )
-    short_query_terms_fast = list(fast_query_shape.get("short_terms", []))
+    short_query_terms_fast = list(fast_query_shape.get("lexical_terms") or fast_query_shape.get("short_terms", []))
     is_short_query_fast = bool(fast_query_shape.get("is_short_semantic_query"))
 
     initial_top_k = max(20, batch_size * 4)
