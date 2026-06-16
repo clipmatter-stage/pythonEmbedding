@@ -2428,7 +2428,7 @@ async def embed_video(data: EmbedVideoRequest, authorized: bool = Depends(verify
     """Enqueue video transcript embedding task. Requires API key if configured."""
     try:
         data_dict = data.model_dump()
-        job = task_queue.enqueue(process_video_task, data_dict, job_timeout='1h')
+        job = task_queue.enqueue('embeddings_test.process_video_task', data_dict, job_timeout='1h')
         
         return {
             "status": "queued",
