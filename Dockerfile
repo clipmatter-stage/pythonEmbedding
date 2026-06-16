@@ -19,6 +19,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application code
 COPY embeddings_test.py .
 COPY migrate_to_3072.py .
+COPY worker.py .
 COPY start.sh .
 
 # Make startup script executable
@@ -36,6 +37,5 @@ EXPOSE 9000
 
 # Health check removed - Railway has built-in health monitoring
 
-# Start command - Railway will inject environment variables at runtime
-# Python script will read PORT from environment and default to 9000
-CMD ["python", "embeddings_test.py"]
+# Start command - use start.sh to launch both worker and web process
+CMD ["./start.sh"]
