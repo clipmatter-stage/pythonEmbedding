@@ -24,6 +24,13 @@ from openai import OpenAI
 import tiktoken
 import asyncio
 import json as json_module
+from redis import Redis
+from rq import Queue
+
+# ============== REDIS QUEUE INITIALIZATION ==============
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
+redis_conn = Redis.from_url(REDIS_URL)
+task_queue = Queue('video_processing', connection=redis_conn)
 
 # ============== LOGGING CONFIGURATION ==============
 logging.basicConfig(
@@ -411,6 +418,7 @@ RATE_LIMIT_WINDOW = int(os.getenv("RATE_LIMIT_WINDOW", "60"))
 class EmbedVideoRequest(BaseModel):
     video_id: int = Field(..., gt=0, description="Video ID must be positive")
     identification_segments: List[dict] = Field(..., min_length=1)
+    webhook_url: Optional[str] = Field(default=None, description="Optional webhook URL to receive status callbacks")
     video_title: str = Field(default="", max_length=500)
     video_filename: str = Field(default="", max_length=500)
     youtube_url: Optional[str] = Field(default="", max_length=1000)
@@ -2193,47 +2201,43 @@ def parse_search_query(query:  str) -> Dict:
     
     return parsed
     
-@app.post("/embed-video")
-async def embed_video(data: EmbedVideoRequest, authorized: bool = Depends(verify_api_key)):
-    """Embed video transcript segments. Requires API key if configured."""
+def process_video_task(data_dict: dict):
+    """Background worker task to process video embeddings and upsert to Qdrant."""
+    webhook_url = data_dict.get('webhook_url')
+    video_id = data_dict.get('video_id')
     try:
-        video_id = data.video_id
-        identification_segments = data.identification_segments
-        if not identification_segments:
-            raise HTTPException(status_code=400, detail="identification_segments is required")
+        identification_segments = data_dict.get('identification_segments', [])
+        video_title = data_dict.get('video_title', '')
+        video_filename = data_dict.get('video_filename', '')
+        youtube_url = data_dict.get('youtube_url', '')
+        language = data_dict.get('language', '')
         
-        video_title = data.video_title
-        video_filename = data.video_filename
-        youtube_url = data.youtube_url
-        language = data.language
+        video_created_at = data_dict.get('video_created_at') or ""
+        processing_status = data_dict.get('processing_status') or "completed"
+        approval_status = data_dict.get('approval_status') or "approved"
+        is_archived = data_dict.get('is_archived', False)
+        user_id = data_dict.get('user_id')
+        speakers_count = data_dict.get('speakers_count', 0)
+        audio_duration_seconds = data_dict.get('audio_duration_seconds', 0)
+        video_description = data_dict.get('video_description') or ""
+        video_summary = data_dict.get('video_summary') or ""
+        video_summary_english = data_dict.get('video_summary_english') or ""
+        video_summary_urdu = data_dict.get('video_summary_urdu') or ""
         
-        # Enriched metadata for dual-mode search (stored in Qdrant payload)
-        video_created_at = data.video_created_at or ""
-        processing_status = data.processing_status or "completed"
-        approval_status = data.approval_status or "approved"
-        is_archived = data.is_archived
-        user_id = data.user_id
-        speakers_count = data.speakers_count
-        audio_duration_seconds = data.audio_duration_seconds
-        video_description = data.video_description or ""
-        video_summary = data.video_summary or ""
-        video_summary_english = data.video_summary_english or ""
-        video_summary_urdu = data.video_summary_urdu or ""
+        logger.info(f"[WORKER] Processing video {video_id} with {len(identification_segments)} segments")
         
-        logger.info(f"Processing video {video_id} with {len(identification_segments)} segments")
-        
-        # Only delete existing embeddings on the FIRST batch (or if no batch info = single request)
         batch_number = 1
         total_batches = 1
-        if data.batch_info:
-            batch_number = data.batch_info.get("batch_number", 1)
-            total_batches = data.batch_info.get("total_batches", 1)
-            logger.info(f"Batch {batch_number}/{total_batches} for video {video_id}")
+        batch_info = data_dict.get('batch_info')
+        if batch_info:
+            batch_number = batch_info.get("batch_number", 1)
+            total_batches = batch_info.get("total_batches", 1)
+            logger.info(f"[WORKER] Batch {batch_number}/{total_batches} for video {video_id}")
         
         if batch_number == 1:
             delete_existing_embeddings(video_id)
         else:
-            logger.info(f"Skipping delete for batch {batch_number} (only delete on batch 1)")
+            logger.info(f"[WORKER] Skipping delete for batch {batch_number} (only delete on batch 1)")
         
         points = []
         segments_embedded = 0
@@ -2242,10 +2246,7 @@ async def embed_video(data: EmbedVideoRequest, authorized: bool = Depends(verify
         segment_metadata = []
         
         for idx, segment in enumerate(identification_segments):
-            # Use segment_index from payload if provided (preserves global index across batches)
-            # Fall back to enumerate index for backward compatibility
             segment_index = segment.get("segment_index", idx)
-            
             speaker = segment.get("speaker", "UNKNOWN")
             text = segment.get("text", "")
             start_time = float(segment.get("start", 0))
@@ -2254,12 +2255,10 @@ async def embed_video(data: EmbedVideoRequest, authorized: bool = Depends(verify
             match_type = segment.get("match", "")
             confidence = segment.get("confidence", 0)
             
-            if not text or len(text. strip()) < 3:
+            if not text or len(text.strip()) < 3:
                 segments_without_text += 1
                 continue
             
-            # BUILD ENRICHED EMBEDDING TEXT — includes speaker, title, language context
-            # This makes vector search find segments by speaker name and video context
             enriched_parts = []
             if speaker and speaker != "UNKNOWN":
                 enriched_parts.append(f"[Speaker: {speaker}]")
@@ -2271,15 +2270,14 @@ async def embed_video(data: EmbedVideoRequest, authorized: bool = Depends(verify
             
             enriched_text = " ".join(enriched_parts)
             
-            # Truncate to max 6000 chars (~1500-2000 tokens) to stay under OpenAI limits
             if len(enriched_text) > 6000:
                 enriched_text = enriched_text[:6000] + "..."
                 logger.debug(f"Truncated segment {segment_index} from {len(text)} to 6000 chars")
             
             texts_to_embed.append(enriched_text)
             segment_metadata.append({
-                'idx': segment_index,  # Use global segment_index, not batch-local idx
-                'speaker':  speaker,
+                'idx': segment_index,
+                'speaker': speaker,
                 'diarization_speaker': diarization_speaker,
                 'match_type': match_type,
                 'start_time': start_time,
@@ -2289,30 +2287,24 @@ async def embed_video(data: EmbedVideoRequest, authorized: bool = Depends(verify
                 'enriched_text': enriched_text
             })
         
-        if not texts_to_embed: 
-            raise HTTPException(
-                status_code=400,
-                detail=f"No valid segments found to embed.  Total:  {len(identification_segments)}, Without text: {segments_without_text}"
-            )
+        if not texts_to_embed:
+            raise ValueError(f"No valid segments found to embed. Total: {len(identification_segments)}, Without text: {segments_without_text}")
         
-        logger.info(f"Generating embeddings for {len(texts_to_embed)} segments in batch...")
+        logger.info(f"[WORKER] Generating embeddings for {len(texts_to_embed)} segments in batch...")
         batch_start_time = datetime.utcnow()
         
-        # Use OpenAI embeddings if enabled, otherwise use FastEmbed
         if USE_OPENAI_EMBEDDINGS and openai_client:
-            logger.info(f"Using OpenAI {OPENAI_EMBEDDING_MODEL} for batch embedding")
+            logger.info(f"[WORKER] Using OpenAI {OPENAI_EMBEDDING_MODEL} for batch embedding")
             vectors = get_openai_embeddings_batch(texts_to_embed)
         else:
-            logger.info("Using FastEmbed for batch embedding")
+            logger.info("[WORKER] Using FastEmbed for batch embedding")
             results_list = list(get_fastembed_model().embed(texts_to_embed))
             vectors = [r.tolist() if hasattr(r, 'tolist') else list(r) for r in results_list]
         
-        # GENERATE LLM ENGLISH SUMMARIES for non-English segments (bilingual bridge)
         summaries_en = {}
         if openai_client and language and language.lower() not in ["english", "en"]:
             try:
-                logger.info(f"Generating English summaries for {len(segment_metadata)} segments...")
-                # Process in batches of 20 for efficiency
+                logger.info(f"[WORKER] Generating English summaries for {len(segment_metadata)} segments...")
                 for batch_start in range(0, len(segment_metadata), 20):
                     batch_end = min(batch_start + 20, len(segment_metadata))
                     batch_texts = []
@@ -2330,7 +2322,6 @@ async def embed_video(data: EmbedVideoRequest, authorized: bool = Depends(verify
                         temperature=0.1
                     )
                     
-                    # Parse summaries
                     for line in summary_response.choices[0].message.content.strip().split("\n"):
                         line = line.strip()
                         if line and "[" in line:
@@ -2340,21 +2331,18 @@ async def embed_video(data: EmbedVideoRequest, authorized: bool = Depends(verify
                                 summaries_en[int(idx_str)] = summary_text
                             except (ValueError, IndexError):
                                 pass
-                
-                logger.info(f"Generated {len(summaries_en)} English summaries")
             except Exception as e:
-                logger.warning(f"Summary generation failed (non-critical): {str(e)}")
+                logger.warning(f"[WORKER] Summary generation failed (non-critical): {str(e)}")
         
         batch_end_time = datetime.utcnow()
         batch_duration = (batch_end_time - batch_start_time).total_seconds()
-        logger.info(f"Batch embedding completed in {batch_duration:.2f} seconds")
+        logger.info(f"[WORKER] Batch embedding completed in {batch_duration:.2f} seconds")
         
         for i, metadata in enumerate(segment_metadata):
             vector = vectors[i]
             id_string = f"video_{video_id}_seg_{metadata['idx']}"
             point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, id_string))
             
-            # Get English summary if available
             summary_en = summaries_en.get(metadata['idx'], "")
             
             payload = {
@@ -2366,17 +2354,16 @@ async def embed_video(data: EmbedVideoRequest, authorized: bool = Depends(verify
                 "segment_index": metadata['idx'],
                 "speaker": metadata['speaker'],
                 "diarization_speaker": metadata['diarization_speaker'],
-                "match_type":  metadata['match_type'],
+                "match_type": metadata['match_type'],
                 "start_time": metadata['start_time'],
                 "end_time": metadata['end_time'],
                 "duration": metadata['end_time'] - metadata['start_time'],
                 "text": metadata['text'],
                 "text_length": len(metadata['text']),
                 "confidence": metadata['confidence'],
-                "summary_en": summary_en,  # English summary for cross-language search
-                "enriched_text": metadata.get('enriched_text', metadata['text']),  # context-rich text
+                "summary_en": summary_en,
+                "enriched_text": metadata.get('enriched_text', metadata['text']),
                 "created_at": datetime.utcnow().isoformat(),
-                # Enriched metadata for dual-mode search eligibility & filtering
                 "video_created_at": video_created_at,
                 "processing_status": processing_status,
                 "approval_status": approval_status,
@@ -2394,42 +2381,63 @@ async def embed_video(data: EmbedVideoRequest, authorized: bool = Depends(verify
             segments_embedded += 1
         
         if not points:
-            raise HTTPException(
-                status_code=400,
-                detail=f"No valid segments found to embed. Total: {len(identification_segments)}, Without text: {segments_without_text}"
+            raise ValueError(f"No valid segments found to embed. Total: {len(identification_segments)}, Without text: {segments_without_text}")
+        
+        logger.info(f"[WORKER] Inserting {len(points)} points into Qdrant...")
+        
+        QDRANT_BATCH_SIZE = 150
+        for i in range(0, len(points), QDRANT_BATCH_SIZE):
+            sub_batch = points[i:i + QDRANT_BATCH_SIZE]
+            logger.info(f"[WORKER] Upserting Qdrant sub-batch {i // QDRANT_BATCH_SIZE + 1}: {len(sub_batch)} points")
+            qdrant_client.upsert(
+                collection_name=SEGMENTS_COLLECTION,
+                points=sub_batch,
+                wait=True
             )
+        logger.info(f"[WORKER] Successfully inserted {len(points)} points")
         
-        logger.info(f"Inserting {len(points)} points into Qdrant...")
-        
-        try:
-            # Sub-batch upsert to stay under Qdrant's 32MB payload limit
-            # Each point is ~70KB (3072-dim vector + payload), so 150 points ≈ 10MB (safe)
-            QDRANT_BATCH_SIZE = 150
-            for i in range(0, len(points), QDRANT_BATCH_SIZE):
-                sub_batch = points[i:i + QDRANT_BATCH_SIZE]
-                logger.info(f"Upserting Qdrant sub-batch {i // QDRANT_BATCH_SIZE + 1}: {len(sub_batch)} points")
-                qdrant_client.upsert(
-                    collection_name=SEGMENTS_COLLECTION,
-                    points=sub_batch,
-                    wait=True
-                )
-            logger.info(f"Successfully inserted {len(points)} points")
-        except Exception as e:
-            logger.info(f"ERROR:  Qdrant insertion failed: {str(e)}")
-            raise HTTPException(status_code=500, detail=f"Qdrant error: {str(e)}")
+        if webhook_url:
+            payload_success = {
+                "status": "completed",
+                "video_id": video_id,
+                "segments_embedded": segments_embedded,
+                "message": "Successfully indexed in Qdrant"
+            }
+            try:
+                requests.post(webhook_url, json=payload_success, timeout=10)
+                logger.info(f"[WORKER] Webhook success sent to {webhook_url}")
+            except Exception as we:
+                logger.error(f"[WORKER] Webhook failed: {str(we)}")
+                
+    except Exception as e:
+        logger.error(f"[WORKER] Error processing video {video_id}: {str(e)}")
+        if webhook_url:
+            payload_error = {
+                "status": "failed",
+                "video_id": video_id,
+                "error": str(e)
+            }
+            try:
+                requests.post(webhook_url, json=payload_error, timeout=10)
+            except Exception as we:
+                logger.error(f"[WORKER] Webhook error notification failed: {str(we)}")
+        raise e
+
+@app.post("/embed-video", status_code=202)
+async def embed_video(data: EmbedVideoRequest, authorized: bool = Depends(verify_api_key)):
+    """Enqueue video transcript embedding task. Requires API key if configured."""
+    try:
+        data_dict = data.model_dump()
+        job = task_queue.enqueue(process_video_task, data_dict, job_timeout='1h')
         
         return {
-            "success": True,
-            "video_id": video_id,
-            "collection":  SEGMENTS_COLLECTION,
-            "segments_embedded": segments_embedded,
-            "total_points_inserted": len(points),
-            "embedding_time_seconds": round(batch_duration, 2),
-            "message": f"Successfully embedded {segments_embedded} segments for video {video_id}"
+            "status": "queued",
+            "video_id": data.video_id,
+            "job_id": job.id,
+            "message": "Video is processing in the background"
         }
-        
     except Exception as e:
-        logger.info(f"Error in embed_video: {str(e)}")
+        logger.error(f"Error enqueueing task: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 def delete_existing_embeddings(video_id: int):
