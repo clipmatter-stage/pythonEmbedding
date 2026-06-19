@@ -3154,10 +3154,8 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                 
                 if not search_words_normalized:
                     if skipped_words:
-                        raise HTTPException(
-                            status_code=400, 
-                            detail=f"Your search only contains common words that are too broad to search: {', '.join(skipped_words[:3])}. Please add more specific terms."
-                        )
+                        # If the entire query consists of stop words, use them instead of failing
+                        search_words_normalized = list(dict.fromkeys([normalize_word(w) for w in skipped_words if normalize_word(w)]))
                     else:
                         raise HTTPException(
                             status_code=400, 
