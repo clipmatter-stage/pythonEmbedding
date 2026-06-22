@@ -3,7 +3,7 @@ from fastapi.security import APIKeyHeader
 from fastapi.middleware.cors import CORSMiddleware
 from fastembed import TextEmbedding
 from qdrant_client import models, QdrantClient
-from qdrant_client.models import Distance, VectorParams, PointStruct, Filter, FieldCondition, MatchValue, MatchText, SearchParams, ScoredPoint
+from qdrant_client.models import Distance, VectorParams, PointStruct, Filter, FieldCondition, MatchValue, MatchText, SearchParams, ScoredPoint, MatchAny
 import uuid
 import os
 import logging
@@ -6256,6 +6256,11 @@ async def delete_video_embeddings(video_id: int, authorized: bool = Depends(veri
         logger.error(f"Error deleting embeddings: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
+from typing import List
+
+class CleanupOrphanVideosRequest(BaseModel):
+    valid_video_ids: List[int] = Field(..., description="List of valid video IDs that exist in MySQL")
+
 class UpdatePayloadRequest(BaseModel):
     video_id: int = Field(..., gt=0, description="Video ID to update")
     video_title: Optional[str] = Field(default=None, max_length=500)
@@ -6273,6 +6278,40 @@ class UpdatePayloadRequest(BaseModel):
     video_summary: Optional[str] = Field(default=None, max_length=10000)
     video_summary_english: Optional[str] = Field(default=None, max_length=10000)
     video_summary_urdu: Optional[str] = Field(default=None, max_length=10000)
+
+
+@app.post("/cleanup-orphan-videos")
+async def cleanup_orphan_videos(request: CleanupOrphanVideosRequest, authorized: bool = Depends(verify_api_key)):
+    """Delete all embeddings for videos that are NOT in the provided valid_video_ids list."""
+    try:
+        valid_ids = request.valid_video_ids
+        if not valid_ids:
+            raise HTTPException(status_code=400, detail="Must provide at least one valid video ID")
+            
+        delete_filter = Filter(
+            must_not=[
+                FieldCondition(
+                    key="video_id",
+                    match=MatchAny(any=valid_ids)
+                )
+            ]
+        )
+        
+        result = qdrant_client.delete(
+            collection_name=SEGMENTS_COLLECTION,
+            points_selector=delete_filter
+        )
+        
+        logger.info(f"Triggered orphan videos cleanup. Valid IDs provided: {len(valid_ids)}. Status: {result.status}")
+        
+        return {
+            "success": True,
+            "message": f"Issued delete command for orphan videos. Protected {len(valid_ids)} valid videos.",
+            "status": result.status
+        }
+    except Exception as e:
+        logger.error(f"Error cleaning up orphan videos: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/update-video-payload")
