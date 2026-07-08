@@ -1060,7 +1060,8 @@ Set "relevant": true ONLY if at least one result scores >= 3.
 Set "relevant": false if ALL results are completely off-topic.
 
 Be MODERATE: If a result seems like a plausible match for the user's specific quote, phrase, or topic, consider it relevant. 
-If searching for "Bill Gates" but results are about Pakistan politics, that's irrelevant."},                {"role": "user", "content": f"Query: {query}\n\nTop Results:\n{docs_text}\n\nAre these results relevant to the query?"}
+If searching for "Bill Gates" but results are about Pakistan politics, that's irrelevant."""},
+                {"role": "user", "content": f"Query: {query}\n\nTop Results:\n{docs_text}\n\nAre these results relevant to the query?"}
             ],
             max_tokens=300,
             temperature=0.0,
