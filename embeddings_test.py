@@ -114,7 +114,7 @@ STOP_WORDS = frozenset({
     "وہاں", "یہاں", "جہاں", "جیسے", "جیسا", "آپ", "ہم", "تم", "مجھے", "ہمیں", "انہوں",
     "speech", "from",  # Common English filler words in Pakistani search context
 
-     # English filler / conversational words
+    # English filler / conversational words
     "please", "plz", "pls", "kindly", "actually", "basically", "literally",
     "maybe", "probably", "perhaps", "okay", "ok", "yes", "yeah", "yep",
     "nope", "hmm", "um", "uh", "like", "means", "mean", "sir", "bro",
@@ -230,6 +230,7 @@ PERSON_ALIASES = {
             "ameer jamat", "ameer-e-jamat", "ameer jamat e islami",
             "ameer jamaat e islami", "ameer ji", "ameer sahab",
             "ameer jama'at", "ameer jamaat islami",
+            "ameer hafeez", "ameer hafiz", "ameer hafiz naeem",
         ],
         # Speaker field values stored in Qdrant (various forms used at ingestion time)
         "speaker_variants": [
@@ -4922,9 +4923,19 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
     # Keyword, title, speaker, and exact_phrase matches are ALWAYS kept.
     # ═══════════════════════════════════════════════════════════════════════════
     if raw_query_text and len(raw_query_text.split()) >= 2:
-        # Extract meaningful (non-stop) words from the query
+        # 1) Remove known person aliases from the query so they don't count as "topic" words
+        topic_query = raw_query_text.lower()
+        for person_data in PERSON_ALIASES.values():
+            # Sort aliases by length descending so we remove longest phrases first
+            sorted_aliases = sorted(person_data.get("aliases", []), key=len, reverse=True)
+            for alias in sorted_aliases:
+                if alias in topic_query:
+                    # Replace with spaces to avoid concatenating adjacent words
+                    topic_query = topic_query.replace(alias, " ")
+        
+        # 2) Extract meaningful (non-stop) words from the remaining topic query
         meaningful_query_words = [
-            normalize_word(w) for w in raw_query_text.split()
+            normalize_word(w) for w in topic_query.split()
             if len(normalize_word(w)) >= 2 and normalize_word(w).lower() not in STOP_WORDS
         ]
         
