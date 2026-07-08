@@ -1060,7 +1060,7 @@ Set "relevant": true ONLY if at least one result scores >= 3.
 Set "relevant": false if ALL results are completely off-topic.
 
 Be MODERATE: If a result seems like a plausible match for the user's specific quote, phrase, or topic, consider it relevant. 
-If searching for "Bill Gates" but results are about Pakistan politics, that's irrelevant."""},                {"role": "user", "content": f"Query: {query}\n\nTop Results:\n{docs_text}\n\nAre these results relevant to the query?"}
+If searching for "Bill Gates" but results are about Pakistan politics, that's irrelevant."},                {"role": "user", "content": f"Query: {query}\n\nTop Results:\n{docs_text}\n\nAre these results relevant to the query?"}
             ],
             max_tokens=300,
             temperature=0.0,
@@ -5261,19 +5261,22 @@ async def search_incremental(data: IncrementalSearchRequest, authorized: bool = 
     _is_numeric_incremental = bool(initial_query_shape.get("is_numeric_query"))
     _is_short_semantic_incremental = bool(initial_query_shape.get("is_short_semantic_query"))
 
-    incremental_allow_delegation = os.getenv("INCREMENTAL_ALLOW_DELEGATION", "true").lower() == "true"
+    # ALWAYS delegate to full /search so keyword & title matching are never skipped.
+    # The fast path (single vector query) misses keyword/title matches for ALL queries.
+    if _is_numeric_incremental:
+        route_reason = "numeric_simple_text"
+    elif _is_short_semantic_incremental:
+        route_reason = "single_word_semantic_keyword" if query_word_count_incremental == 1 else "short_semantic_keyword"
+    else:
+        route_reason = "full_search_delegation"
+    logger.info(f"[INCREMENTAL AUTO-ROUTE] Query '{query_text[:80]}' → delegating to full search ({route_reason})")
 
-    if incremental_allow_delegation and (_is_numeric_incremental or _is_short_semantic_incremental):
-        route_reason = "numeric_simple_text" if _is_numeric_incremental else (
-            "single_word_semantic_keyword" if query_word_count_incremental == 1 else "short_semantic_keyword"
-        )
-        logger.info(f"[INCREMENTAL AUTO-ROUTE] Query '{query_text[:80]}' → delegating to full search ({route_reason})")
-
+    if True:
         delegate_top_k = max(data.top_k or 200, 200)
-        if _is_short_semantic_incremental:
-            delegate_top_k = min(delegate_top_k, 600)
-        elif _is_numeric_incremental:
+        if _is_numeric_incremental:
             delegate_top_k = min(delegate_top_k, 400)
+        else:
+            delegate_top_k = min(delegate_top_k, 600)
 
         delegate_req = SearchRequest(
             query=query_text,
@@ -5358,11 +5361,6 @@ async def search_incremental(data: IncrementalSearchRequest, authorized: bool = 
                 "qdrant_queries": 0
             }
         }
-    elif _is_numeric_incremental or _is_short_semantic_incremental:
-        logger.info(
-            f"[INCREMENTAL FAST] Auto-delegation disabled; staying on one-query fast path "
-            f"(numeric={_is_numeric_incremental}, short_query={_is_short_semantic_incremental})"
-        )
 
     # Person alias support (fast-path safe): expand short aliases to canonical name once.
     # This improves semantic recall for queries like "hnr" without adding extra queries.
