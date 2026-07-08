@@ -1053,14 +1053,14 @@ Return ONLY valid JSON: {"relevant": boolean, "scores": [score1, score2, ...], "
 Score each result 0-10:
 - 8-10: Directly discusses the query topic/person
 - 5-7: Related to the query domain
-- 2-4: Loosely connected or tangential
-- 0-1: Completely unrelated
+- 3-4: Loosely connected, tangential, or mentions a specific phrase/quote
+- 0-2: Completely unrelated
 
-Set "relevant": true ONLY if at least one result scores >= 5.
-Set "relevant": false if ALL results are off-topic.
+Set "relevant": true ONLY if at least one result scores >= 3.
+Set "relevant": false if ALL results are completely off-topic.
 
-Be STRICT: If searching for "Bill Gates" but results are about Pakistan politics, that's irrelevant.
-If searching for a person/topic not in the database, all results will be off-topic."""},
+Be MODERATE: If a result seems like a plausible match for the user's specific quote, phrase, or topic, consider it relevant. 
+If searching for "Bill Gates" but results are about Pakistan politics, that's irrelevant.
                 {"role": "user", "content": f"Query: {query}\n\nTop Results:\n{docs_text}\n\nAre these results relevant to the query?"}
             ],
             max_tokens=300,
@@ -1185,11 +1185,11 @@ Be VERY strict. Most results should get low scores if they don't match the query
             result_copy["match_types"].append("llm_reranked")
             reranked.append(result_copy)
         
-        # STRICTER filtering: LLM score < 0.3 (3/10) is considered irrelevant
-        # But ALWAYS keep title matches and exact phrase matches (these are verified matches)
+        # MODERATE filtering: LLM score < 0.15 is considered irrelevant
+        # ALWAYS keep title matches and exact phrase matches (these are verified matches)
         reranked = [
             r for r in reranked 
-            if r.get("llm_relevance_score", 0) >= 0.3 
+            if r.get("llm_relevance_score", 0) >= 0.15 
             or "title_match" in r.get("match_types", []) 
             or "exact_phrase_match" in r.get("match_types", [])
         ]
