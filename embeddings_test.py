@@ -4218,22 +4218,26 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
 
             scroll_filter = search_filter
 
-            # For single-word searches, pre-filter with Qdrant text index so matches are
-            # retrieved directly instead of relying on early scroll windows.
-            if len(words_lower) == 1:
-                kw = words_lower[0]
-                keyword_text_conditions = [
-                    FieldCondition(key="text", match=MatchText(text=kw)),
-                    FieldCondition(key="summary_en", match=MatchText(text=kw)),
-                    FieldCondition(key="video_title", match=MatchText(text=kw)),
-                    FieldCondition(key="speaker", match=MatchText(text=kw)),
-                    FieldCondition(key="diarization_speaker", match=MatchText(text=kw)),
-                ]
-                if search_filter and getattr(search_filter, "must", None):
-                    scroll_filter = Filter(must=list(search_filter.must), should=keyword_text_conditions)
-                else:
-                    scroll_filter = Filter(should=keyword_text_conditions)
-                logger.info(f"Keyword search using MatchText prefilter for single word: '{kw}'")
+            # Pre-filter with Qdrant text index so matches are retrieved directly
+            # instead of relying on early scroll windows, which fails for older videos.
+            if len(words_lower) >= 1:
+                keyword_text_conditions = []
+                for kw in words_lower:
+                    if len(kw) >= 3:  # Include 3-letter words like "dir", "hnr", "pti"
+                        keyword_text_conditions.extend([
+                            FieldCondition(key="text", match=MatchText(text=kw)),
+                            FieldCondition(key="summary_en", match=MatchText(text=kw)),
+                            FieldCondition(key="video_title", match=MatchText(text=kw)),
+                            FieldCondition(key="speaker", match=MatchText(text=kw)),
+                            FieldCondition(key="diarization_speaker", match=MatchText(text=kw)),
+                        ])
+                
+                if keyword_text_conditions:
+                    if search_filter and getattr(search_filter, "must", None):
+                        scroll_filter = Filter(must=list(search_filter.must), should=keyword_text_conditions)
+                    else:
+                        scroll_filter = Filter(should=keyword_text_conditions)
+                    logger.info(f"Keyword search using MatchText prefilter for {len(words_lower)} words")
 
             # Early termination when we have enough results
             target_results = max(top_k, 20)
@@ -4513,10 +4517,24 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
             max_scan_title = min(max_scanned, 50000)
             seen_titles = {}  # video_id -> video_title (to avoid re-checking same video)
             
+            # PRE-FILTER with MatchText to avoid scanning 50,000 irrelevant segments
+            title_text_conditions = []
+            for tq in title_queries:
+                for kw in tq.split():
+                    if len(kw) >= 3:
+                        title_text_conditions.append(FieldCondition(key="video_title", match=MatchText(text=kw)))
+            
+            active_title_filter = title_search_filter
+            if title_text_conditions:
+                if title_search_filter and getattr(title_search_filter, "must", None):
+                    active_title_filter = Filter(must=list(title_search_filter.must), should=title_text_conditions)
+                else:
+                    active_title_filter = Filter(should=title_text_conditions)
+                    
             while scanned < max_scan_title:
                 points, next_offset = qdrant_client.scroll(
                     collection_name=SEGMENTS_COLLECTION,
-                    scroll_filter=title_search_filter,  # Use title-specific filter (no language restriction for universal queries)
+                    scroll_filter=active_title_filter,  # Use title-specific filter with MatchText
                     limit=min(1000, max_scan_title - scanned),
                     offset=offset,
                     with_payload=True,
@@ -6569,3 +6587,4 @@ if __name__ == "__main__":
         port=port,
         timeout_keep_alive=120
     )
+    
