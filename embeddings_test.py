@@ -107,6 +107,48 @@ STOP_WORDS = frozenset({
     # Urdu common words (transliterated)
     "hai", "hain", "tha", "thi", "the", "ka", "ki", "ke", "ko", "ne", "se", "mein", "par",
     "aur", "ya", "lekin", "jo", "jab", "kya", "kaise", "kahan", "yeh", "woh", "koi", "kuch",
+    # Urdu common words (native script) — articles, prepositions, pronouns, conjunctions
+    "میں", "کا", "کی", "کے", "کو", "نے", "سے", "پر", "اور", "یا", "لیکن", "جو", "جب",
+    "کیا", "کیسے", "کہاں", "یہ", "وہ", "کوئی", "کچھ", "ہے", "ہیں", "تھا", "تھی", "تھے",
+    "اس", "ان", "اپنے", "اپنی", "اپنا", "تو", "بھی", "ہی", "نہیں", "مگر", "پھر", "ابھی",
+    "وہاں", "یہاں", "جہاں", "جیسے", "جیسا", "آپ", "ہم", "تم", "مجھے", "ہمیں", "انہوں",
+    "speech", "from",  # Common English filler words in Pakistani search context
+
+     # English filler / conversational words
+    "please", "plz", "pls", "kindly", "actually", "basically", "literally",
+    "maybe", "probably", "perhaps", "okay", "ok", "yes", "yeah", "yep",
+    "nope", "hmm", "um", "uh", "like", "means", "mean", "sir", "bro",
+    "brother", "dear", "thanks", "thank", "hello", "hi", "hey",
+
+    # Roman Urdu filler/common words
+    "bhai", "bahi", "jan", "jee", "ji", "han", "haan", "nahi", "nahin",
+    "nai", "na", "to", "tu", "tou", "phir", "ab", "abi", "abhi",
+    "bas", "bus", "waise", "wesy", "wese", "matlab", "mtlb",
+    "yani", "yaani", "lagta", "lagti", "lagay", "laga", "lag",
+    "mujhe", "mujhy", "muje", "hum", "ham", "aap", "ap", "tum",
+    "mera", "meri", "mere", "tera", "teri", "tere", "unka", "unki",
+    "unke", "iska", "iski", "iske", "uska", "uski", "uske",
+    "idhar", "udhar", "kidhar", "kidr", "kidar",
+    "acha", "achha", "accha", "theek", "thik", "sahi",
+    "wala", "wali", "walay", "wale", "waly",
+    "kar", "karo", "karen", "karna", "kr", "krlena", "karwana",
+    "hona", "hoga", "hogi", "hongay", "raha", "rahi", "rahe",
+    "rha", "rhi", "rhy", "gaya", "gayi", "gaye",
+    "chahiye", "chaiye", "chaheye", "zaroori", "zroori",
+    "bhut", "bohat", "bahut", "zyada", "ziada", "kam",
+    "shayad", "almost", "qareeb", "qarib",
+
+    # Urdu native filler/common words
+    "براہ", "مہربانی", "شکریہ", "جناب", "بھائی", "جی", "ہاں",
+    "نہ", "نا", "بس", "اصل", "دراصل", "تقریباً", "شاید",
+    "مطلب", "یعنی", "اچھا", "ٹھیک", "صحیح", "زیادہ", "کم",
+    "اب", "بعد", "پہلے", "ساتھ", "والا", "والی", "والے",
+    "رہا", "رہی", "رہے", "گیا", "گئی", "گئے", "کر", "کریں",
+    "کرنا", "ہونا", "ہوگا", "ہوگی", "چاہیے", "ضروری",
+    "سے", "نے", "میں", "پر", "کو", "کا", "کی", "کے", 
+    "وہ", "یہ", "کیا", "کون", "کب", "کہاں", "کیسے", 
+    "ساتھ", "اگر", "جب", "تب", "پھر", "تو", "بھی", "ہی", 
+    "نہیں", "بس", "کچھ", "کچھ بھی"
 })
 
 # ============== PERSON NAME ALIASES ==============
@@ -4871,6 +4913,72 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
     elif use_reranking and query_text:
         logger.info(f"Skipping LLM reranking (results={len(merged_list)}, high_confidence={has_high_confidence_results}) for speed")
     
+    # ═══════════════════════════════════════════════════════════════════════════
+    # FILLER-WORD RELEVANCE FILTER
+    # After retrieving all results, filter out semantic-only segments whose
+    # text/title contain NONE of the meaningful (non-stop) query words.
+    # This prevents results that only matched on filler words like "in", "to",
+    # "the" (English) or "hai", "ka", "ki", "ke" (Urdu) from polluting results.
+    # Keyword, title, speaker, and exact_phrase matches are ALWAYS kept.
+    # ═══════════════════════════════════════════════════════════════════════════
+    if raw_query_text and len(raw_query_text.split()) >= 2:
+        # Extract meaningful (non-stop) words from the query
+        meaningful_query_words = [
+            normalize_word(w) for w in raw_query_text.split()
+            if len(normalize_word(w)) >= 2 and normalize_word(w).lower() not in STOP_WORDS
+        ]
+        
+        if meaningful_query_words:
+            pre_filter_count = len(merged_list)
+            filtered_merged = []
+            filler_only_removed = 0
+            
+            for r in merged_list:
+                match_types = r.get("match_types", [])
+                
+                # ALWAYS keep non-semantic matches (keyword, title, speaker, exact_phrase)
+                non_semantic_types = {"keyword", "title_match", "speaker", "exact_phrase_match",
+                                      "matched_in_video_title", "matched_in_speaker",
+                                      "matched_in_diarization_speaker", "matched_in_text"}
+                if any(mt in non_semantic_types or mt.startswith("matched_in_") for mt in match_types):
+                    filtered_merged.append(r)
+                    continue
+                
+                # For semantic-only results, check if text or title contain at least
+                # ONE meaningful query word (whole word or fuzzy)
+                text = normalize_for_matching(r.get("text", ""))
+                title = normalize_for_matching(r.get("video_title", ""))
+                combined = f"{text} {title}"
+                
+                has_meaningful_word = False
+                for mw in meaningful_query_words:
+                    if whole_word_match(mw, combined):
+                        has_meaningful_word = True
+                        break
+                    # Also try fuzzy for longer words (handles typos/transliterations)
+                    if len(mw) >= 4:
+                        if fuzzy_word_match(mw, combined, threshold=80) > 0:
+                            has_meaningful_word = True
+                            break
+                
+                if has_meaningful_word:
+                    filtered_merged.append(r)
+                else:
+                    filler_only_removed += 1
+            
+            if filler_only_removed > 0 and len(filtered_merged) >= 5:
+                merged_list = filtered_merged
+                logger.info(
+                    f"[FILLER FILTER] Removed {filler_only_removed} semantic-only results with no meaningful "
+                    f"query words (meaningful_words={meaningful_query_words[:5]}), "
+                    f"kept={len(merged_list)}/{pre_filter_count}"
+                )
+            elif filler_only_removed > 0:
+                logger.info(
+                    f"[FILLER FILTER] Would remove {filler_only_removed} results but only {len(filtered_merged)} "
+                    f"would remain; keeping all to avoid empty results"
+                )
+
     # Group by video and collect ALL matching segments per video
     # CONSOLIDATE adjacent/overlapping segments into full segments
     # This prevents showing chunks of the same segment multiple times
