@@ -1060,7 +1060,7 @@ Set "relevant": true ONLY if at least one result scores >= 3.
 Set "relevant": false if ALL results are completely off-topic.
 
 Be MODERATE: If a result seems like a plausible match for the user's specific quote, phrase, or topic, consider it relevant. 
-If searching for "Bill Gates" but results are about Pakistan politics, that's irrelevant."""},
+If searching for "Bill Gates" but results are about Pakistan politics, that's irrelevant.
                 {"role": "user", "content": f"Query: {query}\n\nTop Results:\n{docs_text}\n\nAre these results relevant to the query?"}
             ],
             max_tokens=300,
@@ -4372,16 +4372,18 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                         continue
                     
                     # Flexible word matching: require a high proportion but not necessarily ALL words
-                    # For short queries (2-3 words): require ALL words
-                    # For medium queries (4-6 words): allow 1 missing word
-                    # For long queries (7+ words): require at least 75% of words
+                    # For short queries (1-2 words): require ALL words
+                    # For medium queries (3-4 words): allow 1 missing word
+                    # For long queries (5-6 words): allow 2 missing words
                     total_words = len(words_lower)
-                    if total_words <= 3:
+                    if total_words <= 2:
                         min_required = total_words  # ALL must match
-                    elif total_words <= 6:
+                    elif total_words <= 4:
                         min_required = total_words - 1  # Allow 1 miss
+                    elif total_words <= 6:
+                        min_required = total_words - 2  # Allow 2 misses
                     else:
-                        min_required = max(3, int(total_words * 0.75))  # 75% must match
+                        min_required = max(2, int(total_words * 0.6))  # 60% must match
                     
                     if matched_words_count < min_required:
                         continue
