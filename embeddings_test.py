@@ -5261,7 +5261,7 @@ async def search_incremental(data: IncrementalSearchRequest, authorized: bool = 
     _is_numeric_incremental = bool(initial_query_shape.get("is_numeric_query"))
     _is_short_semantic_incremental = bool(initial_query_shape.get("is_short_semantic_query"))
 
-    incremental_allow_delegation = os.getenv("INCREMENTAL_ALLOW_DELEGATION", "false").lower() == "true"
+    incremental_allow_delegation = os.getenv("INCREMENTAL_ALLOW_DELEGATION", "true").lower() == "true"
 
     if incremental_allow_delegation and (_is_numeric_incremental or _is_short_semantic_incremental):
         route_reason = "numeric_simple_text" if _is_numeric_incremental else (
