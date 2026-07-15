@@ -5100,14 +5100,39 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
             return 1
         return 0
     
-    consolidated_segments.sort(
-        key=lambda x: (
-            consolidated_priority(x),
-            x.get("score", 0),
-            -x.get("start_time", 0)
-        ),
+    # Group segments by video to find the best segment for each video
+    # This ensures that segments from the same video are kept contiguous in the final list,
+    # preventing them from being split across pagination batches.
+    video_groups = {}
+    for seg in consolidated_segments:
+        vid = seg.get("video_id")
+        seg_key = (
+            consolidated_priority(seg),
+            seg.get("score", 0),
+            -seg.get("start_time", 0)
+        )
+        
+        if vid not in video_groups:
+            video_groups[vid] = {"best_key": seg_key, "segments": []}
+        else:
+            if seg_key > video_groups[vid]["best_key"]:
+                video_groups[vid]["best_key"] = seg_key
+                
+        video_groups[vid]["segments"].append(seg)
+
+    # Sort video groups by their highest scoring segment's key
+    sorted_video_groups = sorted(
+        video_groups.values(),
+        key=lambda x: x["best_key"],
         reverse=True
     )
+
+    # Flatten back into consolidated_segments while keeping segments for the same video adjacent
+    consolidated_segments = []
+    for vg in sorted_video_groups:
+        # Sort segments within a video by start_time so they appear in chronological order
+        vg_segments = sorted(vg["segments"], key=lambda x: x.get("start_time", 0))
+        consolidated_segments.extend(vg_segments)
     
     # Log exact phrase and title matches for debugging
     exact_phrase_count = sum(1 for s in consolidated_segments if "exact_phrase_match" in s.get("match_types", []))
