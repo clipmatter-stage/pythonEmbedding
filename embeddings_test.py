@@ -1089,21 +1089,23 @@ def validate_query_relevance(query: str, top_results: List[Dict]) -> Dict:
         response = openai_client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
-                {"role": "system", "content": """You are a relevance validator for a search engine. Your job is to determine if search results actually match the user's query.
+                {"role": "system", "content": """You are a domain gatekeeper for a political/social video search engine. Your job is to determine if the user's query conceptually fits within the domain of the retrieved documents (Pakistan politics, social issues, religion, current events).
 
 Return ONLY valid JSON: {"relevant": boolean, "scores": [score1, score2, ...], "explanation": "reason"}
 
 Score each result 0-10:
-- 8-10: Directly discusses the query topic/person
-- 5-7: Related to the query domain
-- 3-4: Loosely connected, tangential, or mentions a specific phrase/quote
-- 0-2: Completely unrelated
+- 8-10: Conceptually matches the query's domain/topic
+- 5-7: Broadly related to the general topic
+- 3-4: Loosely connected
+- 0-2: Completely unrelated domain (e.g. searching 'Bill Gates' or 'Minecraft' but results are about Pakistan politics)
+
+CRITICAL RULES:
+- If the query is a broad political/social concept (e.g. 'Democracy', 'Constitution', 'Education'), consider it IN-DOMAIN and score highly.
+- ONLY reject queries that are completely foreign to the corpus.
+- Do NOT require exact keyword matches. A query about 'Democracy' is highly relevant to a result discussing 'elections, voting, rights, and parliament'. Assess the conceptual meaning.
 
 Set "relevant": true ONLY if at least one result scores >= 3.
-Set "relevant": false if ALL results are completely off-topic.
-
-Be MODERATE: If a result seems like a plausible match for the user's specific quote, phrase, or topic, consider it relevant. 
-If searching for "Bill Gates" but results are about Pakistan politics, that's irrelevant."""},
+Set "relevant": false if ALL results are completely out-of-domain."""},
                 {"role": "user", "content": f"Query: {query}\n\nTop Results:\n{docs_text}\n\nAre these results relevant to the query?"}
             ],
             max_tokens=300,
@@ -1168,26 +1170,23 @@ def rerank_with_llm(query: str, results: List[Dict], top_k: int = 20) -> List[Di
         response = openai_client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
-                {"role": "system", "content": """You are a STRICT search result relevance judge for a video transcript search engine.
+                {"role": "system", "content": """You are a search result relevance judge for a video transcript search engine.
 Content may be in Urdu, English, or mixed. Rate each transcript segment's relevance to the user's search query.
 
 Return ONLY valid JSON: {"scores": [{"i": 0, "s": 8}, {"i": 1, "s": 3}, ...]}
 Where "i" is the document index and "s" is relevance score 0-10.
 
-Scoring guide (BE STRICT):
-- 10: Perfect match - directly answers the query, exact topic/person
-- 7-9: Highly relevant - clearly discusses the queried topic/person
-- 4-6: Partially relevant - mentions topic but not the main focus
-- 1-3: Marginally relevant - only loosely connected, different topic
-- 0: Completely unrelated - wrong topic/person/domain entirely
+Scoring guide:
+- 8-10: Highly relevant - clearly discusses the queried topic/person or underlying meaning.
+- 5-7: Partially relevant - conceptually related, mentions topic but not main focus.
+- 3-4: Marginally relevant - loosely connected.
+- 0-2: Completely unrelated - wrong topic/person/domain entirely.
 
 CRITICAL RULES:
-- If query is "Bill Gates" but result is about Pakistan politics → score 0-1
-- If query is about technology but result is about religion → score 0-2
-- If query person/topic is NOT mentioned in the result → score 0-3
-- Only give scores >= 7 if the result is ACTUALLY ABOUT what the user searched for
-
-Be VERY strict. Most results should get low scores if they don't match the query topic."""}, 
+- Evaluate the CONCEPTUAL relevance. A result discussing 'elections, voting, and parliament' is highly relevant (7-10) to the query 'Democracy', even if the specific word is missing. Do NOT penalize missing keywords if the underlying meaning aligns.
+- If query is "Bill Gates" but result is about Pakistan politics → score 0-1.
+- If query is about technology but result is about religion → score 0-2.
+- Evaluate the semantic meaning, not just keyword overlaps."""}, 
                 {"role": "user", "content": f"Search Query: {query}\n\nDocuments:\n{docs_text}"}
             ],
             max_tokens=500,
@@ -4129,26 +4128,6 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                                     query_words_in_result = True
                                     break
                     
-                    # Apply query-presence penalty for SHORT queries (1-2 words)
-                    # Short queries are specific searches ("mufti", "drone", "bill gates") — user expects
-                    # the word to actually appear in results, not just be "semantically related"
-                    # EXCEPTION: Skip penalty for known person alias queries — we want ALL results about them
-                    query_word_count = len(query_text.split()) if query_text else 0
-                    presence_penalty = 0.0
-                    if is_person_alias_query:
-                        # Person alias queries: no presence penalty — semantic similarity is enough
-                        # We want to find ALL content related to this person even if their name
-                        # isn't literally in the transcript text
-                        pass
-                    elif query_word_count <= 2 and not query_words_in_result and not speaker_field_match:
-                        # STRONGER penalty: results that don't contain the actual search term
-                        # This prevents "bill gates" → "pakistan politics" false matches
-                        # Also prevents "mufti" → "qari mansoor jamat" false matches
-                        presence_penalty = 0.25  # Increased from 0.15 to 0.25
-                    elif 3 <= query_word_count <= 4 and not query_words_in_result and not speaker_field_match:
-                        # Medium queries (3-4 words): smaller penalty
-                        presence_penalty = 0.15
-
                     # Reward close lexical matches (including typo/near-word matches)
                     # so that words near the query get visible score lift.
                     lexical_closeness = 0.0
@@ -4165,8 +4144,8 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                     
                     combined_score = calculate_combined_score(base_score, False, fuzzy_boost)
                     if lexical_closeness > 0:
-                        combined_score += min(lexical_closeness * 0.12, 0.12)
-                    combined_score = max(combined_score - presence_penalty, 0.0)
+                        combined_score += min(lexical_closeness * 0.15, 0.15)
+                    # presence_penalty is completely removed to allow pure semantic matches
                     
                     # Results from expanded/translated query variations are lower confidence
                     # They are more likely to drift from user intent
@@ -6731,4 +6710,3 @@ if __name__ == "__main__":
         port=port,
         timeout_keep_alive=120
     )
-    
