@@ -1836,12 +1836,11 @@ def compute_retrieval_threshold(min_score: float, is_short_semantic_query: bool 
     """
     Shared retrieval threshold policy used by both /search and /search/incremental.
     """
-    threshold = max(min_score * 0.60, 0.25)
-    if is_alias_query:
-        return max(min_score * 0.40, 0.15)
-    if is_short_semantic_query:
-        return max(min_score * 0.40, 0.15)
-    return threshold
+    # Lower base threshold (0.15) for all queries. 
+    # Long conversational queries (like "speech on electric bill and load shedding")
+    # have highly diluted vectors and struggle to hit 0.30 similarity.
+    # We rely on the LLM reranker to filter out the irrelevant garbage anyway.
+    return max(min_score * 0.30, 0.15)
 
 
 def collect_short_query_lexical_evidence(short_terms: List[str], payload: Dict, fuzzy_threshold: int = 90) -> Dict:
@@ -4152,13 +4151,8 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                     if idx > 0:
                         combined_score *= 0.85  # 15% discount for non-original queries
                     
-                    # Apply threshold filter AFTER combined scoring.
-                    # We use retrieval_threshold instead of the strict min_score so that lower-scoring 
-                    # semantic candidates can reach the LLM reranker for actual semantic evaluation.
-                    if combined_score < retrieval_threshold:
-                        continue
-                    
                     # Build match types list
+
                     match_types = ["semantic"]
                     if speaker_field_match:
                         match_types.append("speaker_field_match")
