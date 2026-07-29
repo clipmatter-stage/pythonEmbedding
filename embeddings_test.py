@@ -4152,8 +4152,10 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                     if idx > 0:
                         combined_score *= 0.85  # 15% discount for non-original queries
                     
-                    # Apply min_score filter AFTER combined scoring
-                    if combined_score < min_score:
+                    # Apply threshold filter AFTER combined scoring.
+                    # We use retrieval_threshold instead of the strict min_score so that lower-scoring 
+                    # semantic candidates can reach the LLM reranker for actual semantic evaluation.
+                    if combined_score < retrieval_threshold:
                         continue
                     
                     # Build match types list
