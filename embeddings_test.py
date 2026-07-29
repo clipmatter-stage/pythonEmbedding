@@ -1836,11 +1836,11 @@ def compute_retrieval_threshold(min_score: float, is_short_semantic_query: bool 
     """
     Shared retrieval threshold policy used by both /search and /search/incremental.
     """
-    threshold = max(min_score * 0.85, 0.35)
+    threshold = max(min_score * 0.60, 0.25)
     if is_alias_query:
-        return max(min_score * 0.55, 0.18)
+        return max(min_score * 0.40, 0.15)
     if is_short_semantic_query:
-        return max(min_score * 0.60, 0.20)
+        return max(min_score * 0.40, 0.15)
     return threshold
 
 
@@ -4042,7 +4042,7 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                 sem_search_response = qdrant_client.query_points(
                     collection_name=SEGMENTS_COLLECTION,
                     query=query_vector,
-                    limit=top_k * 2 if idx == 0 else top_k,  # Reduced from 3x for speed
+                    limit=top_k * 3 if idx == 0 else top_k * 2,  # Increased to pull more semantic candidates
                     score_threshold=retrieval_threshold,  # Lower threshold — filter later
                     query_filter=search_filter,
                     with_payload=True,
@@ -5525,8 +5525,9 @@ async def search_incremental(data: IncrementalSearchRequest, authorized: bool = 
     if alias_person_key:
         initial_top_k = max(initial_top_k, 300)
     # Caller (PHP) can override initial_top_k by sending top_k explicitly.
+    # We multiply by 2 to fetch a broader set of semantic candidates before reranking.
     if data.top_k is not None:
-        initial_top_k = max(initial_top_k, data.top_k)
+        initial_top_k = max(initial_top_k, data.top_k * 2)
     # Hard cap: keep bounded for latency; short queries still get enough candidates.
     initial_top_k = min(initial_top_k, 600)
 
