@@ -112,7 +112,7 @@ STOP_WORDS = frozenset({
     "کیا", "کیسے", "کہاں", "یہ", "وہ", "کوئی", "کچھ", "ہے", "ہیں", "تھا", "تھی", "تھے",
     "اس", "ان", "اپنے", "اپنی", "اپنا", "تو", "بھی", "ہی", "نہیں", "مگر", "پھر", "ابھی",
     "وہاں", "یہاں", "جہاں", "جیسے", "جیسا", "آپ", "ہم", "تم", "مجھے", "ہمیں", "انہوں",
-    "speech", "from",  # Common English filler words in Pakistani search context
+    "speech", "from", "on", "in", "at", "the", "and", "for", "of", "to", "with", "by", "a", "an", "is", "are", "was", "were", "this", "that", "it", # Common English filler words
 
     # English filler / conversational words
     "please", "plz", "pls", "kindly", "actually", "basically", "literally",
@@ -1686,9 +1686,10 @@ def fuzzy_word_match(word: str, text: str, threshold: int = 85) -> float:
         # Only compare against words of comparable length
         if len(text_word) < 2:
             continue
-        # For short words (<=5 chars), require length difference <= 1
-        # This prevents 'cleo'(4) matching 'ceo'(3), but allows 'sam'(3) matching 'sam'(3)
-        if len(word) <= 5 and abs(len(word) - len(text_word)) > 1:
+        # Protect against substring/superstring mismatches like 'national'(8) matching 'international'(13)
+        # Even if fuzz.ratio is 76%, they are fundamentally different words.
+        max_len_diff = 1 if len(word) <= 5 else max(2, len(word) // 3)
+        if abs(len(word) - len(text_word)) > max_len_diff:
             continue
         ratio = fuzz.ratio(word, text_word)
         if ratio >= effective_threshold and ratio > best_score:
@@ -1836,11 +1837,12 @@ def compute_retrieval_threshold(min_score: float, is_short_semantic_query: bool 
     """
     Shared retrieval threshold policy used by both /search and /search/incremental.
     """
-    # Lower base threshold (0.15) for all queries. 
+    # Lower base threshold (0.05) for all queries. 
     # Long conversational queries (like "speech on electric bill and load shedding")
-    # have highly diluted vectors and struggle to hit 0.30 similarity.
-    # We rely on the LLM reranker to filter out the irrelevant garbage anyway.
-    return max(min_score * 0.30, 0.15)
+    # OR single-word conceptual queries (like "Federalism")
+    # have highly diluted vectors and struggle to hit 0.15 similarity.
+    # We rely on the LLM reranker and Keyword Search to filter out the irrelevant garbage anyway.
+    return max(min_score * 0.15, 0.05)
 
 
 def collect_short_query_lexical_evidence(short_terms: List[str], payload: Dict, fuzzy_threshold: int = 90) -> Dict:
@@ -3521,14 +3523,11 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
             alias_speaker_variants = data_p["speaker_variants"]
             alias_extra_keywords = [data_p["canonical"]] + data_p["speaker_variants"][:3]
             logger.info(f"Alias detected in query '{query_text[:40]}' → expanding to person '{data_p['canonical']}'")
-            # Inject canonical name into query and words list
+            # Set canonical name into query if missing, but do NOT inject into words array
+            # Injecting multi-word phrases into `words` inflates `total_words` and breaks keyword math.
             canonical = data_p["canonical"]
             if canonical.lower() not in query_text.lower():
                 query_text = f"{query_text} {canonical}"
-            for term in alias_extra_keywords:
-                tw = term.strip()
-                if tw and tw.lower() not in [w.lower() for w in words]:
-                    words.append(tw)
 
     # 3. If no full-phrase match, do single-word check on query words
     # e.g. query "hafiz speech" triggers alias even if full phrase doesn't match
@@ -4208,13 +4207,25 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
     if query_terms_for_keyword and (len(query_terms_for_keyword) == 1 or (len(query_terms_for_keyword) <= 3 and len(search_words) < 2)):
         search_words.extend(query_terms_for_keyword)
     
-    # Clean up search words: normalize quotes/dashes, strip punctuation, remove too-short words and stop words
     search_words = sorted(set(
         normalize_word(w)
         for w in search_words
         if len(normalize_word(w)) >= 2 and normalize_word(w).lower() not in STOP_WORDS
     ))
-    logger.info(f"Keywords after stop word filtering: {len(search_words)} words")
+    
+    # If this is a person search, the speaker filter already handles finding the person.
+    # We must remove their name parts from search_words so that Keyword Search
+    # focuses entirely on the TOPIC (e.g., "Federalism") rather than giving 
+    # high scores to any random video just because it matches "Hafiz Naeem".
+    if is_person_alias_query and alias_person_key:
+        person_data = PERSON_ALIASES[alias_person_key]
+        alias_name_parts = set()
+        for variant in person_data["speaker_variants"] + [person_data["canonical"]]:
+            for part in variant.split():
+                alias_name_parts.add(normalize_word(part))
+        search_words = [w for w in search_words if w not in alias_name_parts]
+
+    logger.info(f"Keywords after stop word and alias filtering: {len(search_words)} words")
     
     # EXACT PHRASE MATCHING: Prepare the full original query for exact substring match
     # This ensures that when user searches for "before Windows 95, 1984" and that exact
