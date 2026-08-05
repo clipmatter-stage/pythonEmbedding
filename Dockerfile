@@ -18,6 +18,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application code
 COPY embeddings_test.py .
+COPY semantic_query_decomposition.py .
 COPY migrate_to_3072.py .
 COPY worker.py .
 COPY start.sh .
@@ -39,3 +40,4 @@ EXPOSE 9000
 
 # Start command - use start.sh to launch both worker and web process
 CMD ["./start.sh"]
+
