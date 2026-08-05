@@ -24,6 +24,7 @@ from openai import OpenAI
 import tiktoken
 import asyncio
 import json as json_module
+from semantic_query_decomposition import decompose_semantic_query, has_minimum_topic_evidence
 from redis import Redis
 from rq import Queue
 
@@ -502,6 +503,8 @@ class SearchRequest(BaseModel):
     filter_year: Optional[int] = Field(default=None, ge=1900, le=2100)
     filter_month: Optional[int] = Field(default=None, ge=1, le=12)
     filter_date: Optional[str] = Field(default=None, max_length=20)
+    # Authenticated canary override. Production default remains controlled by env.
+    query_decomposition_mode: Optional[str] = Field(default=None, pattern="^(off|shadow|on)$")
 
 class SuggestRequest(BaseModel):
     query: str = Field(..., min_length=2, max_length=200)
@@ -534,6 +537,7 @@ class IncrementalSearchRequest(BaseModel):
     cursor: Optional[str] = Field(default=None, description="Base64-encoded cursor for pagination")
     batch_size: int = Field(default=10, ge=1, le=50, description="Number of results per batch")
     search_session_id: Optional[str] = Field(default=None, max_length=100, description="UUID to identify search session")
+    query_decomposition_mode: Optional[str] = Field(default=None, pattern="^(off|shadow|on)$")
 
 # ============== RATE LIMITER ==============
 class RateLimiter:
@@ -3554,6 +3558,44 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
     use_query_expansion = os.getenv("USE_QUERY_EXPANSION", "true").lower() == "true"
     use_reranking = os.getenv("USE_RERANKING", "true").lower() == "true"
     use_llm_understanding = os.getenv("USE_LLM_UNDERSTANDING", "true").lower() == "true"
+    decomposition_mode = (
+        data.query_decomposition_mode
+        or os.getenv("SEMANTIC_QUERY_DECOMPOSITION_MODE", "off")
+    ).strip().lower()
+    if decomposition_mode not in {"off", "shadow", "on"}:
+        logger.warning(
+            "Unknown SEMANTIC_QUERY_DECOMPOSITION_MODE=%r; defaulting to off",
+            decomposition_mode,
+        )
+        decomposition_mode = "off"
+
+    canonical_speaker = (
+        PERSON_ALIASES[alias_person_key]["canonical"]
+        if alias_person_key
+        else None
+    )
+    query_decomposition = decompose_semantic_query(raw_query_text, canonical_speaker)
+    if decomposition_mode in {"shadow", "on"}:
+        logger.info(
+            "[QUERY DECOMPOSITION] mode=%s decomposed=%s speaker=%r topic=%r original=%r",
+            decomposition_mode,
+            query_decomposition.get("decomposed"),
+            query_decomposition.get("speaker"),
+            query_decomposition.get("topic"),
+            raw_query_text[:120],
+        )
+
+    if decomposition_mode == "on" and query_decomposition.get("decomposed"):
+        query_text = str(query_decomposition["retrieval_query"])
+        speaker_filter = str(query_decomposition["speaker"])
+        logger.info(
+            "[QUERY DECOMPOSITION] active retrieval_query=%r speaker_filter=%r",
+            query_text,
+            speaker_filter,
+        )
+    structured_speaker_topic_search = bool(
+        decomposition_mode == "on" and query_decomposition.get("decomposed")
+    )
     query_source_for_length = raw_query_text or query_text or ""
     query_shape = classify_query_shape(query_source_for_length, search_mode=search_mode, alias_person_key=alias_person_key)
     query_word_count_for_strategy = int(query_shape.get("token_count", 0))
@@ -3737,7 +3779,12 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
     #    - Segments BY that speaker (speaker field match)
     #    - Segments MENTIONING that speaker (transcript content match via semantic search)
     speaker_only_search = speaker_filter and not query_text and not words
-    speaker_parallel_search = speaker_filter and query_text  # Run speaker search in parallel with semantic
+    # A decomposed speaker+topic query uses the speaker as a constraint on topic
+    # retrieval. It must not add arbitrary passages merely because that person
+    # spoke them.
+    speaker_parallel_search = bool(
+        speaker_filter and query_text and not structured_speaker_topic_search
+    )
     
     if use_scan_strategies and (speaker_only_search or speaker_parallel_search):
         try:
@@ -3811,6 +3858,9 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                     speaker_combined = f"{spk} {diar_spk}".strip()
                     video_title = payload.get("video_title", "")
                     text = payload.get("text", "")
+
+                    if structured_speaker_topic_search and not has_minimum_topic_evidence(text):
+                        continue
                     
                     # Fuzzy match speaker name against speaker fields
                     if not fuzzy_match_speaker(speaker_filter, speaker_combined, threshold=70):
@@ -4066,6 +4116,9 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                     speaker = payload.get("speaker", "")
                     diarization_speaker = payload.get("diarization_speaker", "")
                     text = payload.get("text", "")
+
+                    if structured_speaker_topic_search and not has_minimum_topic_evidence(text):
+                        continue
                     
                     # ELASTIC title filter with fuzzy matching
                     if title_filter:
@@ -5150,7 +5203,7 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
             if not relevance_check["is_relevant"]:
                 logger.warning(f"Query '{query_text[:50]}' returned no relevant results. Max relevance: {relevance_check['max_relevance']:.2f}. Reason: {relevance_check['explanation']}")
                 return {
-                    "query": query_text,
+                    "query": raw_query_text or query_text,
                     "words": words,
                     "speaker_filter": speaker_filter,
                     "collection": SEGMENTS_COLLECTION,
@@ -5175,6 +5228,7 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                         "max_relevance": relevance_check["max_relevance"],
                         "explanation": relevance_check["explanation"]
                     },
+                    "query_decomposition": query_decomposition,
                     "results": [],
                     "message": f"No relevant results found for '{query_text}'. The database may not contain content about this topic."
                 }
@@ -5198,7 +5252,7 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
     logger.info(f"Search completed: {len(speaker_results)} speaker + {len(semantic_results)} semantic + {len(keyword_results)} keyword + {len(title_results)} title = {len(final_results)} merged results from {len(videos_seen)} videos (consolidated from {len(merged_list)} raw matches)")
 
     return {
-        "query": query_text,
+        "query": raw_query_text or query_text,
         "words":  words,
         "speaker_filter": speaker_filter,
         "collection":  SEGMENTS_COLLECTION,
@@ -5217,6 +5271,7 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
             "time_range": time_range,
             "min_score": min_score,
         },
+        "query_decomposition": query_decomposition if decomposition_mode != "off" else None,
         "results": [
             {
                 "id": r["id"],
@@ -5424,6 +5479,7 @@ async def search_incremental(data: IncrementalSearchRequest, authorized: bool = 
             filter_type="text" if _is_numeric_incremental else data.filter_type,
             filter_year=data.filter_year,
             filter_month=data.filter_month,
+            query_decomposition_mode=data.query_decomposition_mode,
             filter_date=data.filter_date,
         )
 
