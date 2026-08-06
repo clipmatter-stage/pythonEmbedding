@@ -4843,6 +4843,39 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
             r.setdefault("matched_terms", [])
             r.setdefault("is_multi_match", False)
             merged[r["id"]] = r
+
+    # Final conjunctive gate for decomposed speaker+topic searches. Individual
+    # retrieval legs (notably exact phrase and keyword fallbacks) intentionally
+    # have broad recall and may not apply speaker constraints themselves. Never
+    # allow those candidates to bypass the structured intent.
+    if structured_speaker_topic_search:
+        constrained_merged = {}
+        rejected_wrong_speaker = 0
+        rejected_weak_evidence = 0
+
+        for segment_id, segment in merged.items():
+            segment_speaker = f"{segment.get('speaker', '')} {segment.get('diarization_speaker', '')}".strip()
+            if not fuzzy_match_speaker(speaker_filter, segment_speaker, threshold=70):
+                rejected_wrong_speaker += 1
+                continue
+
+            if not has_minimum_topic_evidence(segment.get("text", "")):
+                rejected_weak_evidence += 1
+                continue
+
+            match_types = list(segment.get("match_types", []))
+            if "structured_speaker_topic" not in match_types:
+                match_types.append("structured_speaker_topic")
+            segment["match_types"] = match_types
+            constrained_merged[segment_id] = segment
+
+        logger.info(
+            "[STRUCTURED QUERY GATE] kept=%d rejected_wrong_speaker=%d rejected_weak_evidence=%d",
+            len(constrained_merged),
+            rejected_wrong_speaker,
+            rejected_weak_evidence,
+        )
+        merged = constrained_merged
     
     # Update is_multi_match flag based on combined matched_terms count
     # Also boost score for multi-match segments (multiple terms found in same segment)

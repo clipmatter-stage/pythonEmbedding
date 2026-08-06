@@ -63,6 +63,9 @@ class SemanticQueryDecompositionTest(unittest.TestCase):
             )
         )
 
+    def test_rejects_transcription_placeholder(self):
+        self.assertFalse(has_minimum_topic_evidence("پ..."))
+
 
 if __name__ == "__main__":
     unittest.main()
