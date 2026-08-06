@@ -1188,6 +1188,8 @@ Scoring guide:
 
 CRITICAL RULES:
 - Evaluate the CONCEPTUAL relevance. A result discussing 'elections, voting, and parliament' is highly relevant (7-10) to the query 'Democracy', even if the specific word is missing. Do NOT penalize missing keywords if the underlying meaning aligns.
+- Distinguish an abstract concept from an incidental word or institution-name match. For example, 'Federalism' requires evidence about division of powers, provincial/local autonomy, or relations between levels of government; merely saying 'federal government' is not enough. 'Local government system' requires evidence about municipal institutions, powers, elections, funding, or services; an unrelated utility complaint is not enough.
+- Judge only the supplied transcript passage. Do not infer relevance from the speaker or video title alone.
 - If query is "Bill Gates" but result is about Pakistan politics → score 0-1.
 - If query is about technology but result is about religion → score 0-2.
 - Evaluate the semantic meaning, not just keyword overlaps."""}, 
@@ -5017,10 +5019,10 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
         merged_list = [
             result
             for result in merged_list
-            if float(result.get("llm_relevance_score", 0) or 0) >= 0.45
+            if float(result.get("llm_relevance_score", 0) or 0) >= 0.60
         ]
         logger.info(
-            "[STRUCTURED TOPIC FLOOR] kept=%d/%d minimum_llm_relevance=0.45",
+            "[STRUCTURED TOPIC FLOOR] kept=%d/%d minimum_llm_relevance=0.60",
             len(merged_list),
             pre_topic_floor_count,
         )
