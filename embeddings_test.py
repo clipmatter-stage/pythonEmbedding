@@ -4941,7 +4941,24 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
     has_high_confidence_results = any(r.get("score", 0) >= 0.8 for r in merged_list[:5])
     # Skip reranking for small top_k (incremental first-page requests use top_k=20)
     # Reranking 20 results with LLM adds 20-30s latency — not worth it for first page
-    should_rerank = use_reranking and query_text and len(query_text.split()) > 1 and len(merged_list) >= 15 and not has_high_confidence_results and top_k > 20
+    standard_should_rerank = (
+        use_reranking
+        and query_text
+        and len(query_text.split()) > 1
+        and len(merged_list) >= 15
+        and not has_high_confidence_results
+        and top_k > 20
+    )
+    # Structured speaker+topic searches require conceptual ranking even on the
+    # normal first page. Otherwise title/keyword score inflation can outrank
+    # passages that actually discuss the requested topic.
+    structured_should_rerank = bool(
+        structured_speaker_topic_search
+        and use_reranking
+        and query_text
+        and len(merged_list) >= 5
+    )
+    should_rerank = standard_should_rerank or structured_should_rerank
     
     if should_rerank:
         logger.info(f"Applying LLM reranking to {len(merged_list)} results...")
@@ -4955,7 +4972,16 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
             if "exact_phrase_match" in r.get("match_types", []):
                 exact_phrase_scores[r["id"]] = r["score"]
         
-        merged_list = rerank_with_llm(query_text, merged_list, top_k=min(len(merged_list), top_k * 3))
+        rerank_query = (
+            str(query_decomposition.get("topic") or query_text)
+            if structured_speaker_topic_search
+            else query_text
+        )
+        merged_list = rerank_with_llm(
+            rerank_query,
+            merged_list,
+            top_k=min(len(merged_list), top_k * 3),
+        )
         
         # Restore score floors for protected match types
         # Exact phrase matches should ALWAYS keep 0.99 score (they are confirmed transcript matches!)
@@ -4985,6 +5011,19 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
             logger.info("LLM reranking returned no results")
     elif use_reranking and query_text:
         logger.info(f"Skipping LLM reranking (results={len(merged_list)}, high_confidence={has_high_confidence_results}) for speed")
+
+    if structured_speaker_topic_search and should_rerank:
+        pre_topic_floor_count = len(merged_list)
+        merged_list = [
+            result
+            for result in merged_list
+            if float(result.get("llm_relevance_score", 0) or 0) >= 0.45
+        ]
+        logger.info(
+            "[STRUCTURED TOPIC FLOOR] kept=%d/%d minimum_llm_relevance=0.45",
+            len(merged_list),
+            pre_topic_floor_count,
+        )
     
     # ═══════════════════════════════════════════════════════════════════════════
     # FILLER-WORD RELEVANCE FILTER
