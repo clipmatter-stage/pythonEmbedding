@@ -86,3 +86,40 @@ def has_minimum_topic_evidence(text: str, min_characters: int = 24, min_words: i
         return False
 
     return len([word for word in normalized.split(" ") if word]) >= min_words
+
+
+def has_conceptual_topic_evidence(topic: str, text: str) -> bool:
+    """Apply narrow deterministic guards for known ambiguous concepts.
+
+    Most topics remain governed by semantic retrieval and LLM reranking. The
+    Parliament guard exists because models can mistake the occupational title
+    "parliamentarian" for a passage about the institution itself.
+    """
+
+    normalized_topic = re.sub(r"[^a-z0-9]+", " ", (topic or "").casefold()).strip()
+    if normalized_topic not in {"parliament", "parliamentary"}:
+        return True
+
+    normalized_text = re.sub(r"\s+", " ", (text or "").casefold()).strip()
+    if not normalized_text:
+        return False
+
+    institutional_evidence = (
+        r"\bparliament\b",
+        r"\blegislatur(?:e|es)\b",
+        r"\blegislat(?:ion|ive|ing)\b",
+        r"\blaw[ -]?making\b",
+        r"\bnational assembly\b",
+        r"\bprovincial assembly\b",
+        r"\bsenate\b",
+        r"\bmember(?:s)? of parliament\b",
+        r"\bparliamentary (?:debate|authority|power|powers|committee|committees|session|sessions|vote|voting|accountability)\b",
+        r"پارلیمنٹ",
+        r"قومی اسمبلی",
+        r"صوبائی اسمبلی",
+        r"قانون سازی",
+        r"مجلس شوری",
+        r"سینیٹ",
+        r"ایوان",
+    )
+    return any(re.search(pattern, normalized_text, re.IGNORECASE) for pattern in institutional_evidence)
