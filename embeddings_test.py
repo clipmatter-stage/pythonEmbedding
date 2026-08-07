@@ -24,7 +24,11 @@ from openai import OpenAI
 import tiktoken
 import asyncio
 import json as json_module
-from semantic_query_decomposition import decompose_semantic_query, has_minimum_topic_evidence
+from semantic_query_decomposition import (
+    decompose_semantic_query,
+    has_conceptual_topic_evidence,
+    has_minimum_topic_evidence,
+)
 from redis import Redis
 from rq import Queue
 
@@ -5021,9 +5025,13 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
             result
             for result in merged_list
             if float(result.get("llm_relevance_score", 0) or 0) >= 0.60
+            and has_conceptual_topic_evidence(
+                str(query_decomposition.get("topic") or query_text),
+                result.get("text", ""),
+            )
         ]
         logger.info(
-            "[STRUCTURED TOPIC FLOOR] kept=%d/%d minimum_llm_relevance=0.60",
+            "[STRUCTURED TOPIC FLOOR] kept=%d/%d minimum_llm_relevance=0.60 conceptual_guard=on",
             len(merged_list),
             pre_topic_floor_count,
         )
