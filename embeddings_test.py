@@ -27,6 +27,7 @@ import json as json_module
 from semantic_query_decomposition import (
     decompose_semantic_query,
     has_conceptual_topic_evidence,
+    has_complete_facet_coverage,
     has_minimum_topic_evidence,
     passes_structured_topic_validation,
 )
@@ -1193,11 +1194,14 @@ def rerank_with_llm(
                 {"role": "system", "content": """You are a search result relevance judge for a video transcript search engine.
 Content may be in Urdu, English, or mixed. Rate each transcript segment's relevance to the user's search query.
 
-Return ONLY valid JSON: {"scores": [{"i": 0, "s": 8, "c": true, "x": false}, ...]}
+Return ONLY valid JSON:
+{"facets":[{"id":"f1","d":"required meaning"}],"scores":[{"i":0,"s":8,"f":["f1"],"x":false},...]}
 Where:
+- "facets" lists the minimum independently required semantic facets of the COMPLETE query topic.
+- Each facet has a short stable "id" and description "d".
 - "i" is the document index.
 - "s" is relevance score 0-10.
-- "c" is true ONLY when the transcript passage supports the COMPLETE query topic.
+- "f" lists only facet IDs substantively supported by the transcript passage.
 - "x" is true when the match is incidental, title-only, a passing mention, or based on disconnected component words.
 
 Scoring guide:
@@ -1207,10 +1211,11 @@ Scoring guide:
 - 0-2: Completely unrelated - wrong topic/person/domain entirely.
 
 CRITICAL RULES:
-- First identify every essential facet of the query topic. For a compound topic, ALL facets must be connected in the passage. Examples: "Farmers Rights" requires farmer/agriculture evidence AND rights, welfare, fair treatment, or material farmer hardship; "Leadership Development" requires leadership evidence AND training, mentoring, preparation, skills, or capacity building; "Democratic Struggle" requires democracy/rights evidence AND an actual struggle, movement, protest, resistance, or campaign.
-- Set "c": false when only one facet is supported. Set "x": true when separate query words appear in unrelated meanings or the passage merely mentions the topic without discussing it.
-- A complete conceptual paraphrase may set "c": true even without exact query words. Keyword presence alone must never make "c" true.
-- If "c" is false, score at most 5. If "x" is true, score at most 3.
+- First emit the minimum semantic facets. Do not split established single concepts into dictionary words: "Social Media", "Business Community", and "Higher Education" are each ONE indivisible concept facet. A relational/possessive topic such as "Women's Rights" requires TWO facets: women/girls AND substantive rights/equality/protection/opportunity. "Democratic Struggle" requires democracy/rights AND an actual struggle, movement, protest, resistance, or campaign.
+- For each passage list only facets supported by the transcript itself. The title and speaker cannot support a facet.
+- Separate words with unrelated meanings do not support a compound concept. A broad parent concept does not support a narrower facet: generic education does not support Higher Education; generic responsibility does not support Accountability; merely naming federal government does not support Federalism.
+- A conceptual paraphrase can support a facet without exact query words. Keyword presence alone cannot.
+- If not every required facet is supported, score at most 5. If "x" is true, score at most 3.
 - Evaluate the CONCEPTUAL relevance. A result discussing 'elections, voting, and parliament' is highly relevant (7-10) to the query 'Democracy', even if the specific word is missing. Do NOT penalize missing keywords if the underlying meaning aligns.
 - Distinguish an abstract concept from an incidental word or institution-name match. For example, 'Federalism' requires evidence about division of powers, provincial/local autonomy, or relations between levels of government; merely saying 'federal government' is not enough. 'Local government system' requires evidence about municipal institutions, powers, elections, funding, or services; an unrelated utility complaint is not enough.
 - For an institutional query such as 'Parliament', require substantive evidence about the legislature, representation, law-making, parliamentary authority, debate, or accountability. Merely calling someone a 'parliamentarian' or mentioning a job/title is incidental and must score 0-3.
@@ -1220,7 +1225,7 @@ CRITICAL RULES:
 - Evaluate the semantic meaning, not just keyword overlaps."""}, 
                 {"role": "user", "content": f"Search Query: {query}\nValidation Mode: {validation_mode}\n\nDocuments:\n{docs_text}"}
             ],
-            max_tokens=1000,
+            max_tokens=1400,
             temperature=0.0,
             response_format={"type": "json_object"},
             timeout=15.0  # Hard cap: return unranked results if reranking is too slow
@@ -1228,6 +1233,16 @@ CRITICAL RULES:
         
         llm_result = json_module.loads(response.choices[0].message.content.strip())
         scores = llm_result.get("scores", [])
+        facet_items = llm_result.get("facets", [])
+        facet_descriptions = {}
+        if isinstance(facet_items, list):
+            for facet in facet_items:
+                if not isinstance(facet, dict):
+                    continue
+                facet_id = str(facet.get("id", "")).strip()
+                if facet_id:
+                    facet_descriptions[facet_id] = str(facet.get("d", "")).strip()
+        required_facet_ids = list(facet_descriptions.keys())
         
         # Build score map
         judgment_map = {}
@@ -1237,10 +1252,21 @@ CRITICAL RULES:
             if 0 <= idx < len(candidates):
                 complete_topic = item.get("c", item.get("complete", False))
                 incidental_match = item.get("x", item.get("incidental", True))
+                supported_facet_ids = item.get("f", item.get("supported_facets", []))
+                if not isinstance(supported_facet_ids, list):
+                    supported_facet_ids = []
+                supported_facet_ids = [str(facet).strip() for facet in supported_facet_ids]
+                if require_complete_topic:
+                    complete_topic = has_complete_facet_coverage(
+                        required_facet_ids,
+                        supported_facet_ids,
+                    )
                 judgment_map[idx] = {
                     "score": score / 10.0,
                     "complete": complete_topic is True,
                     "incidental": incidental_match is not False,
+                    "required_facets": required_facet_ids,
+                    "supported_facets": supported_facet_ids,
                 }
         
         # Apply LLM scores
@@ -1251,6 +1277,8 @@ CRITICAL RULES:
                 "score": 0.3,
                 "complete": False,
                 "incidental": True,
+                "required_facets": required_facet_ids,
+                "supported_facets": [],
             })
             llm_score = judgment["score"]
             
@@ -1260,6 +1288,9 @@ CRITICAL RULES:
             result_copy["llm_relevance_score"] = round(llm_score, 4)
             result_copy["llm_complete_topic"] = judgment["complete"]
             result_copy["llm_incidental_match"] = judgment["incidental"]
+            result_copy["llm_required_facets"] = judgment["required_facets"]
+            result_copy["llm_supported_facets"] = judgment["supported_facets"]
+            result_copy["llm_facet_descriptions"] = facet_descriptions
             result_copy["original_score"] = original_score
             result_copy["score"] = round(
                 llm_score * 0.60 + original_score * 0.25 + result_copy.get("fuzzy_score", 0) * 0.15,
@@ -5417,6 +5448,8 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                 "llm_relevance_score": r.get("llm_relevance_score"),
                 "llm_complete_topic": r.get("llm_complete_topic"),
                 "llm_incidental_match": r.get("llm_incidental_match"),
+                "llm_required_facets": r.get("llm_required_facets", []),
+                "llm_supported_facets": r.get("llm_supported_facets", []),
                 "youtube_url_timestamped": f"{r.get('youtube_url', '')}?t={int(r.get('start_time', 0))}" if r.get('youtube_url') else ""
             }
             for r in final_results

@@ -242,3 +242,19 @@ def passes_structured_topic_validation(
         return False
 
     return has_conceptual_topic_evidence(topic, str(result.get("text", "") or ""))
+
+
+def has_complete_facet_coverage(
+    required_facets: object,
+    supported_facets: object,
+) -> bool:
+    """Return true only when every model-declared required facet is supported."""
+
+    if not isinstance(required_facets, (list, tuple, set)):
+        return False
+    if not isinstance(supported_facets, (list, tuple, set)):
+        return False
+
+    required = {str(facet).strip() for facet in required_facets if str(facet).strip()}
+    supported = {str(facet).strip() for facet in supported_facets if str(facet).strip()}
+    return bool(required) and required.issubset(supported)

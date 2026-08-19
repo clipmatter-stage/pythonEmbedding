@@ -9,6 +9,7 @@ sys.path.insert(0, str(SERVICE_ROOT))
 from semantic_query_decomposition import (
     decompose_semantic_query,
     has_conceptual_topic_evidence,
+    has_complete_facet_coverage,
     has_minimum_topic_evidence,
     passes_structured_topic_validation,
 )
@@ -179,6 +180,12 @@ class SemanticQueryDecompositionTest(unittest.TestCase):
             self.assertFalse(
                 passes_structured_topic_validation(candidate, "Accountability")
             )
+
+    def test_complete_facet_coverage_is_computed_fail_closed(self):
+        self.assertTrue(has_complete_facet_coverage(["subject", "rights"], ["rights", "subject"]))
+        self.assertFalse(has_complete_facet_coverage(["subject", "rights"], ["rights"]))
+        self.assertFalse(has_complete_facet_coverage([], []))
+        self.assertFalse(has_complete_facet_coverage(["topic"], None))
 
 
 if __name__ == "__main__":
