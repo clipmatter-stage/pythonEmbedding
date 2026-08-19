@@ -10,6 +10,7 @@ from semantic_query_decomposition import (
     decompose_semantic_query,
     has_conceptual_topic_evidence,
     has_minimum_topic_evidence,
+    passes_structured_topic_validation,
 )
 
 
@@ -158,6 +159,26 @@ class SemanticQueryDecompositionTest(unittest.TestCase):
                 "کسان پریشان ہیں کیونکہ فصل کی مناسب قیمت اور معاوضہ نہیں ملتا",
             )
         )
+
+    def test_structured_validation_requires_complete_non_incidental_topic(self):
+        valid = {
+            "llm_relevance_score": 0.8,
+            "llm_complete_topic": True,
+            "llm_incidental_match": False,
+            "text": "Public institutions must be accountable for misuse of authority.",
+        }
+        self.assertTrue(passes_structured_topic_validation(valid, "Accountability"))
+
+        for override in (
+            {"llm_complete_topic": False},
+            {"llm_incidental_match": True},
+            {"llm_relevance_score": 0.6},
+            {"llm_complete_topic": None},
+        ):
+            candidate = {**valid, **override}
+            self.assertFalse(
+                passes_structured_topic_validation(candidate, "Accountability")
+            )
 
 
 if __name__ == "__main__":

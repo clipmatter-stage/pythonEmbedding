@@ -28,6 +28,7 @@ from semantic_query_decomposition import (
     decompose_semantic_query,
     has_conceptual_topic_evidence,
     has_minimum_topic_evidence,
+    passes_structured_topic_validation,
 )
 from redis import Redis
 from rq import Queue
@@ -1149,7 +1150,12 @@ Set "relevant": false if ALL results are completely out-of-domain."""},
         return {"is_relevant": True, "max_relevance": 1.0, "relevant_count": len(top_results), "explanation": ""}
 
 
-def rerank_with_llm(query: str, results: List[Dict], top_k: int = 20) -> List[Dict]:
+def rerank_with_llm(
+    query: str,
+    results: List[Dict],
+    top_k: int = 20,
+    require_complete_topic: bool = False,
+) -> List[Dict]:
     """
     LLM-based reranking using GPT-4o-mini.
     Replaces Cohere (English-only) with multilingual GPT-4o-mini reranker.
@@ -1174,6 +1180,12 @@ def rerank_with_llm(query: str, results: List[Dict], top_k: int = 20) -> List[Di
             docs.append(f"[{i}] Speaker: {speaker} | Title: {title} | Text: {text}")
         
         docs_text = "\n".join(docs)
+        validation_mode = (
+            "This is a structured speaker-plus-topic search. Precision is mandatory: "
+            "mark c=true only when the passage supports the whole topic."
+            if require_complete_topic
+            else "Assess conceptual relevance and still report complete/incidental flags."
+        )
         
         response = openai_client.chat.completions.create(
             model="gpt-4o-mini",
@@ -1181,8 +1193,12 @@ def rerank_with_llm(query: str, results: List[Dict], top_k: int = 20) -> List[Di
                 {"role": "system", "content": """You are a search result relevance judge for a video transcript search engine.
 Content may be in Urdu, English, or mixed. Rate each transcript segment's relevance to the user's search query.
 
-Return ONLY valid JSON: {"scores": [{"i": 0, "s": 8}, {"i": 1, "s": 3}, ...]}
-Where "i" is the document index and "s" is relevance score 0-10.
+Return ONLY valid JSON: {"scores": [{"i": 0, "s": 8, "c": true, "x": false}, ...]}
+Where:
+- "i" is the document index.
+- "s" is relevance score 0-10.
+- "c" is true ONLY when the transcript passage supports the COMPLETE query topic.
+- "x" is true when the match is incidental, title-only, a passing mention, or based on disconnected component words.
 
 Scoring guide:
 - 8-10: Highly relevant - clearly discusses the queried topic/person or underlying meaning.
@@ -1191,6 +1207,10 @@ Scoring guide:
 - 0-2: Completely unrelated - wrong topic/person/domain entirely.
 
 CRITICAL RULES:
+- First identify every essential facet of the query topic. For a compound topic, ALL facets must be connected in the passage. Examples: "Farmers Rights" requires farmer/agriculture evidence AND rights, welfare, fair treatment, or material farmer hardship; "Leadership Development" requires leadership evidence AND training, mentoring, preparation, skills, or capacity building; "Democratic Struggle" requires democracy/rights evidence AND an actual struggle, movement, protest, resistance, or campaign.
+- Set "c": false when only one facet is supported. Set "x": true when separate query words appear in unrelated meanings or the passage merely mentions the topic without discussing it.
+- A complete conceptual paraphrase may set "c": true even without exact query words. Keyword presence alone must never make "c" true.
+- If "c" is false, score at most 5. If "x" is true, score at most 3.
 - Evaluate the CONCEPTUAL relevance. A result discussing 'elections, voting, and parliament' is highly relevant (7-10) to the query 'Democracy', even if the specific word is missing. Do NOT penalize missing keywords if the underlying meaning aligns.
 - Distinguish an abstract concept from an incidental word or institution-name match. For example, 'Federalism' requires evidence about division of powers, provincial/local autonomy, or relations between levels of government; merely saying 'federal government' is not enough. 'Local government system' requires evidence about municipal institutions, powers, elections, funding, or services; an unrelated utility complaint is not enough.
 - For an institutional query such as 'Parliament', require substantive evidence about the legislature, representation, law-making, parliamentary authority, debate, or accountability. Merely calling someone a 'parliamentarian' or mentioning a job/title is incidental and must score 0-3.
@@ -1198,9 +1218,9 @@ CRITICAL RULES:
 - If query is "Bill Gates" but result is about Pakistan politics → score 0-1.
 - If query is about technology but result is about religion → score 0-2.
 - Evaluate the semantic meaning, not just keyword overlaps."""}, 
-                {"role": "user", "content": f"Search Query: {query}\n\nDocuments:\n{docs_text}"}
+                {"role": "user", "content": f"Search Query: {query}\nValidation Mode: {validation_mode}\n\nDocuments:\n{docs_text}"}
             ],
-            max_tokens=500,
+            max_tokens=1000,
             temperature=0.0,
             response_format={"type": "json_object"},
             timeout=15.0  # Hard cap: return unranked results if reranking is too slow
@@ -1210,23 +1230,36 @@ CRITICAL RULES:
         scores = llm_result.get("scores", [])
         
         # Build score map
-        score_map = {}
+        judgment_map = {}
         for item in scores:
             idx = item.get("i", item.get("index", -1))
             score = item.get("s", item.get("score", 5))
             if 0 <= idx < len(candidates):
-                score_map[idx] = score / 10.0  # Normalize to 0-1
+                complete_topic = item.get("c", item.get("complete", False))
+                incidental_match = item.get("x", item.get("incidental", True))
+                judgment_map[idx] = {
+                    "score": score / 10.0,
+                    "complete": complete_topic is True,
+                    "incidental": incidental_match is not False,
+                }
         
         # Apply LLM scores
         reranked = []
         for i, r in enumerate(candidates):
             result_copy = r.copy()
-            llm_score = score_map.get(i, 0.3)  # Default to LOW score (0.3) if not scored
+            judgment = judgment_map.get(i, {
+                "score": 0.3,
+                "complete": False,
+                "incidental": True,
+            })
+            llm_score = judgment["score"]
             
             # Combined score: LLM (60%) + original semantic (25%) + keyword/fuzzy (15%)
             # INCREASED LLM weight to 60% so strict LLM scores have more impact
             original_score = result_copy.get("score", 0)
             result_copy["llm_relevance_score"] = round(llm_score, 4)
+            result_copy["llm_complete_topic"] = judgment["complete"]
+            result_copy["llm_incidental_match"] = judgment["incidental"]
             result_copy["original_score"] = original_score
             result_copy["score"] = round(
                 llm_score * 0.60 + original_score * 0.25 + result_copy.get("fuzzy_score", 0) * 0.15,
@@ -4963,7 +4996,7 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
         structured_speaker_topic_search
         and use_reranking
         and query_text
-        and len(merged_list) >= 5
+        and len(merged_list) >= 1
     )
     should_rerank = standard_should_rerank or structured_should_rerank
     
@@ -4988,6 +5021,7 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
             rerank_query,
             merged_list,
             top_k=min(len(merged_list), top_k * 3),
+            require_complete_topic=structured_speaker_topic_search,
         )
         
         # Restore score floors for protected match types
@@ -5024,14 +5058,13 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
         merged_list = [
             result
             for result in merged_list
-            if float(result.get("llm_relevance_score", 0) or 0) >= 0.60
-            and has_conceptual_topic_evidence(
+            if passes_structured_topic_validation(
+                result,
                 str(query_decomposition.get("topic") or query_text),
-                result.get("text", ""),
             )
         ]
         logger.info(
-            "[STRUCTURED TOPIC FLOOR] kept=%d/%d minimum_llm_relevance=0.60 conceptual_guard=on",
+            "[STRUCTURED TOPIC FLOOR] kept=%d/%d minimum_llm_relevance=0.65 complete_topic=required incidental_match=rejected conceptual_guard=on",
             len(merged_list),
             pre_topic_floor_count,
         )
@@ -5382,6 +5415,8 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                 "language": r.get("language", ""),
                 "created_at": r.get("created_at"),
                 "llm_relevance_score": r.get("llm_relevance_score"),
+                "llm_complete_topic": r.get("llm_complete_topic"),
+                "llm_incidental_match": r.get("llm_incidental_match"),
                 "youtube_url_timestamped": f"{r.get('youtube_url', '')}?t={int(r.get('start_time', 0))}" if r.get('youtube_url') else ""
             }
             for r in final_results

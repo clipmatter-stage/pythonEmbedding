@@ -215,3 +215,30 @@ def has_conceptual_topic_evidence(topic: str, text: str) -> bool:
         return contains_near(farmer_evidence, rights_or_welfare_evidence, maximum_gap=180)
 
     return True
+
+
+def passes_structured_topic_validation(
+    result: Dict[str, object],
+    topic: str,
+    minimum_score: float = 0.65,
+) -> bool:
+    """Require an explicit, complete, non-incidental LLM topic judgment.
+
+    Structured speaker-plus-topic searches favor precision. Missing judgment
+    fields therefore fail closed instead of allowing a keyword/title match to
+    bypass validation when the model response is incomplete.
+    """
+
+    try:
+        relevance_score = float(result.get("llm_relevance_score", 0) or 0)
+    except (TypeError, ValueError):
+        return False
+
+    if relevance_score < minimum_score:
+        return False
+    if result.get("llm_complete_topic") is not True:
+        return False
+    if result.get("llm_incidental_match") is not False:
+        return False
+
+    return has_conceptual_topic_evidence(topic, str(result.get("text", "") or ""))
