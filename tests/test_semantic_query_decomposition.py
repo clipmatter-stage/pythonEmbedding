@@ -187,6 +187,67 @@ class SemanticQueryDecompositionTest(unittest.TestCase):
         self.assertFalse(has_complete_facet_coverage([], []))
         self.assertFalse(has_complete_facet_coverage(["topic"], None))
 
+    def test_relational_rights_require_the_correct_beneficiary(self):
+        generic_labor = "Pakistan labor laws provide these rights and social-security benefits."
+        womens_rights = "Women and girls must receive equal rights, education, and protection."
+        self.assertTrue(has_conceptual_topic_evidence("Labor Rights", generic_labor))
+        self.assertFalse(has_conceptual_topic_evidence("Women's Rights", generic_labor))
+        self.assertTrue(has_conceptual_topic_evidence("Women's Rights", womens_rights))
+        self.assertFalse(has_conceptual_topic_evidence("Labor Rights", womens_rights))
+
+    def test_urdu_relational_rights_do_not_cross_match_groups(self):
+        women_only = "عورتوں کو بنیادی حقوق سے محروم کیا جاتا ہے اور لڑکیوں کو تعلیم نہیں ملتی"
+        workers_only = "مزدوروں کو ان کے حقوق، اجرت اور سوشل سیکیورٹی ملنی چاہیے"
+        self.assertTrue(has_conceptual_topic_evidence("Women's Rights", women_only))
+        self.assertFalse(has_conceptual_topic_evidence("Labor Rights", women_only))
+        self.assertTrue(has_conceptual_topic_evidence("Labor Rights", workers_only))
+        self.assertFalse(has_conceptual_topic_evidence("Women's Rights", workers_only))
+
+    def test_federalism_requires_a_power_or_resource_relationship(self):
+        incidental = "The federal government and provincial government are both in power."
+        substantive = "Powers and resources must be divided fairly between the federation and provinces."
+        urdu_substantive = "وفاق کو صوبوں کے اختیارات اور وسائل کی منصفانہ تقسیم یقینی بنانی چاہیے"
+        self.assertFalse(has_conceptual_topic_evidence("Federalism", incidental))
+        self.assertTrue(has_conceptual_topic_evidence("Federalism", substantive))
+        self.assertTrue(has_conceptual_topic_evidence("Federalism", urdu_substantive))
+
+    def test_provincial_rights_exclude_rights_of_local_government(self):
+        local_rights = "The provincial government refuses to transfer funds and powers to local councils."
+        province_rights = "Each province has a constitutional right to autonomy and its resource share."
+        self.assertFalse(has_conceptual_topic_evidence("Provincial Rights", local_rights))
+        self.assertTrue(has_conceptual_topic_evidence("Provincial Rights", province_rights))
+
+    def test_accountability_requires_answerability_or_oversight(self):
+        incidental = "Everyone should perform their personal responsibility."
+        substantive = "Institutions must be answerable and investigated for misuse of authority."
+        urdu_substantive = "اداروں کو جواب دہ بنائیں اور اختیارات کے ناجائز استعمال کا احتساب کریں"
+        self.assertFalse(has_conceptual_topic_evidence("Accountability", incidental))
+        self.assertTrue(has_conceptual_topic_evidence("Accountability", substantive))
+        self.assertTrue(has_conceptual_topic_evidence("Accountability", urdu_substantive))
+
+    def test_reported_production_false_positives_are_rejected(self):
+        cases = (
+            (
+                "Federalism",
+                "وفاقی حکومت اور صوبائی حکومت، اور اب تو صوبائی حکومت بھی وفاقی حکومت میں شامل ہے",
+            ),
+            (
+                "Provincial Rights",
+                "پیپلز پارٹی صوبائی حکومت میں تھی، بلدیاتی ایکٹ میں ہمارے حقوق غصب اور بلدیاتی اختیارات کم کیے گئے",
+            ),
+            (
+                "Labor Rights",
+                "عورت کو بنیادی حقوق سے محروم کرتے ہیں اور لڑکیوں کو تعلیم اور صحت کے حقوق نہیں دیتے",
+            ),
+            (
+                "Women's Rights",
+                "پاکستان کے لیبر قوانین کے تحت مزدوروں کو سوشل سیکیورٹی اور تمام حقوق ملنے چاہیئے",
+            ),
+        )
+        for topic, passage in cases:
+            with self.subTest(topic=topic):
+                self.assertFalse(has_conceptual_topic_evidence(topic, passage))
+
 
 if __name__ == "__main__":
     unittest.main()

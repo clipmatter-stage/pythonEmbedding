@@ -1,260 +1,253 @@
-"""Deterministic decomposition for speaker-plus-topic semantic queries.
-
-This module intentionally has no service dependencies so its behavior can be
-tested without Qdrant, OpenAI, or production credentials.
-"""
-
-from __future__ import annotations
-
-import re
-from typing import Dict, Optional
+import pathlib
+import sys
+import unittest
 
 
-_SPEAKER_TOPIC_PATTERNS = (
-    re.compile(
-        r"^\s*(?P<speaker>.+?)\s+(?:speech|talk|remarks|views|discussion)\s+"
-        r"(?:on|about|regarding)\s+(?P<topic>.+?)\s*[?.!]*\s*$",
-        re.IGNORECASE,
-    ),
-    re.compile(
-        r"^\s*what\s+did\s+(?P<speaker>.+?)\s+"
-        r"(?:say|speak|talk)\s+about\s+(?P<topic>.+?)\s*[?.!]*\s*$",
-        re.IGNORECASE,
-    ),
-    re.compile(
-        r"^\s*(?P<speaker>.+?)\s+(?:said|spoke|talked)\s+"
-        r"(?:on|about)\s+(?P<topic>.+?)\s*[?.!]*\s*$",
-        re.IGNORECASE,
-    ),
+SERVICE_ROOT = pathlib.Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(SERVICE_ROOT))
+
+from semantic_query_decomposition import (
+    decompose_semantic_query,
+    has_conceptual_topic_evidence,
+    has_complete_facet_coverage,
+    has_minimum_topic_evidence,
+    passes_structured_topic_validation,
 )
 
 
-def decompose_semantic_query(
-    query: str,
-    canonical_speaker: Optional[str] = None,
-) -> Dict[str, object]:
-    """Separate a known speaker constraint from the semantic topic.
-
-    Decomposition is deliberately conservative: wrapper removal is performed
-    only when the caller has already resolved a known speaker. Unknown names
-    remain untouched so an out-of-domain query cannot accidentally become a
-    broad in-domain topic search.
-    """
-
-    original = (query or "").strip()
-    result: Dict[str, object] = {
-        "original_query": original,
-        "retrieval_query": original,
-        "speaker": canonical_speaker,
-        "topic": None,
-        "relation": None,
-        "decomposed": False,
-        "confidence": 0.0,
-    }
-
-    if not original or not canonical_speaker:
-        return result
-
-    for pattern in _SPEAKER_TOPIC_PATTERNS:
-        match = pattern.match(original)
-        if not match:
-            continue
-
-        topic = re.sub(r"\s+", " ", match.group("topic")).strip(" .?!")
-        speaker_text = re.sub(r"\s+", " ", match.group("speaker")).strip(" .?!")
-        if len(topic) < 2 or len(speaker_text) < 2:
-            continue
-
-        result.update({
-            "retrieval_query": topic,
-            "speaker": canonical_speaker,
-            "topic": topic,
-            "relation": "spoken_by",
-            "decomposed": True,
-            "confidence": 1.0,
-        })
-        return result
-
-    return result
-
-
-def has_minimum_topic_evidence(text: str, min_characters: int = 24, min_words: int = 6) -> bool:
-    """Reject fragments too small to support a semantic topic assertion."""
-
-    normalized = re.sub(r"\s+", " ", (text or "")).strip()
-    if len(normalized) < min_characters:
-        return False
-
-    return len([word for word in normalized.split(" ") if word]) >= min_words
-
-
-def has_conceptual_topic_evidence(topic: str, text: str) -> bool:
-    """Apply narrow deterministic guards for known ambiguous concepts.
-
-    Most topics remain governed by semantic retrieval and LLM reranking. The
-    Guards exist only for concepts where production evidence showed that the
-    reranker can join unrelated occurrences of the component words.
-    """
-
-    normalized_topic = re.sub(r"[^a-z0-9]+", " ", (topic or "").casefold()).strip()
-    normalized_text = re.sub(r"\s+", " ", (text or "").casefold()).strip()
-    if not normalized_text:
-        return False
-
-    def contains_any(patterns: tuple[str, ...]) -> bool:
-        return any(re.search(pattern, normalized_text, re.IGNORECASE) for pattern in patterns)
-
-    def contains_near(
-        left_patterns: tuple[str, ...],
-        right_patterns: tuple[str, ...],
-        maximum_gap: int,
-    ) -> bool:
-        left_matches = [
-            match
-            for pattern in left_patterns
-            for match in re.finditer(pattern, normalized_text, re.IGNORECASE)
-        ]
-        right_matches = [
-            match
-            for pattern in right_patterns
-            for match in re.finditer(pattern, normalized_text, re.IGNORECASE)
-        ]
-        return any(
-            max(left.start(), right.start()) - min(left.end(), right.end()) <= maximum_gap
-            for left in left_matches
-            for right in right_matches
+class SemanticQueryDecompositionTest(unittest.TestCase):
+    def test_decomposes_client_speaker_topic_phrase(self):
+        result = decompose_semantic_query(
+            "Hafiz Naeem ur Rehman Speech on Constitution of Pakistan",
+            "Hafiz Naeem Ur Rehman",
         )
 
-    if normalized_topic in {"parliament", "parliamentary"}:
-        institutional_evidence = (
-            r"\bparliament\b",
-            r"\blegislatur(?:e|es)\b",
-            r"\blegislat(?:ion|ive|ing)\b",
-            r"\blaw[ -]?making\b",
-            r"\bnational assembly\b",
-            r"\bprovincial assembly\b",
-            r"\bsenate\b",
-            r"\bmember(?:s)? of parliament\b",
-            r"\bparliamentary (?:debate|authority|power|powers|committee|committees|session|sessions|vote|voting|accountability)\b",
-            r"پارلیمنٹ",
-            r"قومی اسمبلی",
-            r"صوبائی اسمبلی",
-            r"قانون سازی",
-            r"مجلس شوری",
-            r"سینیٹ",
-            r"ایوان",
+        self.assertTrue(result["decomposed"])
+        self.assertEqual("Constitution of Pakistan", result["retrieval_query"])
+        self.assertEqual("spoken_by", result["relation"])
+
+    def test_decomposes_natural_question(self):
+        result = decompose_semantic_query(
+            "What did Hafiz Naeem say about electoral reforms?",
+            "Hafiz Naeem Ur Rehman",
         )
-        return contains_any(institutional_evidence)
 
-    if normalized_topic == "leadership development":
-        explicit_leadership_development = (
-            r"\bleadership[ -]?(?:development|training|skills?|capacity|program(?:me)?)\b",
-            r"\bdevelopment of (?:new |young )?leaders(?:hip)?\b",
-            r"\bdevelop(?:ing|ed)? (?:new |young )?leaders\b",
-            r"\btrain(?:ing|ed)? (?:new |young )?leaders\b",
-            r"\bmentor(?:ing|ed)? (?:new |young )?leaders\b",
-            r"قیادت کی (?:تربیت|تیاری|صلاحیت)",
-            r"لیڈر شپ (?:تربیت|تیاری|صلاحیت)",
+        self.assertTrue(result["decomposed"])
+        self.assertEqual("electoral reforms", result["topic"])
+
+    def test_decomposes_talked_about_phrase(self):
+        result = decompose_semantic_query(
+            "Hafiz Naeem talked about electricity bills",
+            "Hafiz Naeem Ur Rehman",
         )
-        if contains_any(explicit_leadership_development):
-            return True
 
-        leadership_evidence = (
-            r"\bleader(?:s|ship)?\b",
-            r"\bleadership\b",
-            r"لیڈر",
-            r"قیادت",
-            r"رہنمائی",
+        self.assertTrue(result["decomposed"])
+        self.assertEqual("electricity bills", result["retrieval_query"])
+
+    def test_does_not_strip_unknown_out_of_domain_person(self):
+        query = "Bill Gates talked about weather"
+        result = decompose_semantic_query(query)
+
+        self.assertFalse(result["decomposed"])
+        self.assertEqual(query, result["retrieval_query"])
+
+    def test_leaves_topic_only_query_unchanged(self):
+        query = "constitutional rights and public mandate"
+        result = decompose_semantic_query(query, "Hafiz Naeem Ur Rehman")
+
+        self.assertFalse(result["decomposed"])
+        self.assertEqual(query, result["retrieval_query"])
+
+    def test_rejects_tiny_transcript_fragments(self):
+        self.assertFalse(has_minimum_topic_evidence("اور"))
+        self.assertFalse(has_minimum_topic_evidence("پاکستان کے سیاسی نظام یہی"))
+
+    def test_accepts_passage_with_enough_topic_evidence(self):
+        self.assertTrue(
+            has_minimum_topic_evidence(
+                "ملک میں جمہوریت اور آئین کی بالادستی کے علاوہ کوئی دوسرا حل نہیں ہے"
+            )
         )
-        development_evidence = (
-            r"\btrain(?:ing|ed)?\b",
-            r"\bmentor(?:ing|ship|ed)?\b",
-            r"\bcapacity[ -]?build(?:ing)?\b",
-            r"\bprepar(?:e|ing|ation)\b",
-            r"\bskills?\b",
-            r"تربیت",
-            r"صلاحیت",
-            r"تیار",
-            r"نشوونما",
-            r"کردار سازی",
+
+    def test_rejects_transcription_placeholder(self):
+        self.assertFalse(has_minimum_topic_evidence("پ..."))
+
+    def test_parliament_rejects_incidental_job_title(self):
+        self.assertFalse(
+            has_conceptual_topic_evidence(
+                "Parliament",
+                "Congratulations to our brother, who is the youngest parliamentarian.",
+            )
         )
-        return contains_near(leadership_evidence, development_evidence, maximum_gap=120)
 
-    if normalized_topic in {"farmers rights", "farmer rights", "farmers right", "farmer right"}:
-        farmer_evidence = (
-            r"\bfarmers?\b",
-            r"\bgrowers?\b",
-            r"\bagricultur(?:e|al)\b",
-            r"\bcrops?\b",
-            r"کسان",
-            r"زراعت",
-            r"فصل",
-            r"گندم",
-            r"چاول",
-            r"کپاس",
+    def test_parliament_accepts_substantive_institutional_discussion(self):
+        self.assertTrue(
+            has_conceptual_topic_evidence(
+                "Parliament",
+                "The parliament must debate legislation and hold the government accountable.",
+            )
         )
-        rights_or_welfare_evidence = (
-            r"\brights?\b",
-            r"\bentitle(?:ment|d)?\b",
-            r"\bfair price\b",
-            r"\bsubsid(?:y|ies)\b",
-            r"\bcompensat(?:ion|e)\b",
-            r"\blivelihood\b",
-            r"\bexploit(?:ation|ed)?\b",
-            r"حقوق?",
-            r"مطالبہ",
-            r"قیمت",
-            r"سبسڈی",
-            r"معاوضہ",
-            r"آمدن",
-            r"روزگار",
-            r"استحصال",
-            r"پریشان",
-            r"کچھ بھی نہیں ملتا",
+        self.assertTrue(
+            has_conceptual_topic_evidence(
+                "Parliament",
+                "قومی اسمبلی اور سینیٹ میں قانون سازی اور عوامی نمائندگی پر بحث ہونی چاہیے",
+            )
         )
-        return contains_near(farmer_evidence, rights_or_welfare_evidence, maximum_gap=180)
 
-    return True
+    def test_other_topics_are_not_affected_by_institutional_guard(self):
+        self.assertTrue(has_conceptual_topic_evidence("Rule of Law", "any passage"))
+
+    def test_leadership_development_requires_connected_development_evidence(self):
+        self.assertFalse(
+            has_conceptual_topic_evidence(
+                "Leadership Development",
+                "The city needs development and, much later, the election needs a leader.",
+            )
+        )
+        self.assertFalse(
+            has_conceptual_topic_evidence(
+                "Leadership Development",
+                "Leadership must be honest and work with a strong team.",
+            )
+        )
+        self.assertFalse(
+            has_conceptual_topic_evidence(
+                "Leadership Development",
+                "کراچی شہر میں development چاہیے، شہر آگے بڑھے گا لیکن اس کے لیے اس کو لیڈر چاہیے",
+            )
+        )
+        self.assertTrue(
+            has_conceptual_topic_evidence(
+                "Leadership Development",
+                "We train and mentor young people to develop their leadership skills.",
+            )
+        )
+        self.assertTrue(
+            has_conceptual_topic_evidence(
+                "Leadership Development",
+                "نوجوانوں کی تربیت اور صلاحیت کے ذریعے نئی قیادت تیار کرنا ضروری ہے",
+            )
+        )
+
+    def test_farmers_rights_requires_farmer_domain_and_welfare_evidence(self):
+        self.assertFalse(
+            has_conceptual_topic_evidence(
+                "Farmers Rights",
+                "Every worker deserves social security, a bonus, and other legal rights.",
+            )
+        )
+        self.assertFalse(
+            has_conceptual_topic_evidence(
+                "Farmers Rights",
+                "جو محنت کرے اس کو پھل ملے، ای او بی آئی، سوشل سیکیورٹی اور بونس کے حقوق ملیں",
+            )
+        )
+        self.assertFalse(
+            has_conceptual_topic_evidence(
+                "Farmers Rights",
+                "People must be counted so resources can be distributed fairly.",
+            )
+        )
+        self.assertTrue(
+            has_conceptual_topic_evidence(
+                "Farmers Rights",
+                "Farmers deserve a fair crop price, subsidies, and protection from exploitation.",
+            )
+        )
+        self.assertTrue(
+            has_conceptual_topic_evidence(
+                "Farmers Rights",
+                "کسان پریشان ہیں کیونکہ فصل کی مناسب قیمت اور معاوضہ نہیں ملتا",
+            )
+        )
+
+    def test_structured_validation_requires_complete_non_incidental_topic(self):
+        valid = {
+            "llm_relevance_score": 0.8,
+            "llm_complete_topic": True,
+            "llm_incidental_match": False,
+            "text": "Public institutions must be accountable for misuse of authority.",
+        }
+        self.assertTrue(passes_structured_topic_validation(valid, "Accountability"))
+
+        for override in (
+            {"llm_complete_topic": False},
+            {"llm_incidental_match": True},
+            {"llm_relevance_score": 0.6},
+            {"llm_complete_topic": None},
+        ):
+            candidate = {**valid, **override}
+            self.assertFalse(
+                passes_structured_topic_validation(candidate, "Accountability")
+            )
+
+    def test_complete_facet_coverage_is_computed_fail_closed(self):
+        self.assertTrue(has_complete_facet_coverage(["subject", "rights"], ["rights", "subject"]))
+        self.assertFalse(has_complete_facet_coverage(["subject", "rights"], ["rights"]))
+        self.assertFalse(has_complete_facet_coverage([], []))
+        self.assertFalse(has_complete_facet_coverage(["topic"], None))
+
+    def test_relational_rights_require_the_correct_beneficiary(self):
+        generic_labor = "Pakistan labor laws provide these rights and social-security benefits."
+        womens_rights = "Women and girls must receive equal rights, education, and protection."
+        self.assertTrue(has_conceptual_topic_evidence("Labor Rights", generic_labor))
+        self.assertFalse(has_conceptual_topic_evidence("Women's Rights", generic_labor))
+        self.assertTrue(has_conceptual_topic_evidence("Women's Rights", womens_rights))
+        self.assertFalse(has_conceptual_topic_evidence("Labor Rights", womens_rights))
+
+    def test_urdu_relational_rights_do_not_cross_match_groups(self):
+        women_only = "عورتوں کو بنیادی حقوق سے محروم کیا جاتا ہے اور لڑکیوں کو تعلیم نہیں ملتی"
+        workers_only = "مزدوروں کو ان کے حقوق، اجرت اور سوشل سیکیورٹی ملنی چاہیے"
+        self.assertTrue(has_conceptual_topic_evidence("Women's Rights", women_only))
+        self.assertFalse(has_conceptual_topic_evidence("Labor Rights", women_only))
+        self.assertTrue(has_conceptual_topic_evidence("Labor Rights", workers_only))
+        self.assertFalse(has_conceptual_topic_evidence("Women's Rights", workers_only))
+
+    def test_federalism_requires_a_power_or_resource_relationship(self):
+        incidental = "The federal government and provincial government are both in power."
+        substantive = "Powers and resources must be divided fairly between the federation and provinces."
+        urdu_substantive = "وفاق کو صوبوں کے اختیارات اور وسائل کی منصفانہ تقسیم یقینی بنانی چاہیے"
+        self.assertFalse(has_conceptual_topic_evidence("Federalism", incidental))
+        self.assertTrue(has_conceptual_topic_evidence("Federalism", substantive))
+        self.assertTrue(has_conceptual_topic_evidence("Federalism", urdu_substantive))
+
+    def test_provincial_rights_exclude_rights_of_local_government(self):
+        local_rights = "The provincial government refuses to transfer funds and powers to local councils."
+        province_rights = "Each province has a constitutional right to autonomy and its resource share."
+        self.assertFalse(has_conceptual_topic_evidence("Provincial Rights", local_rights))
+        self.assertTrue(has_conceptual_topic_evidence("Provincial Rights", province_rights))
+
+    def test_accountability_requires_answerability_or_oversight(self):
+        incidental = "Everyone should perform their personal responsibility."
+        substantive = "Institutions must be answerable and investigated for misuse of authority."
+        urdu_substantive = "اداروں کو جواب دہ بنائیں اور اختیارات کے ناجائز استعمال کا احتساب کریں"
+        self.assertFalse(has_conceptual_topic_evidence("Accountability", incidental))
+        self.assertTrue(has_conceptual_topic_evidence("Accountability", substantive))
+        self.assertTrue(has_conceptual_topic_evidence("Accountability", urdu_substantive))
+
+    def test_reported_production_false_positives_are_rejected(self):
+        cases = (
+            (
+                "Federalism",
+                "وفاقی حکومت اور صوبائی حکومت، اور اب تو صوبائی حکومت بھی وفاقی حکومت میں شامل ہے",
+            ),
+            (
+                "Provincial Rights",
+                "پیپلز پارٹی صوبائی حکومت میں تھی، بلدیاتی ایکٹ میں ہمارے حقوق غصب اور بلدیاتی اختیارات کم کیے گئے",
+            ),
+            (
+                "Labor Rights",
+                "عورت کو بنیادی حقوق سے محروم کرتے ہیں اور لڑکیوں کو تعلیم اور صحت کے حقوق نہیں دیتے",
+            ),
+            (
+                "Women's Rights",
+                "پاکستان کے لیبر قوانین کے تحت مزدوروں کو سوشل سیکیورٹی اور تمام حقوق ملنے چاہیئے",
+            ),
+        )
+        for topic, passage in cases:
+            with self.subTest(topic=topic):
+                self.assertFalse(has_conceptual_topic_evidence(topic, passage))
 
 
-def passes_structured_topic_validation(
-    result: Dict[str, object],
-    topic: str,
-    minimum_score: float = 0.65,
-) -> bool:
-    """Require an explicit, complete, non-incidental LLM topic judgment.
-
-    Structured speaker-plus-topic searches favor precision. Missing judgment
-    fields therefore fail closed instead of allowing a keyword/title match to
-    bypass validation when the model response is incomplete.
-    """
-
-    try:
-        relevance_score = float(result.get("llm_relevance_score", 0) or 0)
-    except (TypeError, ValueError):
-        return False
-
-    if relevance_score < minimum_score:
-        return False
-    if result.get("llm_complete_topic") is not True:
-        return False
-    if result.get("llm_incidental_match") is not False:
-        return False
-
-    return has_conceptual_topic_evidence(topic, str(result.get("text", "") or ""))
-
-
-def has_complete_facet_coverage(
-    required_facets: object,
-    supported_facets: object,
-) -> bool:
-    """Return true only when every model-declared required facet is supported."""
-
-    if not isinstance(required_facets, (list, tuple, set)):
-        return False
-    if not isinstance(supported_facets, (list, tuple, set)):
-        return False
-
-    required = {str(facet).strip() for facet in required_facets if str(facet).strip()}
-    supported = {str(facet).strip() for facet in supported_facets if str(facet).strip()}
-    return bool(required) and required.issubset(supported)
+if __name__ == "__main__":
+    unittest.main()
