@@ -7,6 +7,7 @@ SERVICE_ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SERVICE_ROOT))
 
 from semantic_query_decomposition import (
+    build_structured_rerank_fallback,
     decompose_semantic_query,
     has_conceptual_topic_evidence,
     has_complete_facet_coverage,
@@ -247,6 +248,56 @@ class SemanticQueryDecompositionTest(unittest.TestCase):
         for topic, passage in cases:
             with self.subTest(topic=topic):
                 self.assertFalse(has_conceptual_topic_evidence(topic, passage))
+
+    def test_higher_education_excludes_generic_education(self):
+        self.assertFalse(
+            has_conceptual_topic_evidence(
+                "Higher Education",
+                "Every child has a right to the same standard of education.",
+            )
+        )
+        self.assertTrue(
+            has_conceptual_topic_evidence(
+                "Higher Education",
+                "Universities and colleges need funding so degree education can be affordable.",
+            )
+        )
+        self.assertTrue(
+            has_conceptual_topic_evidence(
+                "Higher Education",
+                "پاکستان کی جامعات اور یونیورسٹیوں کے طلبہ کو اعلیٰ تعلیم مفت ملنی چاہیے",
+            )
+        )
+
+    def test_structured_fallback_is_transcript_backed_and_precision_first(self):
+        results = [
+            {
+                "id": 1,
+                "text": "Pakistan's Constitution guarantees education as a fundamental right for citizens.",
+                "score": 0.61,
+                "match_types": ["semantic", "query_term_present"],
+            },
+            {
+                "id": 2,
+                "text": "This passage is only semantically similar and has no explicit supporting term.",
+                "score": 0.9,
+                "match_types": ["semantic", "title_match"],
+            },
+        ]
+        fallback = build_structured_rerank_fallback("Constitution of Pakistan", results)
+        self.assertEqual([1], [item["id"] for item in fallback])
+        self.assertTrue(fallback[0]["llm_complete_topic"])
+        self.assertFalse(fallback[0]["llm_incidental_match"])
+        self.assertIn("rerank_fallback_exact_evidence", fallback[0]["match_types"])
+
+    def test_structured_fallback_preserves_compound_topic_guards(self):
+        results = [{
+            "id": 1,
+            "text": "The federal government and provincial government are both in power today.",
+            "score": 0.9,
+            "match_types": ["semantic", "query_term_present"],
+        }]
+        self.assertEqual([], build_structured_rerank_fallback("Federalism", results))
 
 
 if __name__ == "__main__":

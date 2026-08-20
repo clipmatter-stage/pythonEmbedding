@@ -7,7 +7,7 @@ tested without Qdrant, OpenAI, or production credentials.
 from __future__ import annotations
 
 import re
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 
 _SPEAKER_TOPIC_PATTERNS = (
@@ -303,6 +303,17 @@ def has_conceptual_topic_evidence(topic: str, text: str) -> bool:
         )
         return contains_any(accountability_evidence)
 
+    if normalized_topic == "higher education":
+        higher_education_evidence = (
+            r"\bhigher education\b", r"\btertiary education\b",
+            r"\buniversit(?:y|ies)\b", r"\bcolleges?\b",
+            r"\bundergraduate\b", r"\bpostgraduate\b", r"\bdegrees?\b",
+            r"\bcampus(?:es)?\b", r"\bfacult(?:y|ies)\b",
+            r"یونیورسٹ", r"جامعہ", r"جامعات", r"کالج", r"اعلیٰ تعلیم",
+            r"اعلی تعلیم", r"ڈگری",
+        )
+        return contains_any(higher_education_evidence)
+
     return True
 
 
@@ -347,3 +358,45 @@ def has_complete_facet_coverage(
     required = {str(facet).strip() for facet in required_facets if str(facet).strip()}
     supported = {str(facet).strip() for facet in supported_facets if str(facet).strip()}
     return bool(required) and required.issubset(supported)
+
+
+def build_structured_rerank_fallback(
+    topic: str,
+    results: List[Dict[str, object]],
+    top_k: int = 20,
+) -> List[Dict[str, object]]:
+    """Build a precision-first fallback when both LLM attempts fail.
+
+    Only transcript-backed query-term or exact-phrase matches are admitted.
+    Speaker/title-only and purely vector-semantic candidates remain excluded.
+    The normal deterministic concept guard is also applied, so fallback mode
+    cannot reintroduce known compound-topic false positives.
+    """
+
+    fallback_results: List[Dict[str, object]] = []
+    for result in results:
+        match_types = list(result.get("match_types", []) or [])
+        transcript_evidence = bool(
+            {"query_term_present", "exact_phrase_match"}.intersection(match_types)
+        )
+        text = str(result.get("text", "") or "")
+        if not transcript_evidence or not has_minimum_topic_evidence(text):
+            continue
+        if not has_conceptual_topic_evidence(topic, text):
+            continue
+
+        candidate = dict(result)
+        candidate["llm_relevance_score"] = 0.7
+        candidate["llm_complete_topic"] = True
+        candidate["llm_incidental_match"] = False
+        candidate["llm_required_facets"] = ["fallback_topic"]
+        candidate["llm_supported_facets"] = ["fallback_topic"]
+        candidate["llm_facet_descriptions"] = {
+            "fallback_topic": "explicit transcript evidence for the complete topic",
+        }
+        candidate["score"] = max(float(candidate.get("score", 0) or 0), 0.65)
+        candidate["match_types"] = match_types + ["rerank_fallback_exact_evidence"]
+        fallback_results.append(candidate)
+
+    fallback_results.sort(key=lambda item: float(item.get("score", 0) or 0), reverse=True)
+    return fallback_results[:top_k]

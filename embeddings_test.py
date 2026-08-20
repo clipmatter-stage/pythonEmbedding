@@ -25,6 +25,7 @@ import tiktoken
 import asyncio
 import json as json_module
 from semantic_query_decomposition import (
+    build_structured_rerank_fallback,
     decompose_semantic_query,
     has_conceptual_topic_evidence,
     has_complete_facet_coverage,
@@ -1188,7 +1189,8 @@ def rerank_with_llm(
             else "Assess conceptual relevance and still report complete/incidental flags."
         )
         
-        response = openai_client.chat.completions.create(
+        try:
+            response = openai_client.with_options(max_retries=0).chat.completions.create(
             model="gpt-4o-mini",
             messages=[
                 {"role": "system", "content": """You are a search result relevance judge for a video transcript search engine.
@@ -1228,8 +1230,35 @@ CRITICAL RULES:
             max_tokens=1400,
             temperature=0.0,
             response_format={"type": "json_object"},
-            timeout=15.0  # Hard cap: return unranked results if reranking is too slow
-        )
+                timeout=15.0,
+            )
+        except Exception as primary_error:
+            # Retry once with a much smaller payload. The OpenAI SDK's implicit
+            # retries are disabled above so worst-case latency remains bounded.
+            retry_count = min(len(candidates), 12)
+            logger.warning(
+                f"LLM reranking primary attempt failed: {primary_error}; "
+                f"retrying with {retry_count} candidates"
+            )
+            candidates = candidates[:retry_count]
+            retry_docs = []
+            for i, r in enumerate(candidates):
+                text = r.get("text", "")[:200]
+                retry_docs.append(
+                    f"[{i}] Speaker: {r.get('speaker', '')} | "
+                    f"Title: {r.get('video_title', '')} | Text: {text}"
+                )
+            response = openai_client.with_options(max_retries=0).chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {"role": "system", "content": """You are a multilingual transcript relevance judge. Return only the requested JSON. Define the minimum facets required by the complete query topic, then mark only facets explicitly or conceptually supported by each transcript passage. Speaker and title are not topic evidence. Relational topics require both the exact subject and relationship; compound concepts require their complete meaning. Keyword presence alone is insufficient. Use score 7-10 only when every required facet is supported, and x=true for incidental, title-only, passing, or disconnected-word matches."""},
+                    {"role": "user", "content": f"Search Query: {query}\nValidation Mode: {validation_mode}\nRequired output: {{\"facets\":[{{\"id\":\"f1\",\"d\":\"required meaning\"}}],\"scores\":[{{\"i\":0,\"s\":8,\"f\":[\"f1\"],\"x\":false}}]}}\n\nDocuments:\n" + "\n".join(retry_docs)},
+                ],
+                max_tokens=800,
+                temperature=0.0,
+                response_format={"type": "json_object"},
+                timeout=12.0,
+            )
         
         llm_result = json_module.loads(response.choices[0].message.content.strip())
         scores = llm_result.get("scores", [])
@@ -1331,6 +1360,13 @@ CRITICAL RULES:
         
     except Exception as e:
         logger.warning(f"LLM reranking error: {str(e)}")
+        if require_complete_topic:
+            fallback = build_structured_rerank_fallback(query, results, top_k)
+            logger.warning(
+                f"Structured reranking fallback admitted {len(fallback)} "
+                f"of {min(len(results), 30)} candidates"
+            )
+            return fallback
         return results[:top_k]
 
 

@@ -25,7 +25,7 @@ COPY start.sh .
 # Fail the image build immediately if the semantic helper is missing,
 # malformed, or accidentally contains a self-import. This prevents Railway
 # from deploying an image that can only crash-loop at container startup.
-RUN python -c "from semantic_query_decomposition import decompose_semantic_query, has_conceptual_topic_evidence, has_complete_facet_coverage, passes_structured_topic_validation; assert callable(decompose_semantic_query) and callable(has_conceptual_topic_evidence) and callable(has_complete_facet_coverage) and callable(passes_structured_topic_validation)"
+RUN python -c "from semantic_query_decomposition import build_structured_rerank_fallback, decompose_semantic_query, has_conceptual_topic_evidence, has_complete_facet_coverage, passes_structured_topic_validation; assert all(callable(fn) for fn in (build_structured_rerank_fallback, decompose_semantic_query, has_conceptual_topic_evidence, has_complete_facet_coverage, passes_structured_topic_validation))"
 
 # Make startup script executable
 RUN chmod +x start.sh
