@@ -314,6 +314,23 @@ def has_conceptual_topic_evidence(topic: str, text: str) -> bool:
         )
         return contains_any(higher_education_evidence)
 
+    if normalized_topic == "democratic struggle":
+        democratic_evidence = (
+            r"\bdemocr(?:acy|atic)\b", r"\belections?\b", r"\bpublic mandate\b",
+            r"\bvoting rights?\b", r"\bcivil rights?\b", r"\bpolitical rights?\b",
+            r"جمہوریت", r"جمہوری", r"انتخاب", r"الیکشن", r"عوامی مینڈیٹ",
+            r"عوام کا م[ی]?نڈیٹ", r"م[ی]?نڈیٹ", r"ووٹ", r"سیاسی حقوق", r"عوام.*حقوق?",
+            r"حقوق?", r"حق",
+        )
+        struggle_evidence = (
+            r"\bstruggl(?:e|es|ing)\b", r"\bmovement\b", r"\bprotests?\b",
+            r"\bresistan(?:ce|t)\b", r"\bcampaign\b", r"\bsit[ -]?in\b",
+            r"\bmobiliz(?:e|ed|ing|ation)\b", r"\btook to the streets\b",
+            r"جدوجہد", r"جدو جہد", r"تحریک", r"احتجاج", r"دھرن", r"مزاحمت",
+            r"سڑکوں پر", r"عوام نکل",
+        )
+        return contains_near(democratic_evidence, struggle_evidence, maximum_gap=320)
+
     return True
 
 
@@ -339,6 +356,9 @@ def passes_structured_topic_validation(
     if result.get("llm_complete_topic") is not True:
         return False
     if result.get("llm_incidental_match") is not False:
+        return False
+
+    if not has_minimum_topic_evidence(str(result.get("text", "") or "")):
         return False
 
     return has_conceptual_topic_evidence(topic, str(result.get("text", "") or ""))

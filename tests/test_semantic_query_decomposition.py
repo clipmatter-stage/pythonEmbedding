@@ -299,6 +299,37 @@ class SemanticQueryDecompositionTest(unittest.TestCase):
         }]
         self.assertEqual([], build_structured_rerank_fallback("Federalism", results))
 
+    def test_democratic_struggle_requires_both_democracy_and_struggle(self):
+        self.assertFalse(
+            has_conceptual_topic_evidence("Democratic Struggle", "Democracy is important.")
+        )
+        self.assertFalse(
+            has_conceptual_topic_evidence("Democratic Struggle", "Workers continued their struggle for wages.")
+        )
+        self.assertTrue(
+            has_conceptual_topic_evidence(
+                "Democratic Struggle",
+                "Citizens launched a democratic movement and protested to defend their voting rights.",
+            )
+        )
+        self.assertTrue(
+            has_conceptual_topic_evidence(
+                "Democratic Struggle",
+                "عوامی مینڈیٹ اور جمہوری حقوق کے لیے عوام نے احتجاج اور جدوجہد شروع کی",
+            )
+        )
+
+    def test_final_structured_gate_rejects_production_fragment(self):
+        fragment = {
+            "llm_relevance_score": 0.8,
+            "llm_complete_topic": True,
+            "llm_incidental_match": False,
+            "text": "جمہوریت ہے اور انہوں نے اس پورے",
+        }
+        self.assertFalse(
+            passes_structured_topic_validation(fragment, "Democratic Struggle")
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
