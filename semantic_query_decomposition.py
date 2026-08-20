@@ -420,3 +420,20 @@ def build_structured_rerank_fallback(
 
     fallback_results.sort(key=lambda item: float(item.get("score", 0) or 0), reverse=True)
     return fallback_results[:top_k]
+
+
+def recover_empty_structured_rerank(
+    topic: str,
+    reranked_results: List[Dict[str, object]],
+    original_results: List[Dict[str, object]],
+    top_k: int = 20,
+) -> List[Dict[str, object]]:
+    """Recover explicit evidence when an LLM yields no valid structured hit."""
+
+    if any(
+        passes_structured_topic_validation(result, topic)
+        for result in reranked_results
+    ):
+        return reranked_results
+
+    return build_structured_rerank_fallback(topic, original_results, top_k)

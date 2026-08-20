@@ -13,6 +13,7 @@ from semantic_query_decomposition import (
     has_complete_facet_coverage,
     has_minimum_topic_evidence,
     passes_structured_topic_validation,
+    recover_empty_structured_rerank,
 )
 
 
@@ -329,6 +330,52 @@ class SemanticQueryDecompositionTest(unittest.TestCase):
         self.assertFalse(
             passes_structured_topic_validation(fragment, "Democratic Struggle")
         )
+
+    def test_empty_llm_judgment_recovers_only_explicit_valid_evidence(self):
+        rejected_llm_result = [{
+            "id": 99,
+            "text": "جمہوریت ہے اور انہوں نے اس پورے",
+            "llm_relevance_score": 0.8,
+            "llm_complete_topic": True,
+            "llm_incidental_match": False,
+            "match_types": ["semantic", "query_term_present"],
+        }]
+        original_candidates = [
+            {
+                "id": 1,
+                "text": "عوامی مینڈیٹ اور جمہوری حقوق کے لیے عوام نے احتجاج اور جدوجہد شروع کی",
+                "score": 0.62,
+                "match_types": ["semantic", "query_term_present"],
+            },
+            {
+                "id": 2,
+                "text": "A general political passage with no explicit transcript topic evidence.",
+                "score": 0.91,
+                "match_types": ["semantic", "title_match"],
+            },
+        ]
+        recovered = recover_empty_structured_rerank(
+            "Democratic Struggle",
+            rejected_llm_result,
+            original_candidates,
+        )
+        self.assertEqual([1], [item["id"] for item in recovered])
+
+    def test_valid_llm_results_are_not_replaced_by_fallback(self):
+        valid = [{
+            "id": 1,
+            "text": "Citizens began a democratic movement and protested for voting rights.",
+            "llm_relevance_score": 0.8,
+            "llm_complete_topic": True,
+            "llm_incidental_match": False,
+            "match_types": ["semantic", "llm_reranked"],
+        }]
+        recovered = recover_empty_structured_rerank(
+            "Democratic Struggle",
+            valid,
+            [],
+        )
+        self.assertIs(valid, recovered)
 
 
 if __name__ == "__main__":

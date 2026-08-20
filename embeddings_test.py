@@ -31,6 +31,7 @@ from semantic_query_decomposition import (
     has_complete_facet_coverage,
     has_minimum_topic_evidence,
     passes_structured_topic_validation,
+    recover_empty_structured_rerank,
 )
 from redis import Redis
 from rq import Queue
@@ -1355,6 +1356,20 @@ CRITICAL RULES:
         low_relevance = sum(1 for r in reranked if 0.3 <= r.get("llm_relevance_score", 0) < 0.5)
         filtered_count = len(candidates) - len([r for r in reranked if r.get("llm_relevance_score")])
         
+        if require_complete_topic:
+            recovered = recover_empty_structured_rerank(
+                query,
+                reranked,
+                results,
+                top_k,
+            )
+            if recovered is not reranked:
+                logger.warning(
+                    f"Structured reranking produced no valid topic result; "
+                    f"precision fallback admitted {len(recovered)} candidates"
+                )
+            reranked = recovered
+
         logger.info(f"LLM reranking: {len(candidates)} candidates -> {len(reranked)} results (high={high_relevance}, med={med_relevance}, low={low_relevance}, filtered={filtered_count})")
         return reranked[:top_k]
         
