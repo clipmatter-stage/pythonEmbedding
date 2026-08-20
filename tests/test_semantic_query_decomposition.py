@@ -378,5 +378,6 @@ class SemanticQueryDecompositionTest(unittest.TestCase):
         self.assertIs(valid, recovered)
 
 
+
 if __name__ == "__main__":
     unittest.main()
