@@ -160,6 +160,14 @@ STOP_WORDS = frozenset({
     "نہیں", "بس", "کچھ", "کچھ بھی"
 })
 
+# These are content-bearing entities, not grammatical noise. Preserve them in
+# lexical hints while the complete phrase remains intact for semantic search.
+MEANINGFUL_SEARCH_TERMS = frozenset({
+    "child", "children", "woman", "women", "person", "people",
+    "right", "rights", "work", "worker", "workers", "high", "low",
+})
+STOP_WORDS = STOP_WORDS.difference(MEANINGFUL_SEARCH_TERMS).union({"ur"})
+
 # ============== PERSON NAME ALIASES ==============
 # Maps known aliases/abbreviations to canonical names with all their variants.
 # When any alias is detected in a query or speaker filter, the search automatically
@@ -5501,6 +5509,19 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                 "llm_incidental_match": r.get("llm_incidental_match"),
                 "llm_required_facets": r.get("llm_required_facets", []),
                 "llm_supported_facets": r.get("llm_supported_facets", []),
+                "relevance_confidence": round(
+                    r.get("llm_relevance_score")
+                    if r.get("llm_relevance_score") is not None
+                    else r.get("score", 0),
+                    4,
+                ),
+                "intent_match": bool(
+                    not structured_speaker_topic_search
+                    or (
+                        r.get("llm_complete_topic") is True
+                        and r.get("llm_incidental_match") is False
+                    )
+                ),
                 "youtube_url_timestamped": f"{r.get('youtube_url', '')}?t={int(r.get('start_time', 0))}" if r.get('youtube_url') else ""
             }
             for r in final_results

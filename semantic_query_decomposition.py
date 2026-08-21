@@ -28,6 +28,25 @@ _SPEAKER_TOPIC_PATTERNS = (
     ),
 )
 
+_QUERY_JOINERS = frozenset({
+    "a", "an", "and", "about", "at", "by", "for", "from", "in", "of",
+    "on", "or", "regarding", "the", "to", "ur", "with",
+})
+
+
+def extract_meaningful_query_terms(text: str) -> List[str]:
+    """Extract lexical hints without destroying the complete topic phrase."""
+
+    tokens = re.findall(r"[\w']+", (text or "").casefold(), flags=re.UNICODE)
+    meaningful: List[str] = []
+    for token in tokens:
+        token = re.sub(r"(?:'s|’s)$", "", token).strip("_'’")
+        if len(token) < 2 or token in _QUERY_JOINERS:
+            continue
+        if token not in meaningful:
+            meaningful.append(token)
+    return meaningful
+
 
 def decompose_semantic_query(
     query: str,
@@ -46,7 +65,11 @@ def decompose_semantic_query(
         "original_query": original,
         "retrieval_query": original,
         "speaker": canonical_speaker,
-        "topic": None,
+        "topic": original or None,
+        "topic_phrase": original or None,
+        "meaningful_topic_terms": extract_meaningful_query_terms(original),
+        "intent": "topic_search" if original else None,
+        "intent_confidence": 1.0 if original else 0.0,
         "relation": None,
         "decomposed": False,
         "confidence": 0.0,
@@ -69,6 +92,10 @@ def decompose_semantic_query(
             "retrieval_query": topic,
             "speaker": canonical_speaker,
             "topic": topic,
+            "topic_phrase": topic,
+            "meaningful_topic_terms": extract_meaningful_query_terms(topic),
+            "intent": "speaker_topic_search",
+            "intent_confidence": 1.0,
             "relation": "spoken_by",
             "decomposed": True,
             "confidence": 1.0,

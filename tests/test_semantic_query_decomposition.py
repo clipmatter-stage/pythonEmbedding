@@ -9,6 +9,7 @@ sys.path.insert(0, str(SERVICE_ROOT))
 from semantic_query_decomposition import (
     build_structured_rerank_fallback,
     decompose_semantic_query,
+    extract_meaningful_query_terms,
     has_conceptual_topic_evidence,
     has_complete_facet_coverage,
     has_minimum_topic_evidence,
@@ -27,6 +28,37 @@ class SemanticQueryDecompositionTest(unittest.TestCase):
         self.assertTrue(result["decomposed"])
         self.assertEqual("Constitution of Pakistan", result["retrieval_query"])
         self.assertEqual("spoken_by", result["relation"])
+        self.assertEqual("speaker_topic_search", result["intent"])
+        self.assertEqual(1.0, result["intent_confidence"])
+        self.assertEqual("Constitution of Pakistan", result["topic_phrase"])
+        self.assertEqual(["constitution", "pakistan"], result["meaningful_topic_terms"])
+
+    def test_query_entities_keep_complete_topic_but_remove_joiners(self):
+        result = decompose_semantic_query(
+            "Hafiz Naeem ur Rehman Speech on Children's Rights",
+            "Hafiz Naeem Ur Rehman",
+        )
+        self.assertEqual("Hafiz Naeem Ur Rehman", result["speaker"])
+        self.assertEqual("Children's Rights", result["topic_phrase"])
+        self.assertEqual(["children", "rights"], result["meaningful_topic_terms"])
+        self.assertNotIn("ur", result["meaningful_topic_terms"])
+        self.assertNotIn("on", result["meaningful_topic_terms"])
+
+    def test_topic_only_query_exposes_intent_without_splitting_phrase(self):
+        result = decompose_semantic_query("Rule of Law")
+        self.assertFalse(result["decomposed"])
+        self.assertEqual("topic_search", result["intent"])
+        self.assertEqual(1.0, result["intent_confidence"])
+        self.assertEqual("Rule of Law", result["topic_phrase"])
+        self.assertEqual(["rule", "law"], result["meaningful_topic_terms"])
+
+    def test_meaningful_terms_do_not_remove_content_entities(self):
+        self.assertEqual(
+            ["rights", "children", "education", "safety"],
+            extract_meaningful_query_terms(
+                "the rights of children in education and safety"
+            ),
+        )
 
     def test_decomposes_natural_question(self):
         result = decompose_semantic_query(
@@ -376,7 +408,6 @@ class SemanticQueryDecompositionTest(unittest.TestCase):
             [],
         )
         self.assertIs(valid, recovered)
-
 
 
 if __name__ == "__main__":
