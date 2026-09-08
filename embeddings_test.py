@@ -34,7 +34,7 @@ from semantic_query_decomposition import (
     recover_empty_structured_rerank,
 )
 from redis import Redis
-from rq import Queue
+from rq import Queue, Retry
 
 # ============== REDIS QUEUE INITIALIZATION ==============
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
@@ -2377,6 +2377,46 @@ def parse_search_query(query:  str) -> Dict:
         parsed["keywords"] = remaining_query.split()
     
     return parsed
+
+
+class WebhookDeliveryError(RuntimeError):
+    """Raised when processing succeeded but Laravel could not be notified."""
+
+
+def send_webhook_with_retry(webhook_url: str, payload: dict, max_attempts: int = 5) -> None:
+    """Deliver a Laravel status webhook and fail loudly if it cannot be delivered."""
+    last_error = None
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            response = requests.post(webhook_url, json=payload, timeout=30)
+            response.raise_for_status()
+            logger.info(
+                "[WORKER] Webhook delivered on attempt %s/%s: status=%s response=%s",
+                attempt,
+                max_attempts,
+                response.status_code,
+                response.text[:500],
+            )
+            return
+        except requests.RequestException as exc:
+            last_error = exc
+            response = getattr(exc, "response", None)
+            logger.warning(
+                "[WORKER] Webhook attempt %s/%s failed: error=%s status=%s response=%s",
+                attempt,
+                max_attempts,
+                exc,
+                response.status_code if response is not None else None,
+                response.text[:500] if response is not None else None,
+            )
+
+            if attempt < max_attempts:
+                time.sleep(min(2 ** (attempt - 1), 15))
+
+    raise WebhookDeliveryError(
+        f"Webhook delivery failed after {max_attempts} attempts: {last_error}"
+    )
     
 def process_video_task(data_dict: dict):
     """Background worker task to process video embeddings and upsert to Qdrant."""
@@ -2580,37 +2620,41 @@ def process_video_task(data_dict: dict):
                 "segments_embedded": segments_embedded,
                 "message": "Successfully indexed in Qdrant"
             }
-            try:
-                requests.post(webhook_url, json=payload_success, timeout=10)
-                logger.info(f"[WORKER] Webhook success sent to {webhook_url}")
-            except Exception as we:
-                logger.error(f"[WORKER] Webhook failed: {str(we)}")
+            send_webhook_with_retry(webhook_url, payload_success)
                 
     except Exception as e:
         logger.error(f"[WORKER] Error processing video {video_id}: {str(e)}")
-        if webhook_url:
+        # Do not report an embedding failure when Qdrant succeeded and only the
+        # completion callback failed. Raising lets RQ retry the idempotent job.
+        if webhook_url and not isinstance(e, WebhookDeliveryError):
             payload_error = {
                 "status": "failed",
                 "video_id": video_id,
                 "error": str(e)
             }
             try:
-                requests.post(webhook_url, json=payload_error, timeout=10)
+                send_webhook_with_retry(webhook_url, payload_error)
             except Exception as we:
                 logger.error(f"[WORKER] Webhook error notification failed: {str(we)}")
-        raise e
+        raise
 
 @app.post("/embed-video", status_code=202)
 async def embed_video(data: EmbedVideoRequest, authorized: bool = Depends(verify_api_key)):
     """Enqueue video transcript embedding task. Requires API key if configured."""
     try:
         data_dict = data.model_dump()
-        job = task_queue.enqueue('embeddings_test.process_video_task', data_dict, job_timeout='1h')
+        job = task_queue.enqueue(
+            'embeddings_test.process_video_task',
+            data_dict,
+            job_timeout='3h',
+            retry=Retry(max=3, interval=[30, 60, 120]),
+        )
         
         return {
             "status": "queued",
             "video_id": data.video_id,
             "job_id": job.id,
+            "segments_queued": len(data.identification_segments),
             "message": "Video is processing in the background"
         }
     except Exception as e:
@@ -2630,7 +2674,8 @@ def delete_existing_embeddings(video_id: int):
                         )
                     ]
                 )
-            )
+            ),
+            wait=True,
         )
         logger.info(f"Deleted existing embeddings for video {video_id}")
     except Exception as e:
