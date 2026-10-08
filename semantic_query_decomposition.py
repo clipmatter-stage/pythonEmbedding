@@ -12,6 +12,21 @@ from typing import Dict, List, Optional
 
 _SPEAKER_TOPIC_PATTERNS = (
     re.compile(
+        r"^\s*(?:(?:find|show)(?:\s+me)?\s+(?:clips?\s+)?)?(?:where\s+)?"
+        r"(?P<speaker>.+?)\s+(?:talks?|speaks?|discusses|discuss|talked|spoke)\s+"
+        r"(?:(?:on|about|regarding)\s+)?(?P<topic>.+?)\s*[?.!]*\s*$",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"^\s*(?P<speaker>.+?)\s+نے\s+(?P<topic>.+?)\s+"
+        r"(?:کے\s+بارے\s+میں|پر)\s+(?:بات|گفتگو|تقریر).*$",
+    ),
+    re.compile(
+        r"^\s*(?P<speaker>.+?)\s+ne\s+(?P<topic>.+?)\s+"
+        r"(?:ke\s+bare\s+mein|par)\s+(?:baat|guftagu|taqreer).*$",
+        re.IGNORECASE,
+    ),
+    re.compile(
         r"^\s*(?P<speaker>.+?)\s+(?:speech|talk|remarks|views|discussion)\s+"
         r"(?:on|about|regarding)\s+(?P<topic>.+?)\s*[?.!]*\s*$",
         re.IGNORECASE,

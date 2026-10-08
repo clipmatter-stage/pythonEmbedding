@@ -19,6 +19,35 @@ from semantic_query_decomposition import (
 
 
 class SemanticQueryDecompositionTest(unittest.TestCase):
+    def test_present_tense_and_find_wrappers(self):
+        for query in (
+            "where Hafiz Naeem talks about education",
+            "show me clips where Hafiz Naeem speaks about education",
+            "Hafiz Naeem discusses education",
+        ):
+            with self.subTest(query=query):
+                result = decompose_semantic_query(query, "Hafiz Naeem Ur Rehman")
+                self.assertTrue(result["decomposed"])
+                self.assertEqual("education", result["topic"])
+
+    def test_urdu_and_roman_urdu_speaker_topic_queries(self):
+        for query, topic in (
+            ("حافظ نعیم نے تعلیم کے بارے میں بات کی", "تعلیم"),
+            ("Hafiz Naeem ne taleem ke bare mein baat ki", "taleem"),
+        ):
+            with self.subTest(query=query):
+                result = decompose_semantic_query(query, "Hafiz Naeem Ur Rehman")
+                self.assertTrue(result["decomposed"])
+                self.assertEqual(topic, result["topic"])
+
+    def test_keyword_and_title_scores_cannot_bypass_complete_topic_gate(self):
+        for match_type in ("keyword", "speaker", "title_match", "exact_phrase_match"):
+            result = {
+                "score": 0.99, "match_types": [match_type],
+                "text": "The speaker discusses election campaigning and political party meetings today.",
+            }
+            self.assertFalse(passes_structured_topic_validation(result, "education"))
+
     def test_decomposes_client_speaker_topic_phrase(self):
         result = decompose_semantic_query(
             "Hafiz Naeem ur Rehman Speech on Constitution of Pakistan",

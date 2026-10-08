@@ -1185,7 +1185,7 @@ def rerank_with_llm(
         # Build compact document list for the LLM
         docs = []
         for i, r in enumerate(candidates):
-            text = r.get("text", "")[:200]  # Truncate for token efficiency
+            text = r.get("text", "")[:1200 if require_complete_topic else 200]  # Truncate for token efficiency
             speaker = r.get("speaker", "")
             title = r.get("video_title", "")
             docs.append(f"[{i}] Speaker: {speaker} | Title: {title} | Text: {text}")
@@ -1365,18 +1365,7 @@ CRITICAL RULES:
         filtered_count = len(candidates) - len([r for r in reranked if r.get("llm_relevance_score")])
         
         if require_complete_topic:
-            recovered = recover_empty_structured_rerank(
-                query,
-                reranked,
-                results,
-                top_k,
-            )
-            if recovered is not reranked:
-                logger.warning(
-                    f"Structured reranking produced no valid topic result; "
-                    f"precision fallback admitted {len(recovered)} candidates"
-                )
-            reranked = recovered
+            reranked = [r for r in reranked if passes_structured_topic_validation(r, query)]
 
         logger.info(f"LLM reranking: {len(candidates)} candidates -> {len(reranked)} results (high={high_relevance}, med={med_relevance}, low={low_relevance}, filtered={filtered_count})")
         return reranked[:top_k]
@@ -1384,12 +1373,7 @@ CRITICAL RULES:
     except Exception as e:
         logger.warning(f"LLM reranking error: {str(e)}")
         if require_complete_topic:
-            fallback = build_structured_rerank_fallback(query, results, top_k)
-            logger.warning(
-                f"Structured reranking fallback admitted {len(fallback)} "
-                f"of {min(len(results), 30)} candidates"
-            )
-            return fallback
+            return []
         return results[:top_k]
 
 
@@ -3735,7 +3719,7 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
     use_llm_understanding = os.getenv("USE_LLM_UNDERSTANDING", "true").lower() == "true"
     decomposition_mode = (
         data.query_decomposition_mode
-        or os.getenv("SEMANTIC_QUERY_DECOMPOSITION_MODE", "off")
+        or os.getenv("SEMANTIC_QUERY_DECOMPOSITION_MODE", "on")
     ).strip().lower()
     if decomposition_mode not in {"off", "shadow", "on"}:
         logger.warning(
@@ -3747,7 +3731,7 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
     canonical_speaker = (
         PERSON_ALIASES[alias_person_key]["canonical"]
         if alias_person_key
-        else None
+        else speaker_filter
     )
     query_decomposition = decompose_semantic_query(raw_query_text, canonical_speaker)
     if decomposition_mode in {"shadow", "on"}:
@@ -3770,6 +3754,15 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
         )
     structured_speaker_topic_search = bool(
         decomposition_mode == "on" and query_decomposition.get("decomposed")
+    )
+    # Every multi-term AI query must satisfy the complete intent, regardless
+    # of whether a keyword/title candidate inflated the retrieval score.
+    strict_semantic_topic_search = bool(
+        search_mode == "semantic" and query_text
+        and (structured_speaker_topic_search or len([
+            w for w in query_text.split()
+            if len(normalize_word(w)) >= 2 and normalize_word(w) not in STOP_WORDS
+        ]) >= 2)
     )
     query_source_for_length = raw_query_text or query_text or ""
     query_shape = classify_query_shape(query_source_for_length, search_mode=search_mode, alias_person_key=alias_person_key)
@@ -5128,7 +5121,7 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
     # normal first page. Otherwise title/keyword score inflation can outrank
     # passages that actually discuss the requested topic.
     structured_should_rerank = bool(
-        structured_speaker_topic_search
+        strict_semantic_topic_search
         and use_reranking
         and query_text
         and len(merged_list) >= 1
@@ -5152,12 +5145,21 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
             if structured_speaker_topic_search
             else query_text
         )
-        merged_list = rerank_with_llm(
-            rerank_query,
-            merged_list,
-            top_k=min(len(merged_list), top_k * 3),
-            require_complete_topic=structured_speaker_topic_search,
-        )
+        if strict_semantic_topic_search:
+            # Judge every candidate in bounded batches; unchecked candidates
+            # must neither leak through nor crowd relevant later passages out.
+            judged_results = []
+            for offset in range(0, len(merged_list), 30):
+                judged_results.extend(rerank_with_llm(
+                    rerank_query, merged_list[offset:offset + 30],
+                    top_k=30, require_complete_topic=True,
+                ))
+            merged_list = sorted(judged_results, key=lambda r: r.get("score", 0), reverse=True)
+        else:
+            merged_list = rerank_with_llm(
+                rerank_query, merged_list,
+                top_k=min(len(merged_list), top_k * 3),
+            )
         
         # Restore score floors for protected match types
         # Exact phrase matches should ALWAYS keep 0.99 score (they are confirmed transcript matches!)
@@ -5188,7 +5190,7 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
     elif use_reranking and query_text:
         logger.info(f"Skipping LLM reranking (results={len(merged_list)}, high_confidence={has_high_confidence_results}) for speed")
 
-    if structured_speaker_topic_search and should_rerank:
+    if strict_semantic_topic_search:
         pre_topic_floor_count = len(merged_list)
         merged_list = [
             result
@@ -5196,6 +5198,13 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
             if passes_structured_topic_validation(
                 result,
                 str(query_decomposition.get("topic") or query_text),
+            ) and (
+                not structured_speaker_topic_search
+                or any(
+                    fuzzy_match_speaker(name, str(result.get("speaker") or ""))
+                    or fuzzy_match_speaker(name, str(result.get("diarization_speaker") or ""))
+                    for name in (alias_speaker_variants or [speaker_filter]) if name
+                )
             )
         ]
         logger.info(
@@ -5267,17 +5276,12 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                 else:
                     filler_only_removed += 1
             
-            if filler_only_removed > 0 and len(filtered_merged) >= 5:
+            if filler_only_removed > 0:
                 merged_list = filtered_merged
                 logger.info(
                     f"[FILLER FILTER] Removed {filler_only_removed} semantic-only results with no meaningful "
                     f"query words (meaningful_words={meaningful_query_words[:5]}), "
                     f"kept={len(merged_list)}/{pre_filter_count}"
-                )
-            elif filler_only_removed > 0:
-                logger.info(
-                    f"[FILLER FILTER] Would remove {filler_only_removed} results but only {len(filtered_merged)} "
-                    f"would remain; keeping all to avoid empty results"
                 )
 
     # Group by video and collect ALL matching segments per video
