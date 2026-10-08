@@ -256,3 +256,38 @@ class StageTwoEvidenceTest(unittest.TestCase):
         second,next_cursor,more=scope['extract_batch_from_results'](results,scope['decode_cursor'](cursor),1,'isolated')
         self.assertEqual([2],[r['video_id'] for r in second]);self.assertFalse(more)
         self.assertIsNone(next_cursor)
+
+    def test_validation_logs_safe_reason_and_correlatable_error_id(self):
+        def fail(*args):
+            raise TimeoutError('sk-private-api-key SECRET_TRANSCRIPT')
+        with self.assertLogs('semantic_passage_evidence', level='INFO') as logs:
+            with self.assertRaises(ValidationUnavailable) as caught:
+                validate_passages('SECRET_QUERY', [passage(1,'SECRET_TRANSCRIPT')], fail)
+        output='\n'.join(logs.output)
+        self.assertIn('reason=provider_timeout',output)
+        self.assertIn(caught.exception.diagnostic_id,output)
+        self.assertEqual('provider_timeout',caught.exception.reason)
+        for secret in ('sk-private-api-key','SECRET_TRANSCRIPT','SECRET_QUERY'):
+            self.assertNotIn(secret,output)
+
+    def test_protocol_failure_logs_the_exact_failed_check(self):
+        def invalid(*args):
+            return {'required_facets':['fees'],'passages':[]}
+        with self.assertLogs('semantic_passage_evidence', level='ERROR') as logs:
+            with self.assertRaises(ValidationUnavailable) as caught:
+                validate_passages('fees',[passage(1)],invalid)
+        self.assertEqual('incomplete_judgments',caught.exception.reason)
+        self.assertIn('reason=incomplete_judgments','\n'.join(logs.output))
+
+    def test_partial_provider_failure_is_logged_and_keeps_same_diagnostic_id(self):
+        calls=[]
+        def judge(*args):
+            calls.append(1)
+            if len(calls)==2:raise TimeoutError('secret')
+            return judgments(*args)
+        with self.assertLogs('semantic_passage_evidence',level='INFO') as logs:
+            results,metadata=validate_passages('fees',[passage(i) for i in range(40)],judge)
+        self.assertEqual(20,len(results));self.assertEqual('partial',metadata['status'])
+        failure=next(line for line in logs.output if 'PASSAGE_VALIDATION_FAILED' in line)
+        self.assertIn(metadata['diagnostic_id'],failure)
+        self.assertIn('reason=provider_timeout',failure)

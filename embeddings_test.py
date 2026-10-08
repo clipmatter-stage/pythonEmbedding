@@ -8,6 +8,7 @@ from qdrant_client.models import Distance, VectorParams, PointStruct, Filter, Fi
 import uuid
 import os
 import logging
+import sys
 import string as _string
 from datetime import datetime
 from typing import Optional, List, Dict, Tuple
@@ -45,7 +46,9 @@ task_queue = Queue('video_processing', connection=redis_conn)
 # ============== LOGGING CONFIGURATION ==============
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    stream=sys.stdout,
+    force=True,
 )
 logger = logging.getLogger(__name__)
 
@@ -1171,6 +1174,15 @@ def judge_passage_batch(query, candidates, timeout, required_facets=None):
             "identity is checked separately. Do not reward incidental mentions.")},
             {"role": "user", "content": evidence_json.dumps(
                 {"query": query, "required_facets": required_facets, "passages": documents}, ensure_ascii=False)}])
+    import logging as evidence_logging
+    finish = getattr(response.choices[0], "finish_reason", None)
+    finish = finish if finish in {None, "stop", "length", "content_filter", "tool_calls", "function_call"} else "unknown"
+    usage = getattr(response, "usage", None)
+    total_tokens = getattr(usage, "total_tokens", None)
+    total_tokens = total_tokens if type(total_tokens) is int else None
+    evidence_logging.getLogger("semantic_passage_evidence").info(
+        "PASSAGE_PROVIDER_RESPONSE candidates=%d finish_reason=%s total_tokens=%s",
+        len(candidates), finish, total_tokens)
     return evidence_json.loads(response.choices[0].message.content)
 
 
@@ -5101,8 +5113,11 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
         final_results, passage_validation = validate_passages(
             raw_query_text or query_text, merged_list, judge_passage_batch,
             speaker_names=[name for name in explicit_names if name])
-    except ValidationUnavailable:
+    except ValidationUnavailable as exc:
+        logger.error("PASSAGE_SEARCH_UNAVAILABLE diagnostic_id=%s reason=%s",
+                     exc.diagnostic_id, exc.reason)
         raise HTTPException(status_code=503, detail={
+            "diagnostic_id": exc.diagnostic_id,
             "code": "passage_validation_unavailable", "retryable": True,
             "message": "Passage validation is temporarily unavailable. Please retry."})
     passage_validation["query_provider_calls"] = query_provider_calls

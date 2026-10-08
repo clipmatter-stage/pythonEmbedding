@@ -6,6 +6,8 @@ separately from model accuracy. Source times are already seconds (Stage 1).
 from __future__ import annotations
 
 import math
+import logging
+import uuid
 import time
 import unicodedata
 from collections import OrderedDict
@@ -13,6 +15,39 @@ from collections import OrderedDict
 
 class ValidationUnavailable(RuntimeError):
     """Retryable provider or protocol failure, distinct from zero matches."""
+    def __init__(self, message, *, diagnostic_id=None, reason=None):
+        super().__init__(message)
+        self.diagnostic_id = diagnostic_id
+        self.reason = reason
+
+
+logger = logging.getLogger(__name__)
+_VALIDATION_REASONS = {
+    'Invalid required facets': 'invalid_required_facets',
+    'Facet plan changed between batches': 'facet_plan_changed',
+    'Incomplete validation response': 'incomplete_judgments',
+    'Invalid passage indices': 'invalid_indices',
+    'Invalid or duplicate passage indices': 'duplicate_or_missing_indices',
+    'Invalid boolean score': 'invalid_score',
+    'Invalid passage judgment': 'invalid_judgment',
+    'Missing facet evidence': 'missing_facet_evidence',
+    'Evidence quote not present in passage': 'quote_not_in_passage',
+    'Validation provider unavailable': 'provider_not_configured',
+}
+
+
+def validation_failure_reason(exc):
+    # Never log exception messages from providers or arbitrary caller data.
+    if isinstance(exc, ValidationUnavailable):
+        return _VALIDATION_REASONS.get(str(exc), 'validation_failed')
+    name = type(exc).__name__
+    return {'JSONDecodeError': 'invalid_json', 'TimeoutError': 'provider_timeout',
+            'APITimeoutError': 'provider_timeout', 'RateLimitError': 'provider_rate_limit',
+            'AuthenticationError': 'provider_authentication',
+            'PermissionDeniedError': 'provider_permission',
+            'APIConnectionError': 'provider_connection',
+            'AttributeError': 'invalid_response_type', 'KeyError': 'missing_response_field',
+            'ValueError': 'invalid_response_value'}.get(name, 'provider_or_protocol_error')
 
 
 def normalize_multilingual(value):
@@ -74,6 +109,7 @@ def validate_passages(query, candidates, judge, *, speaker_names=(), max_candida
     text. A global, model-declared facet set must be covered by each passage;
     each facet must have an exact evidence quote found in that passage.
     """
+    diagnostic_id = uuid.uuid4().hex
     started = clock()
     pool = consolidate_candidates(candidates)
     if speaker_names:
@@ -92,6 +128,8 @@ def validate_passages(query, candidates, judge, *, speaker_names=(), max_candida
     max_calls = min(max_calls, 3); deadline_seconds = min(deadline_seconds, 30)
     accepted = []; checked = 0; calls = 0; failure = None; input_chars = 0; required_facets = None
     eligible = [r for r in pool[:maximum] if len(r['text']) <= 2400]
+    failure_reason = None
+    logger.info('PASSAGE_VALIDATION_START diagnostic_id=%s candidates=%d eligible=%d', diagnostic_id, len(pool), len(eligible))
     for offset in range(0, len(eligible), batch_size):
         remaining = deadline_seconds - (clock() - started)
         if calls >= max_calls or remaining <= 0:
@@ -99,6 +137,7 @@ def validate_passages(query, candidates, judge, *, speaker_names=(), max_candida
         batch = eligible[offset:offset + batch_size]
         calls += 1
         input_chars += sum(len(r['text']) for r in batch)
+        logger.info('PASSAGE_VALIDATION_BATCH diagnostic_id=%s batch=%d candidates=%d timeout_seconds=%.2f', diagnostic_id, calls, len(batch), min(10, remaining))
         try:
             response = judge(query, batch, min(10, remaining), required_facets)
             facets = response.get('required_facets')
@@ -141,10 +180,15 @@ def validate_passages(query, candidates, judge, *, speaker_names=(), max_candida
             checked += len(batch)
         except Exception as exc:
             failure = type(exc).__name__
+            failure_reason = validation_failure_reason(exc)
+            status = getattr(exc, 'status_code', None)
+            status = status if type(status) is int else None
+            logger.error('PASSAGE_VALIDATION_FAILED diagnostic_id=%s batch=%d reason=%s exception_type=%s provider_status=%s evaluated=%d accepted=%d',
+                         diagnostic_id, calls, failure_reason, failure, status, checked, len(accepted))
             break
     incomplete = checked < len(pool)
     if failure and not accepted:
-        raise ValidationUnavailable('Passage validation unavailable; retry the search')
+        raise ValidationUnavailable('Passage validation unavailable; retry the search', diagnostic_id=diagnostic_id, reason=failure_reason)
     status = 'partial' if incomplete else ('completed' if accepted else 'no_matches')
     accepted.sort(key=lambda r: (-r['score'], str(r.get('video_id')), float(r.get('start_time', 0)), str(r['id'])))
     # Keep each video contiguous so cursor pages never split its passages.
@@ -152,7 +196,7 @@ def validate_passages(query, candidates, judge, *, speaker_names=(), max_candida
     for r in accepted:
         groups.setdefault(r.get('video_id'), []).append(r)
     accepted = [r for group in groups.values() for r in group]
-    metadata = {'authority': 'python_passage_v1', 'status': status, 'retryable': bool(failure),
+    metadata = {'diagnostic_id': diagnostic_id, 'authority': 'python_passage_v1', 'status': status, 'retryable': bool(failure),
                 'provider_failure': failure, 'candidate_count': len(pool), 'evaluated_count': checked,
                 'provider_calls': calls, 'elapsed_seconds': round(clock() - started, 3),
                 'input_passage_characters': input_chars,
@@ -160,6 +204,7 @@ def validate_passages(query, candidates, judge, *, speaker_names=(), max_candida
                            'characters_per_passage': 2400, 'output_tokens_per_call': 2400},
                 'counts': {'videos': len({r.get('video_id') for r in accepted}), 'passages': len(accepted),
                            'source_segments': sum(r['match_count'] for r in accepted), 'occurrences': None}}
+    logger.info('PASSAGE_VALIDATION_COMPLETE diagnostic_id=%s status=%s evaluated=%d accepted=%d provider_calls=%d elapsed_seconds=%s', diagnostic_id, status, checked, len(accepted), calls, metadata['elapsed_seconds'])
     return accepted, metadata
 
 
