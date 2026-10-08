@@ -23,6 +23,7 @@ class ValidationUnavailable(RuntimeError):
 
 logger = logging.getLogger(__name__)
 _VALIDATION_REASONS = {
+    'Incomplete provider response': 'incomplete_provider_response',
     'Invalid required facets': 'invalid_required_facets',
     'Facet plan changed between batches': 'facet_plan_changed',
     'Incomplete validation response': 'incomplete_judgments',
@@ -102,7 +103,7 @@ def consolidate_candidates(candidates, max_chars=2400, max_seconds=60):
 
 
 def validate_passages(query, candidates, judge, *, speaker_names=(), max_candidates=60,
-                      batch_size=20, max_calls=3, deadline_seconds=30, clock=time.monotonic):
+                      batch_size=10, max_calls=6, deadline_seconds=30, clock=time.monotonic):
     """Validate beyond the first 30, with bounded sequential expansion.
 
     Every returned passage is independently judged on its complete displayed
@@ -125,7 +126,7 @@ def validate_passages(query, candidates, judge, *, speaker_names=(), max_candida
     pool = first + tail
     # These hard caps cannot be raised by callers accidentally.
     maximum = min(max_candidates, 60); batch_size = min(batch_size, 20)
-    max_calls = min(max_calls, 3); deadline_seconds = min(deadline_seconds, 30)
+    max_calls = min(max_calls, 6); deadline_seconds = min(deadline_seconds, 30)
     accepted = []; checked = 0; calls = 0; failure = None; input_chars = 0; required_facets = None
     eligible = [r for r in pool[:maximum] if len(r['text']) <= 2400]
     failure_reason = None
@@ -137,9 +138,20 @@ def validate_passages(query, candidates, judge, *, speaker_names=(), max_candida
         batch = eligible[offset:offset + batch_size]
         calls += 1
         input_chars += sum(len(r['text']) for r in batch)
-        logger.info('PASSAGE_VALIDATION_BATCH diagnostic_id=%s batch=%d candidates=%d timeout_seconds=%.2f', diagnostic_id, calls, len(batch), min(10, remaining))
+        logger.info('PASSAGE_VALIDATION_BATCH diagnostic_id=%s batch=%d candidates=%d timeout_seconds=%.2f', diagnostic_id, calls, len(batch), min(15, remaining))
         try:
-            response = judge(query, batch, min(10, remaining), required_facets)
+            try:
+                response = judge(query, batch, min(15, remaining), required_facets)
+            except Exception as exc:
+                retry_remaining = deadline_seconds - (clock() - started)
+                if (validation_failure_reason(exc) != 'provider_timeout'
+                        or calls >= max_calls or retry_remaining < 1):
+                    raise
+                calls += 1
+                input_chars += sum(len(r['text']) for r in batch)
+                logger.warning('PASSAGE_VALIDATION_RETRY diagnostic_id=%s reason=provider_timeout timeout_seconds=%.2f',
+                               diagnostic_id, min(15, retry_remaining))
+                response = judge(query, batch, min(15, retry_remaining), required_facets)
             facets = response.get('required_facets')
             judgments = response.get('passages')
             if not isinstance(facets, list) or not facets or not all(isinstance(f, str) and f.strip() for f in facets):
