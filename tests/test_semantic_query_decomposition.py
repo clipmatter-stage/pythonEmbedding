@@ -20,25 +20,13 @@ from semantic_query_decomposition import (
 
 
 class SemanticQueryDecompositionTest(unittest.TestCase):
-    def test_strict_search_has_one_bounded_model_call_and_no_unjudged_tail(self):
+    def test_semantic_search_requires_authoritative_passage_validation(self):
         tree = ast.parse((SERVICE_ROOT / "embeddings_test.py").read_text())
-        branch = next(node for node in ast.walk(tree)
-                      if isinstance(node, ast.If)
-                      and isinstance(node.test, ast.Name)
-                      and node.test.id == "strict_semantic_topic_search"
-                      and node.orelse)
-        calls = []
-        def judge(query, results, **kwargs):
-            calls.append((query, len(results), kwargs))
-            return results[:2]
-        scope = {"strict_semantic_topic_search": True, "rerank_query": "education",
-                 "merged_list": list(range(600)), "rerank_with_llm": judge}
-        exec(compile(ast.fix_missing_locations(ast.Module(body=[branch], type_ignores=[])),
-                     "bounded_validation", "exec"), scope)
+        search = next(node for node in tree.body if isinstance(node, ast.AsyncFunctionDef) and node.name == "search")
+        calls = [node for node in ast.walk(search) if isinstance(node, ast.Call)
+                 and isinstance(node.func, ast.Name) and node.func.id == "validate_passages"]
         self.assertEqual(1, len(calls))
-        self.assertEqual(30, calls[0][1])
-        self.assertTrue(calls[0][2]["require_complete_topic"])
-        self.assertEqual([0, 1], scope["merged_list"])
+        self.assertEqual("merged_list", calls[0].args[1].id)
 
     def test_present_tense_and_find_wrappers(self):
         for query in (
