@@ -465,7 +465,7 @@ openai_client = None
 if USE_OPENAI_EMBEDDINGS:
     if not OPENAI_API_KEY:
         logger.warning("USE_OPENAI_EMBEDDINGS is true but OPENAI_API_KEY not set. Falling back to sentence-transformers.")
-        USE_OPENAI_EMBEDDINGS = False
+        raise RuntimeError("OpenAI embedding configuration requires OPENAI_API_KEY")
     else:
         openai_client = OpenAI(api_key=OPENAI_API_KEY)
         logger.info(f"Using OpenAI embeddings: {OPENAI_EMBEDDING_MODEL} (dim={EMBEDDING_DIMENSION})")
@@ -483,6 +483,10 @@ class EmbedVideoRequest(BaseModel):
     video_filename: str = Field(default="", max_length=500)
     youtube_url: Optional[str] = Field(default="", max_length=1000)
     language: Optional[str] = Field(default="", max_length=50)
+    embedding_model: Optional[str] = None
+    embedding_dimensions: Optional[int] = None
+    run_id: Optional[str] = None
+    timestamp_unit: str = "seconds"
     batch_info: Optional[dict] = Field(default=None, description="Batch processing info: batch_number, total_batches, segments_in_batch")
     speakers_transcript: Optional[List[dict]] = Field(default=None, description="Full speakers transcript (ignored)")
     diarization_segments: Optional[List[dict]] = Field(default=None, description="Diarization segments (ignored)")
@@ -878,53 +882,17 @@ def maybe_mark_expandable_boundary(
 # ============== ADVANCED EMBEDDING FUNCTIONS ==============
 
 def get_openai_embedding(text: str, model_name: str = None) -> List[float]:
-    """
-    Get embedding from OpenAI API with advanced text-embedding-3 models.
-    These models provide significantly better semantic understanding.
-    Falls back to FastEmbed on OpenAI failure.
-    """
-    if not openai_client:
-        logger.warning("OpenAI client not initialized, falling back to FastEmbed")
-        return get_fastembed_embedding(text)
-    
-    model_name = model_name or OPENAI_EMBEDDING_MODEL
-    
-    try:
-        # Replace newlines and limit text to ~7500 tokens (roughly 30KB)
-        # to avoid token limit errors
-        text = text.replace("\n", " ").strip()
-        if len(text) > 30000:
-            logger.warning(f"Text truncated from {len(text)} to 30000 chars for embedding")
-            text = text[:30000]
-        
-        response = openai_client.embeddings.create(
-            input=text,
-            model=model_name,
-            dimensions=EMBEDDING_DIMENSION  # Can reduce dimensions for faster search
-        )
-        
-        return response.data[0].embedding
-    except Exception as e:
-        logger.error(f"OpenAI embedding error: {str(e)}. Falling back to FastEmbed")
-        # Fallback to FastEmbed on any OpenAI failure
-        try:
-            embedding = get_fastembed_embedding(text)
-            # Pad FastEmbed 384-dim to 3072-dim to match collection schema
-            return embedding + [0.0] * (EMBEDDING_DIMENSION - len(embedding))
-        except Exception as fallback_error:
-            logger.error(f"FastEmbed fallback also failed: {str(fallback_error)}")
-            raise
+    return get_openai_embeddings_batch([text], model_name)[0]
 
 def get_openai_embeddings_batch(texts: List[str], model_name: str = None) -> List[List[float]]:
     """
     Get embeddings for multiple texts using OpenAI API.
     Handles sub-batching for large inputs (API limit is 2048 inputs per call).
-    Falls back to FastEmbed on OpenAI failure.
+    Provider failure is retryable; alternate embedding spaces are never mixed.
     """
     if not openai_client:
-        logger.warning("OpenAI client not initialized, falling back to FastEmbed batch")
-        return [get_fastembed_embedding(text) for text in texts]
-    
+        raise HTTPException(status_code=503, detail="Embedding provider unavailable; retry later")
+
     model_name = model_name or OPENAI_EMBEDDING_MODEL
     
     try:
@@ -957,21 +925,12 @@ def get_openai_embeddings_batch(texts: List[str], model_name: str = None) -> Lis
             sub_embeddings = [item.embedding for item in sorted(response.data, key=lambda x: x.index)]
             all_embeddings.extend(sub_embeddings)
         
+        if len(all_embeddings) != len(texts) or any(len(v) != EMBEDDING_DIMENSION for v in all_embeddings):
+            raise ValueError("Provider returned incompatible embeddings")
         return all_embeddings
     except Exception as e:
-        logger.error(f"OpenAI batch embedding error: {str(e)}. Falling back to FastEmbed")
-        # Fallback to FastEmbed on any OpenAI failure
-        try:
-            embeddings = []
-            for text in texts:
-                embedding = get_fastembed_embedding(text)
-                # Pad FastEmbed 384-dim to 3072-dim to match collection schema
-                padded = embedding + [0.0] * (EMBEDDING_DIMENSION - len(embedding))
-                embeddings.append(padded)
-            return embeddings
-        except Exception as fallback_error:
-            logger.error(f"FastEmbed batch fallback also failed: {str(fallback_error)}")
-            raise
+        raise HTTPException(status_code=503, detail="Embedding provider failed; retry later") from e
+
 
 def expand_query_with_gpt(query: str) -> List[str]:
     """
@@ -1557,17 +1516,13 @@ Where "i" is the document index and "s" is relevance score 0-10."""
 # ============== ELASTIC SEARCH HELPERS ==============
 
 def get_cached_embedding(text: str) -> List[float]:
-    """Get embedding with caching for repeated queries. Uses OpenAI if enabled."""
-    cache_key = text.strip().lower()[:500]  # Normalize and limit key length
+    if not USE_OPENAI_EMBEDDINGS:
+        raise HTTPException(status_code=503, detail="Primary search requires configured OpenAI embeddings")
+    cache_key = (OPENAI_EMBEDDING_MODEL, EMBEDDING_DIMENSION, text)
     if cache_key not in embedding_cache:
-        if USE_OPENAI_EMBEDDINGS and openai_client:
-            logger.info(f"Using OpenAI embeddings for query")
-            embedding_cache[cache_key] = get_openai_embedding(text)
-        else:
-            logger.info("Using FastEmbed for query embedding")
-            result = list(get_fastembed_model().embed([text]))
-            embedding_cache[cache_key] = result[0].tolist() if hasattr(result[0], 'tolist') else list(result[0])
+        embedding_cache[cache_key] = get_openai_embedding(text)
     return embedding_cache[cache_key]
+
 
 def fuzzy_match_text(query: str, text: str, threshold: int = 65) -> bool:
     """
@@ -2439,10 +2394,10 @@ def process_video_task(data_dict: dict):
             total_batches = batch_info.get("total_batches", 1)
             logger.info(f"[WORKER] Batch {batch_number}/{total_batches} for video {video_id}")
         
-        if batch_number == 1:
-            delete_existing_embeddings(video_id)
-        else:
-            logger.info(f"[WORKER] Skipping delete for batch {batch_number} (only delete on batch 1)")
+        # Preserve the existing index until every batch has generated compatible vectors.
+        run_id = data_dict.get("run_id")
+        if data_dict.get("timestamp_unit", "seconds") != "seconds":
+            raise ValueError("Embedding endpoint requires seconds timestamps")
         
         points = []
         segments_embedded = 0
@@ -2483,6 +2438,7 @@ def process_video_task(data_dict: dict):
             segment_metadata.append({
                 'idx': segment_index,
                 'speaker': speaker,
+                'transcript_speaker': segment.get('transcript_speaker'),
                 'diarization_speaker': diarization_speaker,
                 'match_type': match_type,
                 'start_time': start_time,
@@ -2502,6 +2458,7 @@ def process_video_task(data_dict: dict):
             logger.info(f"[WORKER] Using OpenAI {OPENAI_EMBEDDING_MODEL} for batch embedding")
             vectors = get_openai_embeddings_batch(texts_to_embed)
         else:
+            raise HTTPException(status_code=503, detail="Primary collection requires OpenAI embeddings")
             logger.info("[WORKER] Using FastEmbed for batch embedding")
             results_list = list(get_fastembed_model().embed(texts_to_embed))
             vectors = [r.tolist() if hasattr(r, 'tolist') else list(r) for r in results_list]
@@ -2545,6 +2502,8 @@ def process_video_task(data_dict: dict):
         
         for i, metadata in enumerate(segment_metadata):
             vector = vectors[i]
+            if len(vector) != EMBEDDING_DIMENSION:
+                raise ValueError("Embedding dimensions do not match collection configuration")
             id_string = f"video_{video_id}_seg_{metadata['idx']}"
             point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, id_string))
             
@@ -2552,6 +2511,11 @@ def process_video_task(data_dict: dict):
             
             payload = {
                 "video_id": video_id,
+                "embedding_model": OPENAI_EMBEDDING_MODEL if USE_OPENAI_EMBEDDINGS else FASTEMBED_MODEL_NAME,
+                "embedding_dimensions": EMBEDDING_DIMENSION,
+                "indexing_run_id": run_id,
+                "timestamp_unit": "seconds",
+                "transcript_speaker": metadata.get("transcript_speaker"),
                 "video_title": video_title,
                 "video_filename": video_filename,
                 "youtube_url": youtube_url,
@@ -2588,19 +2552,33 @@ def process_video_task(data_dict: dict):
         if not points:
             raise ValueError(f"No valid segments found to embed. Total: {len(identification_segments)}, Without text: {segments_without_text}")
         
-        logger.info(f"[WORKER] Inserting {len(points)} points into Qdrant...")
-        
-        QDRANT_BATCH_SIZE = 150
-        for i in range(0, len(points), QDRANT_BATCH_SIZE):
-            sub_batch = points[i:i + QDRANT_BATCH_SIZE]
-            logger.info(f"[WORKER] Upserting Qdrant sub-batch {i // QDRANT_BATCH_SIZE + 1}: {len(sub_batch)} points")
-            qdrant_client.upsert(
-                collection_name=SEGMENTS_COLLECTION,
-                points=sub_batch,
-                wait=True
-            )
-        logger.info(f"[WORKER] Successfully inserted {len(points)} points")
-        
+        if run_id:
+            # Redis staging is isolated by generation; no provider failure mutates Qdrant.
+            stage_key = f"index-stage:{video_id}:{run_id}"
+            redis_conn.hset(stage_key, str(batch_number), json_module.dumps([p.model_dump() for p in points]))
+            redis_conn.expire(stage_key, 86400)
+            with redis_conn.lock(f"index-commit:{video_id}", timeout=10800, blocking_timeout=30):
+                if redis_conn.get(f"index-active:{video_id}") != run_id.encode():
+                    return {"status": "stale"}
+                staged = redis_conn.hgetall(stage_key)
+                if len(staged) == total_batches:
+                    all_points = []
+                    for number in range(1, total_batches + 1):
+                        all_points.extend(PointStruct(**p) for p in json_module.loads(staged[str(number).encode()]))
+                    # All provider calls succeeded before replacement starts.
+                    for offset in range(0, len(all_points), 150):
+                        qdrant_client.upsert(collection_name=SEGMENTS_COLLECTION, points=all_points[offset:offset + 150], wait=True)
+                    # Remove only obsolete IDs after successful replacement upserts.
+                    qdrant_client.delete(collection_name=SEGMENTS_COLLECTION,
+                        points_selector=models.FilterSelector(filter=Filter(
+                            must=[FieldCondition(key="video_id", match=MatchValue(value=video_id))],
+                            must_not=[models.HasIdCondition(has_id=[p.id for p in all_points])],
+                        )), wait=True)
+        else:
+            # Legacy single batches remain accepted, without delete-before-embed.
+            for offset in range(0, len(points), 150):
+                qdrant_client.upsert(collection_name=SEGMENTS_COLLECTION, points=points[offset:offset + 150], wait=True)
+
         if webhook_url:
             payload_success = {
                 "status": "completed",
@@ -2630,7 +2608,17 @@ def process_video_task(data_dict: dict):
 async def embed_video(data: EmbedVideoRequest, authorized: bool = Depends(verify_api_key)):
     """Enqueue video transcript embedding task. Requires API key if configured."""
     try:
+        if data.embedding_model and data.embedding_model != OPENAI_EMBEDDING_MODEL:
+            raise HTTPException(status_code=422, detail="Embedding model contract mismatch")
+        if data.embedding_dimensions and data.embedding_dimensions != EMBEDDING_DIMENSION:
+            raise HTTPException(status_code=422, detail="Embedding dimension contract mismatch")
         data_dict = data.model_dump()
+        if data.timestamp_unit != "seconds":
+            raise HTTPException(status_code=422, detail="timestamp_unit must be seconds")
+        if data.run_id and (data.batch_info or {}).get("batch_number", 1) == 1:
+            with redis_conn.lock(f"index-commit:{data.video_id}", timeout=30):
+                if redis_conn.set(f"index-registered:{data.video_id}:{data.run_id}", "1", nx=True, ex=604800):
+                    redis_conn.set(f"index-active:{data.video_id}", data.run_id, ex=604800)
         job = task_queue.enqueue(
             'embeddings_test.process_video_task',
             data_dict,
@@ -2645,6 +2633,8 @@ async def embed_video(data: EmbedVideoRequest, authorized: bool = Depends(verify
             "segments_queued": len(data.identification_segments),
             "message": "Video is processing in the background"
         }
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error enqueueing task: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -4414,7 +4404,7 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
 
         except Exception as e:
             logger.info(f"ERROR during semantic search: {str(e)}")
-            raise HTTPException(status_code=500, detail=f"Semantic search error: {str(e)}")
+            raise e if isinstance(e, HTTPException) else HTTPException(status_code=500, detail=f"Semantic search error: {str(e)}")
 
     # Strategy 2: Keyword search
     # For single-word queries, also use the query itself as a keyword fallback.
