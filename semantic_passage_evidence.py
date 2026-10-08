@@ -128,6 +128,7 @@ def validate_passages(query, candidates, judge, *, speaker_names=(), max_candida
     maximum = min(max_candidates, 60); batch_size = min(batch_size, 20)
     max_calls = min(max_calls, 6); deadline_seconds = min(deadline_seconds, 30)
     accepted = []; checked = 0; calls = 0; failure = None; input_chars = 0; required_facets = None
+    invalid_evidence_count = 0
     eligible = [r for r in pool[:maximum] if len(r['text']) <= 2400]
     failure_reason = None
     logger.info('PASSAGE_VALIDATION_START diagnostic_id=%s candidates=%d eligible=%d', diagnostic_id, len(pool), len(eligible))
@@ -167,6 +168,7 @@ def validate_passages(query, candidates, judge, *, speaker_names=(), max_candida
             if set(by_index) != set(range(len(batch))):
                 raise ValidationUnavailable('Invalid or duplicate passage indices')
             batch_accepted = []
+            batch_invalid = 0
             for index, r in enumerate(batch):
                 judgment = by_index[index]
                 if isinstance(judgment.get('score'), bool):
@@ -177,19 +179,31 @@ def validate_passages(query, candidates, judge, *, speaker_names=(), max_candida
                 if not judgment['complete'] or score < 0.65:
                     continue
                 evidence = judgment.get('evidence')
+                evidence_reason = None
                 if not isinstance(evidence, dict) or not set(facets).issubset(evidence):
-                    raise ValidationUnavailable('Missing facet evidence')
-                text = normalize_multilingual(r['text'])
-                if not all(isinstance(evidence[f], str) and len(normalize_multilingual(evidence[f])) >= 3
-                           and normalize_multilingual(evidence[f]) in text for f in facets):
-                    raise ValidationUnavailable('Evidence quote not present in passage')
+                    evidence_reason = 'missing_facet_evidence'
+                else:
+                    text = normalize_multilingual(r['text'])
+                    if not all(isinstance(evidence[f], str) and len(normalize_multilingual(evidence[f])) >= 3
+                               and normalize_multilingual(evidence[f]) in text for f in facets):
+                        evidence_reason = 'quote_not_in_passage'
+                if evidence_reason:
+                    # A bad individual judgment cannot invalidate its verified peers.
+                    # Never convert missing evidence into a match or a valid rejection.
+                    batch_invalid += 1
+                    invalid_evidence_count += 1
+                    failure = 'ValidationUnavailable'
+                    failure_reason = evidence_reason
+                    logger.warning('PASSAGE_EVIDENCE_REJECTED diagnostic_id=%s batch=%d index=%d reason=%s',
+                                   diagnostic_id, calls, index, evidence_reason)
+                    continue
                 batch_accepted.append({**r, 'score': score, 'llm_relevance_score': score,
                     'llm_complete_topic': True, 'llm_incidental_match': False,
                     'llm_required_facets': facets, 'llm_supported_facets': facets,
                     'passage_evidence': evidence, 'intent_match': True,
                     'match_types': ['semantic', 'validated_passage']})
             accepted.extend(batch_accepted)
-            checked += len(batch)
+            checked += len(batch) - batch_invalid
         except Exception as exc:
             failure = type(exc).__name__
             failure_reason = validation_failure_reason(exc)
@@ -209,7 +223,7 @@ def validate_passages(query, candidates, judge, *, speaker_names=(), max_candida
         groups.setdefault(r.get('video_id'), []).append(r)
     accepted = [r for group in groups.values() for r in group]
     metadata = {'diagnostic_id': diagnostic_id, 'authority': 'python_passage_v1', 'status': status, 'retryable': bool(failure),
-                'provider_failure': failure, 'candidate_count': len(pool), 'evaluated_count': checked,
+                'provider_failure': failure, 'invalid_evidence_count': invalid_evidence_count, 'candidate_count': len(pool), 'evaluated_count': checked,
                 'provider_calls': calls, 'elapsed_seconds': round(clock() - started, 3),
                 'input_passage_characters': input_chars,
                 'limits': {'candidates': maximum, 'calls': max_calls, 'deadline_seconds': deadline_seconds,
