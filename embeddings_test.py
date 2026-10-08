@@ -1239,9 +1239,13 @@ CRITICAL RULES:
             max_tokens=1400,
             temperature=0.0,
             response_format={"type": "json_object"},
-                timeout=15.0,
+                timeout=12.0 if require_complete_topic else 15.0,
             )
         except Exception as primary_error:
+            if require_complete_topic:
+                # Do not spend another model timeout on the first-page deadline.
+                logger.warning(f"Complete-topic validation failed: {primary_error}")
+                return []
             # Retry once with a much smaller payload. The OpenAI SDK's implicit
             # retries are disabled above so worst-case latency remains bounded.
             retry_count = min(len(candidates), 12)
@@ -5146,15 +5150,13 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
             else query_text
         )
         if strict_semantic_topic_search:
-            # Judge every candidate in bounded batches; unchecked candidates
-            # must neither leak through nor crowd relevant later passages out.
-            judged_results = []
-            for offset in range(0, len(merged_list), 30):
-                judged_results.extend(rerank_with_llm(
-                    rerank_query, merged_list[offset:offset + 30],
-                    top_k=30, require_complete_topic=True,
-                ))
-            merged_list = sorted(judged_results, key=lambda r: r.get("score", 0), reverse=True)
+            # One bounded judgment call per request. Large incremental searches
+            # must not validate hundreds of candidates in serial before responding.
+            # Unjudged candidates are excluded by the complete-topic gate.
+            merged_list = rerank_with_llm(
+                rerank_query, merged_list[:30],
+                top_k=30, require_complete_topic=True,
+            )
         else:
             merged_list = rerank_with_llm(
                 rerank_query, merged_list,
