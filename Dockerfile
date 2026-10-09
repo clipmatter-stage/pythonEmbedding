@@ -21,6 +21,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY embeddings_test.py .
 COPY semantic_query_decomposition.py .
 COPY semantic_passage_evidence.py .
+COPY transcript_search_contract.py .
+COPY search_contract_v1.json .
+COPY backfill_transcript_contract.py .
+RUN python -c "from transcript_search_contract import match_spans; assert match_spans('I.P.P.', 'IPP')"
 COPY migrate_to_3072.py .
 COPY start.sh .
 

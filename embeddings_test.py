@@ -1,3 +1,4 @@
+from transcript_search_contract import contract_search, search_session_binding
 from semantic_passage_evidence import normalize_multilingual, validate_passages, ValidationUnavailable, requested_speaker_names, BoundedRetrieval, RetrievalBudgetReached
 from fastapi import FastAPI, HTTPException, Depends, Security, Request
 from fastapi.security import APIKeyHeader
@@ -508,6 +509,8 @@ class EmbedVideoRequest(BaseModel):
     video_summary_urdu: str = Field(default="", max_length=10000)
 
 class SearchRequest(BaseModel):
+    summary_candidates: Optional[List[dict]] = Field(default=None, max_length=60)
+    transcript_contract: str = Field(default="normalized", pattern="^(literal|normalized|alias)$")
     query: str = Field(default="", max_length=1000)
     words: List[str] = Field(default=[])
     word: Optional[str] = Field(default=None, max_length=200)
@@ -540,6 +543,7 @@ class TitleSearchRequest(BaseModel):
     limit: int = Field(default=10, ge=1, le=100)
 
 class IncrementalSearchRequest(BaseModel):
+    transcript_contract: str = Field(default="normalized", pattern="^(literal|normalized|alias)$")
     """Request model for incremental cursor-based search"""
     query: str = Field(default="", max_length=1000)
     words: List[str] = Field(default=[])
@@ -2455,6 +2459,7 @@ def send_webhook_with_retry(webhook_url: str, payload: dict, max_attempts: int =
     
 def process_video_task(data_dict: dict):
     """Background worker task to process video embeddings and upsert to Qdrant."""
+    from transcript_search_contract import indexed_text_fields
     webhook_url = data_dict.get('webhook_url')
     video_id = data_dict.get('video_id')
     try:
@@ -2620,6 +2625,7 @@ def process_video_task(data_dict: dict):
                 "end_time": metadata['end_time'],
                 "duration": metadata['end_time'] - metadata['start_time'],
                 "text": metadata['text'],
+                **indexed_text_fields(metadata["text"]),
                 "text_length": len(metadata['text']),
                 "confidence": metadata['confidence'],
                 "summary_en": summary_en,
@@ -2871,6 +2877,24 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
     # Only one filter is active at a time. Returns results from Qdrant scroll.
     # Eligibility: processing_status=completed, approval_status=approved, is_archived=false
     # ═══════════════════════════════════════════════════════════════════════════
+    if search_mode == "simple" and filter_type in {"text", "title", "summary"}:
+        try:
+            return contract_search(data, BoundedRetrieval(qdrant_client), SEGMENTS_COLLECTION,
+                                   models, get_semantic_query_embedding, judge_passage_batch,
+                                   use_normalized_index=os.getenv("TRANSCRIPT_CONTRACT_INDEX_V1", "false").lower() == "true")
+        except ValidationUnavailable as exc:
+            raise HTTPException(status_code=503, detail={"code": "passage_validation_unavailable",
+                "retryable": True, "diagnostic_id": exc.diagnostic_id,
+                "message": "Passage validation is temporarily unavailable. Please retry."})
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
+        except HTTPException:
+            raise
+        except Exception:
+            logger.exception("CONTRACT_SEARCH_UNAVAILABLE")
+            raise HTTPException(status_code=503, detail={"code": "contract_search_unavailable",
+                "retryable": True, "message": "Search is temporarily unavailable. Please retry."})
+
     if search_mode == "simple":
         logger.info(f"[SIMPLE SEARCH] filter_type={filter_type}, query='{query_text}', speaker={speaker_filter}, video_id={video_id_filter}, language={language_filter}, title={title_filter}")
         
@@ -5244,9 +5268,8 @@ async def search_incremental(data: IncrementalSearchRequest, authorized: bool = 
 
     if cached_data:
         cached_params = cached_data.get("query_params", {})
-        bindings_match = all(cached_params.get(key) == getattr(data, key, None)
-            for key in ("speaker", "title", "video_id", "language", "filter_year", "filter_month", "filter_date", "time_range"))
-        if not bindings_match or normalize_multilingual(cached_params.get("query")) != normalize_multilingual(data.query):
+        bindings_match = cached_params.get("contract_binding") == search_session_binding(data)
+        if not bindings_match:
             raise HTTPException(status_code=409, detail={"code": "search_session_mismatch",
                 "retryable": True, "message": "Search changed. Retry the search from the first page."})
         all_results = cached_data.get("results", [])
@@ -5278,6 +5301,7 @@ async def search_incremental(data: IncrementalSearchRequest, authorized: bool = 
                 "elapsed_seconds": round(elapsed, 3),
                 "cache_hit": True,
                 "passage_validation": query_params.get("passage_validation"),
+                "search_contract": query_params.get("search_contract"),
                 "batch_size": len(batch),
                 "batch_start": cursor.get("index", -1) + 1 if cursor else 0,
                 "query": query_params.get("query", ""),
@@ -5359,7 +5383,8 @@ async def search_incremental(data: IncrementalSearchRequest, authorized: bool = 
             min_score=data.min_score,
             time_range=data.time_range,
             max_scanned=max(data.max_scanned, 50000 if _is_numeric_incremental else 18000),
-            search_mode="simple" if _is_numeric_incremental else "semantic",
+            search_mode="simple" if _is_numeric_incremental else data.search_mode,
+            transcript_contract=data.transcript_contract,
             filter_type="text" if _is_numeric_incremental else data.filter_type,
             filter_year=data.filter_year,
             filter_month=data.filter_month,
@@ -5371,6 +5396,8 @@ async def search_incremental(data: IncrementalSearchRequest, authorized: bool = 
         delegated_results = delegated.get("results", []) if isinstance(delegated, dict) else []
 
         delegated_query_params = {
+            "contract_binding": search_session_binding(data),
+            "search_contract": delegated.get("search_contract"),
             "query": data.query,
             "effective_query": query_text,
             "speaker": data.speaker,
@@ -5387,6 +5414,7 @@ async def search_incremental(data: IncrementalSearchRequest, authorized: bool = 
             "time_range": data.time_range,
             "delegated_route_reason": route_reason,
             "passage_validation": delegated.get("metadata", {}).get("passage_validation"),
+                "search_contract": delegated.get("search_contract"),
         }
         cache_search_results(search_session_id, delegated_results, delegated_query_params, delegate_req.top_k)
 
@@ -5426,6 +5454,7 @@ async def search_incremental(data: IncrementalSearchRequest, authorized: bool = 
                 "fast_path": False,
                 "delegated_full_search": True,
                 "passage_validation": delegated.get("metadata", {}).get("passage_validation"),
+                "search_contract": delegated.get("search_contract"),
                 "delegated_reason": route_reason,
                 "query_shape": {
                     "token_count": int(initial_query_shape.get("token_count", 0)),

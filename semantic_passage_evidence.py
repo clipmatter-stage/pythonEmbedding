@@ -289,3 +289,6 @@ class BoundedRetrieval:
 
     def query_points(self, **kwargs):
         return self._read('query_points', **kwargs)
+
+    def count(self, **kwargs):
+        return self._read('count', **kwargs)
