@@ -102,7 +102,7 @@ def consolidate_candidates(candidates, max_chars=2400, max_seconds=60):
     return sorted(output, key=lambda r: (-float(r.get('score', 0)), str(r.get('video_id')), float(r.get('start_time', 0)), str(r['id'])))
 
 
-def validate_passages(query, candidates, judge, *, speaker_names=(), max_candidates=60,
+def validate_passages(query, candidates, judge, *, speaker_names=(), verifier=None, max_candidates=60,
                       batch_size=10, max_calls=6, deadline_seconds=30, clock=time.monotonic):
     """Validate beyond the first 30, with bounded sequential expansion.
 
@@ -129,6 +129,7 @@ def validate_passages(query, candidates, judge, *, speaker_names=(), max_candida
     max_calls = min(max_calls, 6); deadline_seconds = min(deadline_seconds, 30)
     accepted = []; checked = 0; calls = 0; failure = None; input_chars = 0; required_facets = None
     invalid_evidence_count = 0
+    verification_rejected_count = 0
     eligible = [r for r in pool[:maximum] if len(r['text']) <= 2400]
     failure_reason = None
     logger.info('PASSAGE_VALIDATION_START diagnostic_id=%s candidates=%d eligible=%d', diagnostic_id, len(pool), len(eligible))
@@ -202,6 +203,44 @@ def validate_passages(query, candidates, judge, *, speaker_names=(), max_candida
                     'llm_required_facets': facets, 'llm_supported_facets': facets,
                     'passage_evidence': evidence, 'intent_match': True,
                     'match_types': ['semantic', 'validated_passage']})
+            if verifier and batch_accepted:
+                remaining = deadline_seconds - (clock() - started)
+                if calls >= max_calls or remaining <= 0:
+                    # Unverified positives are never returned when the budget expires.
+                    break
+                calls += 1
+                input_chars += sum(len(r['text']) for r in batch_accepted)
+                verification = verifier(query, batch_accepted, min(15, remaining), required_facets)
+                items = verification.get('passages')
+                if (verification.get('required_facets') != required_facets
+                        or not isinstance(items, list) or len(items) != len(batch_accepted)
+                        or not all(isinstance(j, dict) and type(j.get('index')) is int for j in items)
+                        or {j['index'] for j in items} != set(range(len(batch_accepted)))):
+                    raise ValidationUnavailable('Incomplete validation response')
+                by_verified_index = {j['index']: j for j in items}
+                verified = []
+                for i, result in enumerate(batch_accepted):
+                    decision = by_verified_index[i]
+                    evidence = decision.get('evidence')
+                    score = decision.get('score')
+                    if (type(decision.get('complete')) is not bool or type(score) not in (int, float)
+                            or not math.isfinite(score) or not 0 <= score <= 1):
+                        raise ValidationUnavailable('Invalid passage judgment')
+                    if not decision['complete'] or score < .65:
+                        verification_rejected_count += 1
+                        continue
+                    text = normalize_multilingual(result['text'])
+                    if (not isinstance(evidence, dict) or not set(required_facets).issubset(evidence)
+                            or not all(isinstance(evidence[f], str)
+                                and len(normalize_multilingual(evidence[f])) >= 3
+                                and normalize_multilingual(evidence[f]) in text for f in required_facets)):
+                        raise ValidationUnavailable('Missing facet evidence')
+                    result['passage_evidence'] = evidence
+                    result['independently_verified'] = True
+                    result['score'] = min(result['score'], score)
+                    result['llm_relevance_score'] = result['score']
+                    verified.append(result)
+                batch_accepted = verified
             accepted.extend(batch_accepted)
             checked += len(batch) - batch_invalid
         except Exception as exc:
@@ -223,7 +262,8 @@ def validate_passages(query, candidates, judge, *, speaker_names=(), max_candida
         groups.setdefault(r.get('video_id'), []).append(r)
     accepted = [r for group in groups.values() for r in group]
     metadata = {'diagnostic_id': diagnostic_id, 'authority': 'python_passage_v1', 'status': status, 'retryable': bool(failure),
-                'provider_failure': failure, 'invalid_evidence_count': invalid_evidence_count, 'candidate_count': len(pool), 'evaluated_count': checked,
+                'provider_failure': failure, 'invalid_evidence_count': invalid_evidence_count,
+                'independent_verification': bool(verifier), 'verification_rejected_count': verification_rejected_count, 'candidate_count': len(pool), 'evaluated_count': checked,
                 'provider_calls': calls, 'elapsed_seconds': round(clock() - started, 3),
                 'input_passage_characters': input_chars,
                 'limits': {'candidates': maximum, 'calls': max_calls, 'deadline_seconds': deadline_seconds,

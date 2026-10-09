@@ -108,7 +108,7 @@ def date_matches(payload,request):
     return True
 
 
-def contract_search(request,reader,collection,models,embedding,judge,*,use_normalized_index=False):
+def contract_search(request,reader,collection,models,embedding,judge,*,use_normalized_index=False,verifier=None):
     """Bounded existing-payload reader, with no writes or embedding-space changes."""
     query=(request.title or request.query) if request.filter_type=='title' else (request.query or ' '.join(request.words))
     if not query or not query.strip():raise ValueError('A search query is required')
@@ -187,7 +187,7 @@ def contract_search(request,reader,collection,models,embedding,judge,*,use_norma
                 if len(found)>=60 or {p.payload.get('video_id') for p in found if p.payload} != set(videos):
                     limited=True
                 candidates=[{'id':str(p.id),**(p.payload or {}),'score':p.score} for p in found if valid_interval(p.payload or {}) and date_matches(p.payload or {},request)]
-                results,validation=validate_passages(query,candidates,judge)
+                results,validation=validate_passages(query,candidates,judge,verifier=verifier)
                 for row in results:
                     row['matched_summary_fields']=videos[row['video_id']]['matched_summary_fields'];row['matched_field']='summary_with_transcript_evidence'
             except RetrievalBudgetReached:limited=True
