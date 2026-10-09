@@ -51,6 +51,29 @@ def validation_failure_reason(exc):
             'ValueError': 'invalid_response_value'}.get(name, 'provider_or_protocol_error')
 
 
+def validation_error_detail(exc):
+    """Public errors expose bounded reason codes, never provider payloads."""
+    reason = exc.reason or 'validation_failed'
+    evidence_reasons = {'quote_not_in_passage', 'missing_facet_evidence'}
+    protocol_reasons = set(_VALIDATION_REASONS.values()) - {'provider_not_configured'}
+    if reason in evidence_reasons:
+        code = 'passage_evidence_invalid'
+        message = ('Search could not verify the results because the validation evidence '
+                   'did not match the transcript. Please retry.')
+    elif reason == 'provider_timeout':
+        code = 'passage_validation_timeout'
+        message = 'Search verification timed out before it could finish. Please retry.'
+    elif reason in protocol_reasons or reason in {'invalid_json', 'invalid_response_type', 'missing_response_field', 'invalid_response_value'}:
+        code = 'passage_validation_invalid_response'
+        message = 'Search verification returned an incomplete or invalid response. Please retry.'
+    else:
+        code = 'passage_validation_unavailable'
+        message = 'Search verification service is temporarily unavailable. Please retry.'
+    return {'code': code, 'message': message, 'retryable': True,
+            'diagnostic_id': exc.diagnostic_id,
+            'reason': reason if reason in evidence_reasons | protocol_reasons | {'provider_timeout', 'provider_rate_limit', 'provider_connection', 'provider_not_configured'} else 'validation_failed'}
+
+
 def normalize_multilingual(value):
     # Preserve aspirated consonants and vowel distinctions. Only canonicalize
     # Arabic keyboard variants of Urdu yeh/kaf and punctuation.
@@ -193,8 +216,6 @@ def validate_passages(query, candidates, judge, *, speaker_names=(), verifier=No
                     # Never convert missing evidence into a match or a valid rejection.
                     batch_invalid += 1
                     invalid_evidence_count += 1
-                    failure = 'ValidationUnavailable'
-                    failure_reason = evidence_reason
                     logger.warning('PASSAGE_EVIDENCE_REJECTED diagnostic_id=%s batch=%d index=%d reason=%s',
                                    diagnostic_id, calls, index, evidence_reason)
                     continue
@@ -234,7 +255,11 @@ def validate_passages(query, candidates, judge, *, speaker_names=(), verifier=No
                             or not all(isinstance(evidence[f], str)
                                 and len(normalize_multilingual(evidence[f])) >= 3
                                 and normalize_multilingual(evidence[f]) in text for f in required_facets)):
-                        raise ValidationUnavailable('Missing facet evidence')
+                        invalid_evidence_count += 1
+                        batch_invalid += 1
+                        verification_rejected_count += 1
+                        logger.warning('PASSAGE_EVIDENCE_REJECTED diagnostic_id=%s batch=%d index=%d reason=invalid_verifier_evidence', diagnostic_id, calls, i)
+                        continue
                     result['passage_evidence'] = evidence
                     result['independently_verified'] = True
                     result['score'] = min(result['score'], score)
@@ -261,7 +286,8 @@ def validate_passages(query, candidates, judge, *, speaker_names=(), verifier=No
     for r in accepted:
         groups.setdefault(r.get('video_id'), []).append(r)
     accepted = [r for group in groups.values() for r in group]
-    metadata = {'diagnostic_id': diagnostic_id, 'authority': 'python_passage_v1', 'status': status, 'retryable': bool(failure),
+    metadata = {'diagnostic_id': diagnostic_id, 'authority': 'python_passage_v1', 'status': status, 'retryable': bool(failure or incomplete),
+                'warnings': ['Some results could not be verified against the transcript. Please retry.'] if invalid_evidence_count else [],
                 'provider_failure': failure, 'invalid_evidence_count': invalid_evidence_count,
                 'independent_verification': bool(verifier), 'verification_rejected_count': verification_rejected_count, 'candidate_count': len(pool), 'evaluated_count': checked,
                 'provider_calls': calls, 'elapsed_seconds': round(clock() - started, 3),

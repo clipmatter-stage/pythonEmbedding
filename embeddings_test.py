@@ -1,3 +1,4 @@
+from semantic_passage_evidence import validation_error_detail
 from transcript_search_contract import contract_search, search_session_binding
 from semantic_passage_evidence import normalize_multilingual, validate_passages, ValidationUnavailable, requested_speaker_names, BoundedRetrieval, RetrievalBudgetReached
 from fastapi import FastAPI, HTTPException, Depends, Security, Request
@@ -2892,9 +2893,7 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                                    use_normalized_index=os.getenv("TRANSCRIPT_CONTRACT_INDEX_V1", "false").lower() == "true",
                 verifier=verify_passage_batch)
         except ValidationUnavailable as exc:
-            raise HTTPException(status_code=503, detail={"code": "passage_validation_unavailable",
-                "retryable": True, "diagnostic_id": exc.diagnostic_id,
-                "message": "Passage validation is temporarily unavailable. Please retry."})
+            raise HTTPException(status_code=503, detail=validation_error_detail(exc))
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc))
         except HTTPException:
@@ -5175,10 +5174,7 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
     except ValidationUnavailable as exc:
         logger.error("PASSAGE_SEARCH_UNAVAILABLE diagnostic_id=%s reason=%s",
                      exc.diagnostic_id, exc.reason)
-        raise HTTPException(status_code=503, detail={
-            "diagnostic_id": exc.diagnostic_id,
-            "code": "passage_validation_unavailable", "retryable": True,
-            "message": "Passage validation is temporarily unavailable. Please retry."})
+        raise HTTPException(status_code=503, detail=validation_error_detail(exc))
     passage_validation["query_provider_calls"] = query_provider_calls
     passage_validation["qdrant_calls"] = retrieval_client.calls
     passage_validation["evaluation_scope"] = "retrieved_candidates"

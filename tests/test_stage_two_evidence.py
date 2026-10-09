@@ -58,8 +58,9 @@ class StageTwoEvidenceTest(unittest.TestCase):
             return {'required_facets': ['students', 'fees'], 'passages': [
                 {'index': 0, 'score': 1, 'complete': True,
                  'evidence': {'students': 'Students', 'fees': 'high education fees'}}]}
-        with self.assertRaises(ValidationUnavailable):
-            validate_passages('students high fees', [passage(1, 'Students enjoy the library.', video_title='high education fees')], bad)
+        results, meta = validate_passages('students high fees', [passage(1, 'Students enjoy the library.', video_title='high education fees')], bad)
+        self.assertEqual([], results)
+        self.assertEqual('partial', meta['status'])
 
     def test_wrong_explicit_speaker_rejected_before_provider(self):
         calls = []
@@ -85,7 +86,7 @@ class StageTwoEvidenceTest(unittest.TestCase):
             return result
         results, meta = validate_passages('education fees', [passage(i, score=.9-i*.001) for i in range(100)], judge)
         self.assertTrue(any(r['id'] == '35' for r in results))
-        self.assertEqual([20,20,20], calls); self.assertEqual(60, meta['evaluated_count'])
+        self.assertEqual([10]*6, calls); self.assertEqual(60, meta['evaluated_count'])
         self.assertEqual('partial', meta['status'])
 
     def test_timeout_and_invalid_json_are_retryable_not_zero_matches(self):
@@ -99,11 +100,11 @@ class StageTwoEvidenceTest(unittest.TestCase):
         calls = []
         def judge(*args):
             calls.append(1)
-            if len(calls) == 2: raise TimeoutError()
+            if len(calls) >= 2: raise TimeoutError()
             return judgments(*args)
         results, meta = validate_passages('fees', [passage(i) for i in range(40)], judge)
-        self.assertEqual(20, len(results)); self.assertEqual('partial', meta['status'])
-        self.assertTrue(meta['retryable']); self.assertEqual(20, meta['evaluated_count'])
+        self.assertEqual(10, len(results)); self.assertEqual('partial', meta['status'])
+        self.assertTrue(meta['retryable']); self.assertEqual(10, meta['evaluated_count'])
 
     def test_no_genuine_match_returns_no_filler(self):
         def reject(*args):
@@ -138,7 +139,7 @@ class StageTwoEvidenceTest(unittest.TestCase):
     def test_deadline_prevents_another_call(self):
         ticks=iter([0,0,31,31])
         results, meta=validate_passages('fees', [passage(i) for i in range(40)], judgments, clock=lambda:next(ticks))
-        self.assertEqual(20,len(results)); self.assertEqual(1,meta['provider_calls'])
+        self.assertEqual(10,len(results)); self.assertEqual(1,meta['provider_calls'])
 
     def test_unicode_preserves_meaning_and_matches_keyboard_and_punctuation_variants(self):
         self.assertEqual(normalize_multilingual('  تعليم، كی “فيس”؟ '), normalize_multilingual('تعلیم, کی "فیس"?'))
@@ -164,7 +165,10 @@ class StageTwoEvidenceTest(unittest.TestCase):
         calls=[]
         def create(**kwargs):
             calls.append(kwargs)
-            return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps(judgments('q',[passage(1)],5,None))))])
+            response=judgments('q',[passage(1)],5,None)
+            for item in response['passages']:
+                item['evidence']=[{'facet':f,'quote':q} for f,q in item['evidence'].items()]
+            return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps(response)))])
         options=[]
         client=SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
         client.with_options=lambda **kwargs: (options.append(kwargs) or client)
@@ -177,6 +181,14 @@ class StageTwoEvidenceTest(unittest.TestCase):
         self.assertEqual(5,calls[0]['timeout']);self.assertEqual([{'max_retries':0}],options)
         self.assertEqual('gpt-4o-mini',calls[0]['model'])
         self.assertEqual(1,len(result['passages']))
+        self.assertIsInstance(result['passages'][0]['evidence'],dict)
+        contract=calls[0]['response_format']
+        self.assertEqual('json_schema',contract['type'])
+        self.assertTrue(contract['json_schema']['strict'])
+        schema=contract['json_schema']['schema']
+        self.assertFalse(schema['additionalProperties'])
+        self.assertEqual(1,schema['properties']['required_facets']['minItems'])
+        self.assertEqual({'required_facets','passages'},set(schema['required']))
 
     def test_bounded_retrieval_uses_real_transport_timeout_contract_and_stops(self):
         from semantic_passage_evidence import BoundedRetrieval, RetrievalBudgetReached
@@ -283,11 +295,58 @@ class StageTwoEvidenceTest(unittest.TestCase):
         calls=[]
         def judge(*args):
             calls.append(1)
-            if len(calls)==2:raise TimeoutError('secret')
+            if len(calls)>=2:raise TimeoutError('secret')
             return judgments(*args)
         with self.assertLogs('semantic_passage_evidence',level='INFO') as logs:
             results,metadata=validate_passages('fees',[passage(i) for i in range(40)],judge)
-        self.assertEqual(20,len(results));self.assertEqual('partial',metadata['status'])
+        self.assertEqual(10,len(results));self.assertEqual('partial',metadata['status'])
         failure=next(line for line in logs.output if 'PASSAGE_VALIDATION_FAILED' in line)
         self.assertIn(metadata['diagnostic_id'],failure)
         self.assertIn('reason=provider_timeout',failure)
+
+    def test_timeout_retry_recovers_within_shared_budget(self):
+        calls=[]
+        def judge(query,batch,timeout,facets):
+            calls.append(timeout)
+            if len(calls)==1:raise TimeoutError()
+            return judgments(query,batch,timeout,facets)
+        ticks=iter([0,0,15,16])
+        results,meta=validate_passages('fees',[passage(1)],judge,clock=lambda:next(ticks))
+        self.assertEqual([15,15],calls)
+        self.assertEqual(1,len(results))
+        self.assertEqual(2,meta['provider_calls'])
+        self.assertEqual('completed',meta['status'])
+
+    def test_timeout_cannot_retry_after_deadline(self):
+        calls=[]
+        def judge(*args):
+            calls.append(1);raise TimeoutError()
+        ticks=iter([0,0,30])
+        with self.assertRaises(ValidationUnavailable):
+            validate_passages('fees',[passage(1)],judge,clock=lambda:next(ticks))
+        self.assertEqual(1,len(calls))
+
+    def test_bad_evidence_does_not_discard_verified_peers(self):
+        for bad_evidence in ({}, {'students_and_high_education_fees':'invented quote'}):
+            def judge(*args):
+                result=judgments(*args)
+                result['passages'][0]['evidence']=bad_evidence
+                return result
+            results,meta=validate_passages('education fees',[passage(1),passage(2)],judge)
+            self.assertEqual(['2'],[r['id'] for r in results])
+            self.assertEqual('partial',meta['status'])
+            self.assertTrue(meta['retryable'])
+            self.assertEqual(1,meta['evaluated_count'])
+            self.assertEqual(1,meta['invalid_evidence_count'])
+
+    def test_all_missing_evidence_remains_explicit_retryable_failure(self):
+        def judge(*args):
+            result=judgments(*args)
+            for item in result['passages']:item['evidence']={}
+            return result
+        results, meta = validate_passages('education fees',[passage(1),passage(2)],judge)
+        self.assertEqual([], results)
+        self.assertEqual('partial', meta['status'])
+        self.assertTrue(meta['retryable'])
+        self.assertIsNone(meta['provider_failure'])
+        self.assertEqual(2, meta['invalid_evidence_count'])

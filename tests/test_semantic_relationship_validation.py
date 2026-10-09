@@ -34,7 +34,11 @@ class RelationshipValidationTests(unittest.TestCase):
     def test_independent_quotes_must_belong_to_this_passage(self):
         def fabricate(q,b,t,f):
             response=primary(q,b,t,f);response['passages'][0]['evidence']={'complete_request':'unrelated invented quote'};return response
-        with self.assertRaises(ValidationUnavailable):validate_passages('any topic',[candidate(1,'A topic discussion.')],primary,verifier=fabricate)
+        results, meta = validate_passages('any topic',[candidate(1,'A topic discussion.')],primary,verifier=fabricate)
+        self.assertEqual([], results)
+        self.assertEqual('partial', meta['status'])
+        self.assertTrue(meta['retryable'])
+        self.assertEqual(1, meta['invalid_evidence_count'])
     def test_both_passes_share_six_call_limit(self):
         rows,meta=validate_passages('any topic',[candidate(i,'A topic discussion.')for i in range(100)],primary,verifier=primary)
         self.assertEqual(6,meta['provider_calls']);self.assertEqual(30,len(rows));self.assertEqual('partial',meta['status'])
