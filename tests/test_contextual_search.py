@@ -204,6 +204,21 @@ class ContextualSearchTest(unittest.TestCase):
         self.service.search(request(query="", words=["children", "rights"]))
         self.assertEqual(["children rights"], captured)
 
+    def test_context_fetches_are_grouped_once_per_video(self):
+        from unittest.mock import patch
+        self.reranker.settings = replace(self.settings, context_seconds=20)
+        self.put(3, "education and protection", video_id=1, start_time=21, end_time=25)
+        with patch.object(self.client, "scroll", wraps=self.client.scroll) as reads:
+            self.service.search(request(video_id=1))
+        self.assertEqual(1, reads.call_count)
+
+    def test_context_read_budget_is_reported_instead_of_unbounded_scans(self):
+        self.reranker.settings = replace(self.settings, context_seconds=20)
+        for identity in range(3, 20):
+            self.put(identity, "education and protection")
+        response = self.service.search(request())
+        self.assertIn("context_retrieval_budget_reached", response["ranking"]["retrieval_warnings"])
+
 
 class ContextWindowTest(unittest.TestCase):
     def test_context_preserves_focus_and_excludes_other_speakers_videos_and_distant_text(self):

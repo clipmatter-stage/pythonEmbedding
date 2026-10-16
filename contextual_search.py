@@ -19,6 +19,8 @@ import uuid
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from qdrant_client import models
+from semantic_passage_evidence import BoundedRetrieval, RetrievalBudgetReached
+from transcript_search_contract import valid_interval
 
 logger = logging.getLogger(__name__)
 
@@ -288,16 +290,51 @@ def timestamp_url(url: str, seconds: float) -> str:
 class ContextualSearch:
     def __init__(self, client, collection: str, embed: Callable, understand: Callable,
                  speaker_matches: Callable, title_matches: Callable, reranker: QdrantReranker,
-                 speaker_values: Callable | None = None):
+                 speaker_values: Callable | None = None, validator: Callable | None = None):
         self.client, self.collection = client, collection
         self.embed, self.understand = embed, understand
         self.speaker_matches, self.title_matches = speaker_matches, title_matches
         self.reranker = reranker
         self.speaker_values = speaker_values
+        self.validator = validator
+
+    def _populate_context(self, pool: list[dict], base_filter, reader) -> list[str]:
+        """Fetch each video's neighboring turns once within the source-read budget."""
+        warnings = []
+        groups = defaultdict(list)
+        for candidate in pool:
+            candidate["context_text"] = candidate["text"]
+            if self.reranker.settings.context_seconds > 0:
+                groups[candidate["video_id"]].append(candidate)
+        seconds = self.reranker.settings.context_seconds
+        for video_id, candidates in groups.items():
+            windows = [models.FieldCondition(key="start_time", range=models.Range(
+                gte=max(0, r["start_time"] - seconds), lte=r["end_time"] + seconds,
+            )) for r in candidates]
+            window = models.Filter(must=list(base_filter.must or []) + [
+                models.FieldCondition(key="video_id", match=models.MatchValue(value=video_id)),
+                models.Filter(should=windows),
+            ])
+            try:
+                points, offset = reader.scroll(
+                    collection_name=self.collection, scroll_filter=window,
+                    limit=min(512, 64 * len(candidates)),
+                    with_payload=["video_id", "speaker", "start_time", "end_time", "timestamp_unit", "text"],
+                    with_vectors=False,
+                )
+            except RetrievalBudgetReached:
+                warnings.append("context_retrieval_budget_reached")
+                break
+            neighbors = [p.payload or {} for p in points if valid_interval(p.payload or {})]
+            for candidate in candidates:
+                candidate["context_text"] = nearby_passage(candidate, neighbors, seconds)
+            if offset is not None:
+                warnings.append("context_window_truncated")
+        return list(dict.fromkeys(warnings))
 
     def _context(self, candidate: dict, base_filter):
         settings = self.reranker.settings
-        if settings.context_seconds <= 0:
+        if settings.context_seconds <= 0 or not valid_interval(candidate):
             return candidate["text"]
         window = models.Filter(must=list(base_filter.must or []) + [
             models.FieldCondition(key="video_id", match=models.MatchValue(value=candidate["video_id"])),
@@ -309,10 +346,10 @@ class ContextualSearch:
         # Bounded per candidate; no unbounded whole-video scans.
         points, _ = self.client.scroll(
             collection_name=self.collection, scroll_filter=window, limit=64,
-            with_payload=["video_id", "speaker", "start_time", "end_time", "text"],
+            with_payload=["video_id", "speaker", "start_time", "end_time", "timestamp_unit", "text"],
             with_vectors=False,
         )
-        return nearby_passage(candidate, [p.payload or {} for p in points], settings.context_seconds)
+        return nearby_passage(candidate, [p.payload or {} for p in points if valid_interval(p.payload or {})], settings.context_seconds)
 
     def search(self, request, video_ids: list[int] | None = None) -> dict:
         query = (request.query or "").strip()
@@ -342,13 +379,15 @@ class ContextualSearch:
             ]))
         settings = self.reranker.settings
         limit = settings.candidate_limit
+        reader = BoundedRetrieval(self.client)
+        retrieval_warnings = []
         queries = [semantic_query]
         translated = intent.get("semantic_query_translated")
         if isinstance(translated, str) and translated.strip() and translated != semantic_query:
             queries.append(translated.strip())
         candidates = {}
         for variation in queries:
-            points = self.client.query_points(
+            points = reader.query_points(
                 collection_name=self.collection, query=self.embed(variation),
                 query_filter=search_filter, limit=limit,
                 score_threshold=request.min_score,
@@ -357,7 +396,7 @@ class ContextualSearch:
             ).points
             for point in points:
                 payload = point.payload or {}
-                if not str(payload.get("text") or "").strip():
+                if not str(payload.get("text") or "").strip() or not valid_interval(payload):
                     continue
                 if speaker and not self.speaker_matches(speaker, f"{payload.get('speaker', '')} {payload.get('diarization_speaker', '')}"):
                     continue
@@ -375,29 +414,55 @@ class ContextualSearch:
                     "youtube_url_timestamped": timestamp_url(payload.get("youtube_url", ""), start),
                 }
         pool = sorted(candidates.values(), key=lambda r: -r["dense_score"])[:limit]
-        for candidate in pool:
-            candidate["context_text"] = self._context(candidate, search_filter)
+        retrieval_warnings.extend(self._populate_context(pool, search_filter, reader))
         ranked = self.reranker.rerank(semantic_query, pool)
+        passage_validation = None
+        if self.validator is not None:
+            # Validate displayed transcript text, never title or surrounding hints.
+            native_scores = {str(r["id"]): r["rerank_score"] for r in ranked}
+            ranked, passage_validation = self.validator(query, ranked, speaker)
+            for result in ranked:
+                result["rerank_score"] = max(native_scores[str(identity)] for identity in result["segment_ids"])
+                result["score_type"] = "validated_passage_relevance"
+                result["match_types"].append("qdrant_maxsim_reranked")
+            ranked.sort(key=lambda r: (-r["rerank_score"], str(r["id"])))
+            passage_validation["qdrant_calls"] = reader.calls
+            passage_validation["qdrant_calls_scope"] = "source_collection_reads"
+            passage_validation["evaluation_scope"] = "retrieved_candidates"
+            passage_validation["retrieval_limits"] = {"seconds": 35, "qdrant_calls": 12, "query_variations": 2}
+            if retrieval_warnings:
+                passage_validation["status"] = "partial"
+                passage_validation["retryable"] = True
+                passage_validation["retrieval_warnings"] = retrieval_warnings
         # Rank videos by their best passage, keeping each video's passages together
         # so existing cursor pagination never splits a video into different pages.
         groups = defaultdict(list)
         for result in ranked:
             groups[result.get("video_id")].append(result)
         results = [r for group in groups.values() for r in group][:request.top_k]
+        if passage_validation is not None:
+            passage_validation["returned_counts"] = {
+                "videos": len({r.get("video_id") for r in results}),
+                "passages": len(results), "occurrences": None,
+            }
         return {
             "query": query, "words": request.words, "speaker_filter": speaker,
+            "query_decomposition": intent.get("query_decomposition"),
             "collection": self.collection, "search_mode": "semantic",
             "total_semantic_hits": len(pool), "total_speaker_hits": 0,
             "total_keyword_hits": 0, "total_title_hits": 0, "total_exact_phrase_hits": 0,
             "returned": len(results), "unique_videos": len({r.get("video_id") for r in results}),
+            "metadata": {"passage_validation": passage_validation},
             "filters_applied": {"video_id": request.video_id, "speaker": speaker,
                                 "title": request.title, "language": request.language,
                                 "time_range": request.time_range, "min_score": request.min_score},
             "ranking": {"engine": "qdrant_maxsim", "model": settings.model,
-                        "score_type": "bge_m3_mean_maxsim", "score_is_probability": False,
+                        "score_type": "validated_passage_relevance" if passage_validation is not None else "bge_m3_mean_maxsim",
+                        "rerank_score_type": "bge_m3_mean_maxsim", "score_is_probability": False,
                         "minimum_rerank_score": settings.minimum_rerank_score,
                         "candidates_reranked": len(pool), "candidate_limit": limit,
                         "context_seconds": settings.context_seconds,
+                        "retrieval_warnings": retrieval_warnings,
                         "query_understanding": intent.get("understanding_status", "enabled")},
             "results": results,
         }

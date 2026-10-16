@@ -3,8 +3,9 @@
 FastAPI service using OpenAI dense embeddings to retrieve transcript candidates,
 then **Qdrant native MaxSim multivector search** to rank contextual passages.
 The local `BAAI/bge-m3` model generates multilingual token vectors; Qdrant computes
-relevance. Semantic search has no GPT scoring prompt, weighted score blend, title
-score floor, or mandatory query-word overlap.
+relevance. The upstream evidence validator then requires complete-topic quotes and
+an independent verification pass before a passage can be returned. There is no
+weighted score blend, title score floor, or mandatory query-word overlap.
 
 ## Setup
 
@@ -60,13 +61,21 @@ and [embedding documentation](https://developers.openai.com/api/docs/models/text
    Deleted or changed source passages cannot reappear through the vector cache.
 6. Rank videos by their best passage and keep video groups together for pagination.
    Text and timestamps refer to the focus segment; `context_text` exposes nearby
-   evidence separately. Contextual relevance can come from this nearby evidence.
+   evidence separately. Context helps retrieval/ranking, but may not supply missing
+   evidence: the validator judges only the complete displayed transcript text.
+7. Apply the upstream bounded evidence validator and independent verifier to the
+   original request. Each required facet needs an exact transcript quote. Provider
+   failures return retryable 503 errors; partial validation is reported explicitly.
+   Only validated passages are returned, ranked by Qdrant MaxSim within video groups.
 
 All nonnumeric semantic queries, including single words and default `top_k=20`,
 follow this pipeline. `/search/incremental` delegates to it and caches the ranked
 set for pagination. `/search-multi-video` uses it with video-ID filters.
-Numeric-only queries retain literal simple text search. `search_mode="simple"`
-retains structured/fuzzy filters and does not call an LLM reranker.
+Numeric-only queries use simple transcript search. `search_mode="simple"` uses the
+upstream contracts for text, title, and summary; speaker/date/language/video filters
+retain their existing behavior. Summary searches retrieve transcript candidates and
+require LLM evidence verification, so they incur embedding and validation calls.
+Literal/normalized/alias transcript and title searches do not require an LLM.
 
 ```json
 {
@@ -78,9 +87,11 @@ retains structured/fuzzy filters and does not call an LLM reranker.
 ```
 
 `min_score` is the **initial dense retrieval threshold**. Response `dense_score`
-retains that similarity; `score` and `rerank_score` are BGE-M3 mean MaxSim scores
-(Qdrant sum divided by query-token count). They are **not probabilities or accuracy
-percentages**. `ranking` reports the model, candidate count, score type, context,
+retains that similarity. For semantic results, `score` and `llm_relevance_score`
+retain the upstream verified 0–1 relevance score; `rerank_score` holds BGE-M3 mean
+MaxSim (Qdrant sum divided by query-token count). Neither is a probability or
+accuracy percentage. Qdrant determines ordering; evidence validation determines
+admission. `ranking` reports the model, candidate count, score type, context,
 and query-understanding status. `SEMANTIC_CANDIDATE_LIMIT` bounds both inference
 work and the total reranked candidate set. `top_k` is an output maximum; fewer
 results may be returned. Increase candidate depth if constrained-speaker recall
@@ -89,7 +100,39 @@ is insufficient and your hardware can support it.
 The deprecated `USE_RERANKING`, `USE_SIMPLE_RERANKING`, `USE_QUERY_EXPANSION`,
 `OPENAI_ONLY_SEARCH`, and `query_decomposition_mode` switches no longer control
 semantic ranking. `USE_LLM_UNDERSTANDING=false` disables LLM interpretation and
-translation but retains native ranking. Existing simple filter parameters remain.
+translation but retains native ranking and mandatory passage validation. Existing
+simple filter parameters remain. These settings cannot disable evidence verification.
+
+## Preserved upstream contracts and optimizations
+
+- `transcript_contract="literal"`, `"normalized"` (default), or `"alias"` preserves
+  source spans, occurrence counts, utterance identities, and timestamp intervals.
+- `summary_candidates` accepts up to 60 client-selected videos with
+  `matched_summary_fields`. Summary metadata alone cannot establish a passage hit.
+- `search_contract` and `metadata.passage_validation` report authority, counts,
+  completeness, warnings, diagnostics, and retryability. Pagination carries them
+  forward unchanged, together with the ranking metadata.
+- Cursor caches are bound to the original query, filters, transcript contract and
+  supplied summary candidates. Changed sessions and expired/malformed cursors
+  return 409 instead of silently restarting or returning mismatched cached results.
+- `/embed-video` accepts `embedding_model`, `embedding_dimensions`, `run_id`, and
+  `timestamp_unit`. Model/dimension mismatches, nonseconds/invalid intervals, and
+  invalid batch numbering are rejected before queueing. Source payloads retain
+  normalized-index fields, transcript speaker labels and generation metadata.
+- Indexing stages batches in Redis by run ID and commits only the active completed
+  generation. The existing index survives embedding failures; obsolete IDs are
+  removed only after all replacement upserts succeed. Supply globally unique
+  `segment_index` values across batches. Legacy jobs without run IDs remain accepted.
+- `/operations/points` and `/operations/patch-timestamps` retain upstream strict API
+  authentication, bounded snapshots, hash preconditions, and rollback behavior.
+- Source reads retain the 35-second/12-call budget. Context reads are grouped per
+  video and incomplete context is reported. The shared validator retains its hard
+  60-candidate/6-call/30-second limits, including independent verification.
+- Complete validation results are cached for five minutes (128 entries) by model,
+  original query, speaker constraints and candidate content. Source eligibility is
+  checked on every fresh search. Changed content invalidates the validation cache;
+  partial/error responses are never cached. Existing cursor paging reuses its
+  validated snapshot and does not revalidate each page.
 
 ## Deployment and existing data
 
@@ -121,8 +164,33 @@ translation but retains native ranking. Existing simple filter parameters remain
 - These changes do not guarantee correctness. Before rollout, measure relevance
   and latency on labeled English, Urdu, and Roman Urdu queries, including compound
   concepts and no-match cases. Set `QDRANT_RERANK_MIN_SCORE` from those measurements.
-  No universal confidence cutoff is assumed. Without a cutoff, the API returns
-  the best matches above the dense threshold even if none fully answers the query.
+  No universal MaxSim confidence cutoff is assumed. The upstream evidence gate
+  requires every returned passage to support the complete request, but model
+  judgments still need evaluation against human-labeled examples.
+
+## Laravel caller alignment
+
+The `pakistan-clip-matters` caller now forwards original queries, date filters,
+transcript contracts and evidence without replacing Python ranking. Its React
+results preserve source occurrences and display partial/error states. Semantic
+pagination uses the Python cursor directly.
+
+Deploy both projects together. Laravel requires the generation-tracking migration,
+frontend rebuild, refreshed config and restarted queue workers. Set its
+`EMBEDDING_SERVICE_URL` to this API and `EMBEDDING_API_KEY` to the same `API_KEY`
+used by this API and the RQ worker. Its `EMBEDDING_MODEL` and
+`EMBEDDING_DIMENSIONS` must match `OPENAI_EMBEDDING_MODEL` and
+`EMBEDDING_DIMENSION` here. A new model/dimension still requires a compatible
+source collection; environment changes alone do not rebuild vectors.
+
+Laravel submits a generation ID, global segment indices, seconds timestamps and
+an HTTPS callback URL (`EMBEDDING_CALLBACK_URL`, defaulting to its `APP_URL` plus
+`/api/embeddings/callback`). The RQ worker authenticates callbacks using
+`X-API-Key`. Intermediate batches report processing; completed is sent only
+after the full generation commits, with its final count and collection. Laravel
+ignores stale generation callbacks. HTTP 202 means queued, not indexed.
+Let existing legacy jobs finish before switching the two deployments. See the
+Laravel project's `docs/embedding-service.md` for commands and environment sample.
 
 ## Validation
 
