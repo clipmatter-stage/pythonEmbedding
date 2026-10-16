@@ -67,6 +67,10 @@ class SearchApiTest(unittest.TestCase):
         cls.database.close()
 
     def setUp(self):
+        self.shared_cache = MemoryRedis()
+        cache_patch = patch.object(self.api, "search_cache_redis", self.shared_cache)
+        cache_patch.start()
+        self.addCleanup(cache_patch.stop)
         self.api.search_result_cache.clear()
         self.api.embedding_cache.clear()
         self.api.passage_validation_cache.clear()
@@ -145,6 +149,59 @@ class SearchApiTest(unittest.TestCase):
             self.assertEqual(2, judge.call_count)
         self.assertFalse(first["metadata"]["passage_validation"]["cache_hit"])
 
+    def test_completed_verification_is_reused_after_local_replica_cache_is_empty(self):
+        self.put(9048, "Children deserve protection.", video_id=9048)
+        self.production_service()
+        request = self.api.SearchRequest(query="rights", video_id=9048)
+        with patch.object(self.api, "judge_passage_batch", side_effect=self.evidence) as judge, patch.object(
+            self.api, "verify_passage_batch", side_effect=self.evidence,
+        ):
+            first = asyncio.run(self.api.search(request, True))
+            self.api.passage_validation_cache.clear()
+            second = asyncio.run(self.api.search(request, True))
+        self.assertEqual(1, judge.call_count)
+        self.assertEqual(first["results"][0]["id"], second["results"][0]["id"])
+        self.assertTrue(second["metadata"]["passage_validation"]["cache_hit"])
+        self.assertEqual(0, second["metadata"]["passage_validation"]["provider_calls"])
+
+    def test_search_session_survives_replica_local_cache_miss(self):
+        request = self.api.IncrementalSearchRequest(query="rights")
+        rows = [{"id": 1, "video_id": 1, "score": .9}, {"id": 2, "video_id": 2, "score": .8}]
+        self.api.cache_search_results("shared-session", rows, {"contract_binding": self.api.search_session_binding(request)})
+        self.api.search_result_cache.clear()
+        cursor = self.api.encode_cursor(1, .9, 0, "shared-session")
+        result = asyncio.run(self.api.search_incremental(request.model_copy(update={"cursor": cursor}), True))
+        self.assertEqual(2, result["results"][0]["id"])
+        self.assertTrue(result["metadata"]["cache_hit"])
+
+    def test_shared_cache_outage_does_not_fail_search(self):
+        from unittest.mock import Mock
+        self.put(9049, "Children deserve protection.", video_id=9049)
+        self.production_service()
+        unavailable = Mock()
+        unavailable.get.side_effect = ConnectionError("offline")
+        unavailable.set.side_effect = ConnectionError("offline")
+        with patch.object(self.api, "search_cache_redis", unavailable), patch.object(
+            self.api, "judge_passage_batch", side_effect=self.evidence,
+        ), patch.object(self.api, "verify_passage_batch", side_effect=self.evidence):
+            result = asyncio.run(self.api.search(self.api.SearchRequest(query="rights", video_id=9049), True))
+        self.assertEqual(1, len(result["results"]))
+        self.assertTrue(result["results"][0]["independently_verified"])
+
+    def test_default_validation_pool_is_bounded_and_shared_cache_never_stores_partial(self):
+        service = self.production_service()
+        candidates = [{"id": str(i), "video_id": i, "text": "Children deserve protection.", "score": .8,
+                       "start_time": 0, "end_time": 5, "speaker": "Alice"} for i in range(30)]
+        with patch.object(self.api, "judge_passage_batch", side_effect=self.evidence) as judge, patch.object(
+            self.api, "verify_passage_batch", side_effect=self.evidence,
+        ):
+            results, metadata = service.validator("rights", candidates, None)
+        self.assertEqual(20, len(results))
+        self.assertEqual(30, metadata["native_candidate_count"])
+        self.assertEqual(20, metadata["validation_candidate_limit"])
+        self.assertEqual(1, judge.call_count)
+        self.assertEqual("completed", metadata["status"])
+
     def test_literal_normalized_alias_contracts_reach_new_endpoint(self):
         self.put(9010, "IPP I.P.P. آئی پی پی ipp", video_id=9010)
         for contract, count in [("literal", 1), ("normalized", 3), ("alias", 4)]:
@@ -191,6 +248,7 @@ class SearchApiTest(unittest.TestCase):
                 ), True))
             self.assertEqual("search_session_mismatch", error.exception.detail["code"])
         self.api.search_result_cache.clear()
+        self.shared_cache.values.clear()
         with self.assertRaises(self.api.HTTPException) as error:
             asyncio.run(self.api.search_incremental(self.api.IncrementalSearchRequest(query="IPP", cursor=cursor), True))
         self.assertEqual("search_session_expired", error.exception.detail["code"])
@@ -358,6 +416,30 @@ class SearchApiTest(unittest.TestCase):
                 "identification_segments": [{"text": "Stale replacement", "start": 0, "end": 5}]})
         self.assertEqual({"status": "stale"}, response)
         self.assertEqual("Current source text.", self.database.retrieve(self.api.SEGMENTS_COLLECTION, [9035])[0].payload["text"])
+
+    def test_legacy_ui_cutoff_does_not_discard_low_cosine_verified_passages(self):
+        self.put(9047, "Children deserve protection.", video_id=9047)
+        service = self.production_service()
+        service.embed = lambda query: [.25, .96824584]
+        with patch.object(self.api, "judge_passage_batch", side_effect=self.evidence), patch.object(
+            self.api, "verify_passage_batch", side_effect=self.evidence,
+        ):
+            request = self.api.SearchRequest(query="rights", video_id=9047, min_score=.5)
+            response = asyncio.run(self.api.search(request, True))
+            strict = asyncio.run(self.api.search(request.model_copy(update={"min_score": .95}), True))
+        self.assertEqual(1, len(response["results"]))
+        self.assertLess(response["results"][0]["dense_score"], .35)
+        self.assertTrue(response["results"][0]["independently_verified"])
+        self.assertEqual([], strict["results"])
+
+    def test_roman_urdu_speaker_is_resolved_before_language_understanding(self):
+        query = "hafiz naeem nojawan ko namaz ki talqeen karte huwe"
+        with patch.object(self.api, "understand_query", return_value={"semantic_query": "نوجوانوں کو نماز کی تلقین", "query_type": "general"}) as analyze:
+            service = self.api.get_contextual_search()
+            intent = service.understand(query)
+        analyze.assert_called_once_with("nojawan ko namaz ki talqeen karte huwe")
+        self.assertEqual("speaker_search", intent["query_type"])
+        self.assertEqual("Hafiz Naeem Ur Rehman", intent["extracted_speaker"])
 
     def test_callback_sends_shared_api_key(self):
         from unittest.mock import Mock

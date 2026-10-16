@@ -66,6 +66,7 @@ def extract_meaningful_query_terms(text: str) -> List[str]:
 def decompose_semantic_query(
     query: str,
     canonical_speaker: Optional[str] = None,
+    speaker_aliases: Optional[List[str]] = None,
 ) -> Dict[str, object]:
     """Separate a known speaker constraint from the semantic topic.
 
@@ -93,9 +94,23 @@ def decompose_semantic_query(
     if not original or not canonical_speaker:
         return result
 
-    for pattern in _SPEAKER_TOPIC_PATTERNS:
+    patterns = list(_SPEAKER_TOPIC_PATTERNS)
+    # Roman Urdu action requests name the speaker before the audience/topic.
+    # Match only supplied, unambiguous names and preserve the complete action.
+    names = sorted({name.strip() for name in [canonical_speaker, *(speaker_aliases or [])]
+                    if name and len(name.split()) >= 2}, key=len, reverse=True)
+    roman_action = re.compile(
+        r"\b(?:talqeen|targheeb|hidayat|naseehat|dawat)\s+"
+        r"(?:kar(?:te|tay|ta|ti|na)|de(?:te|tay|na))\b", re.IGNORECASE)
+    roman_pattern = re.compile(
+        r"^\s*(?P<speaker>" + "|".join(re.escape(name) for name in names)
+        + r")\s+(?P<topic>.+?)\s*[?.!]*\s*$", re.IGNORECASE)
+    patterns.append(roman_pattern)
+    for pattern in patterns:
         match = pattern.match(original)
         if not match:
+            continue
+        if pattern is roman_pattern and not roman_action.search(match.group("topic")):
             continue
 
         topic = re.sub(r"\s+", " ", match.group("topic")).strip(" .?!")

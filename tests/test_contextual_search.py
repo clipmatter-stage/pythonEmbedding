@@ -14,7 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from qdrant_client import QdrantClient, models
 from contextual_search import (
     ContextualSearch, QdrantReranker, SearchInputError, SearchSettings,
-    nearby_passage, timestamp_url,
+    nearby_passage, source_passage, timestamp_url, cpu_thread_budget,
 )
 
 
@@ -74,6 +74,16 @@ class ContextualSearchTest(unittest.TestCase):
         self.assertEqual(2, response["ranking"]["candidates_reranked"])
         self.assertEqual(1.0, response["results"][0]["rerank_score"])
         self.assertNotIn("Children's rights", " ".join(self.encoder.calls))
+
+    def test_literal_topic_can_enter_native_reranking_below_dense_candidate_pool(self):
+        self.reranker.settings = replace(self.settings, candidate_limit=2)
+        self.put(3, "نماز education and protection", vector=[-1.0, 0.0])
+        self.service.understand = lambda query: {"semantic_query": query, "retrieval_terms": ["نماز"]}
+        response = self.service.search(request())
+        self.assertEqual(3, response["results"][0]["id"])
+        self.assertIsNone(response["results"][0]["dense_score"])
+        self.assertEqual(1, response["ranking"]["lexical_candidates"])
+        self.assertEqual(2, response["ranking"]["candidates_reranked"])
 
     def test_single_word_is_also_reranked(self):
         response = self.service.search(request(query="rights"))
@@ -192,11 +202,41 @@ class ContextualSearchTest(unittest.TestCase):
         self.assertEqual("That protects them.", focus["text"])
         self.assertEqual(20, focus["start_time"])
 
+    def test_validator_receives_adjacent_source_evidence_and_real_seek_times(self):
+        self.reranker.settings = replace(self.settings, context_seconds=20)
+        self.put(1, "They should pray.", video_id=1, start_time=20, end_time=25)
+        self.put(3, "Young people, listen.", video_id=1, start_time=15, end_time=20)
+        captured = []
+        def validate(query, candidates, speaker):
+            captured.extend(candidates)
+            row = next(r for r in candidates if r["id"] == 1)
+            return [{**row, "score": .9, "match_types": ["validated_passage"]}], {}
+        self.service.validator = validate
+        result = self.service.search(request(video_id=1))["results"][0]
+        self.assertEqual("Young people, listen. They should pray.", result["text"])
+        self.assertEqual([3, 1], result["segment_ids"])
+        self.assertEqual(15, result["start_time"])
+        self.assertEqual(25, result["end_time"])
+        self.assertEqual("Young people, listen.", result["source_utterances"][0]["text"])
+        self.assertNotIn("Preceding context:", result["text"])
+        self.assertNotIn("_source_passage", result)
+
     def test_known_speaker_prefilter_retrieves_within_the_speaker_subset(self):
         self.service.speaker_values = lambda name: [name]
         self.put(3, "education and protection", speaker="Bob")
         response = self.service.search(request(speaker="Bob"))
         self.assertEqual([3], [r["id"] for r in response["results"]])
+
+    def test_speaker_prefilter_uses_existing_text_index_without_keyword_requirement(self):
+        from unittest.mock import patch
+        self.service.speaker_values = lambda name: [name]
+        self.service.speaker_index_types = {"speaker": "text"}
+        self.put(3, "education and protection", speaker="Bob")
+        with patch.object(self.client, "query_points", wraps=self.client.query_points) as queries:
+            response = self.service.search(request(speaker="Bob"))
+        self.assertEqual([3], [r["id"] for r in response["results"]])
+        condition = queries.call_args_list[0].kwargs["query_filter"].must[-1].should[0]
+        self.assertIsInstance(condition.match, models.MatchText)
 
     def test_words_contribute_once_to_semantic_meaning(self):
         captured = []
@@ -221,6 +261,27 @@ class ContextualSearchTest(unittest.TestCase):
 
 
 class ContextWindowTest(unittest.TestCase):
+    def test_inference_thread_budget_respects_cpu_quota_instead_of_host_core_count(self):
+        from unittest.mock import patch
+        with patch("contextual_search.os.cpu_count", return_value=48), patch(
+            "contextual_search.Path.read_text", return_value="800000 100000",
+        ), patch.dict("os.environ", {"QDRANT_RERANK_CPU_THREADS": "48"}):
+            self.assertEqual(8, cpu_thread_budget())
+        with patch("contextual_search.os.cpu_count", return_value=48), patch(
+            "contextual_search.Path.read_text", return_value="50000 100000",
+        ):
+            self.assertEqual(1, cpu_thread_budget())
+
+
+    def test_source_passage_does_not_join_other_speakers_or_noncontiguous_turns(self):
+        focus = dict(id=1, video_id=1, speaker="Alice", start_time=20, end_time=25, text="Pray regularly.")
+        wrong = {**focus, "id": 2, "speaker": "Bob", "start_time": 15, "end_time": 20, "text": "Young people."}
+        distant = {**focus, "id": 3, "start_time": 1, "end_time": 5, "text": "Young people."}
+        self.assertEqual({}, source_passage(focus, [wrong, distant], 20))
+        unknown = {**focus, "speaker": "Unknown Speaker"}
+        self.assertEqual({}, source_passage(unknown, [{**wrong, "speaker": "Unknown Speaker"}], 20))
+
+
     def test_context_preserves_focus_and_excludes_other_speakers_videos_and_distant_text(self):
         focus = dict(video_id=1, speaker="Alice", start_time=20, end_time=30, text="That protects them.")
         before = dict(video_id=1, speaker="Alice", start_time=10, end_time=20, text="We discussed children's rights.")

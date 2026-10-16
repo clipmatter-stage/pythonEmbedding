@@ -320,7 +320,7 @@ def requested_speaker_names(query, aliases, explicit=None):
                 continue
             match = re.match(r'^(?:(?:find|show)(?: me)?(?: clips?)?\s+)?(?:(?:where|what did)\s+)?' + re.escape(alias) + r'(?:\s+|$)(.*)$', normalized)
             if match and (not match.group(1) or re.search(
-                r'^(?:talk|speak|discuss|speech|say|said|spoke|encourag|urging|ne\b|نے\b|نوجوان|طلبہ|students|youth|naujawan|ki speech|کا خطاب|کی تقریر|خطاب)', match.group(1))):
+                r'^(?:talk|speak|discuss|speech|say|said|spoke|encourag|urging|ne\b|نے\b|نوجوان|طلبہ|students|youth|n[ao]u?jaw[ao]n|ki speech|کا خطاب|کی تقریر|خطاب)', match.group(1))):
                 return list(dict.fromkeys([data['canonical']] + list(data.get('speaker_variants', []))))
     return [explicit] if explicit else []
 

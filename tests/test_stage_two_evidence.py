@@ -77,6 +77,7 @@ class StageTwoEvidenceTest(unittest.TestCase):
         self.assertEqual([], requested_speaker_names('naeem education policy', aliases))
         self.assertEqual([], requested_speaker_names('Students discuss Hafiz Naeem policies', aliases))
         self.assertIn('حافظ نعیم', requested_speaker_names('Hafiz Naeem encouraging young people to pray', aliases))
+        self.assertIn('حافظ نعیم', requested_speaker_names('hafiz naeem nojawan ko namaz ki talqeen karte huwe', aliases))
 
     def test_relevant_candidates_below_30_and_strict_budget(self):
         calls = []

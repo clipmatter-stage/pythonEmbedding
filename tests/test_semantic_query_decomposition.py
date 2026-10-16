@@ -57,6 +57,17 @@ class SemanticQueryDecompositionTest(unittest.TestCase):
             }
             self.assertFalse(passes_structured_topic_validation(result, "education"))
 
+    def test_roman_urdu_action_keeps_audience_and_complete_topic(self):
+        query = "hafiz naeem nojawan ko namaz ki talqeen karte huwe"
+        result = decompose_semantic_query(query, "Hafiz Naeem Ur Rehman", ["hafiz naeem"])
+        self.assertTrue(result["decomposed"])
+        self.assertEqual("nojawan ko namaz ki talqeen karte huwe", result["retrieval_query"])
+        self.assertEqual("Hafiz Naeem Ur Rehman", result["speaker"])
+        self.assertFalse(decompose_semantic_query(
+            "hafiz naeem ki talqeen par tanqeed", "Hafiz Naeem Ur Rehman", ["hafiz naeem"],
+        )["decomposed"])
+        self.assertFalse(decompose_semantic_query(query)["decomposed"])
+
     def test_decomposes_client_speaker_topic_phrase(self):
         result = decompose_semantic_query(
             "Hafiz Naeem ur Rehman Speech on Constitution of Pakistan",

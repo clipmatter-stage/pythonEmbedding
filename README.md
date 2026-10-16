@@ -32,6 +32,14 @@ new jobs use `embeddings_service.process_video_task`.
 Loading `.env` is the responsibility of the shell or deployment; starting the
 Python module does not load it automatically.
 
+In Railway, check the **web service's Custom Start Command**. Set it to
+`bash start.sh` (or clear it to use Docker's CMD). A saved command such as
+`python embeddings_test.py` overrides Docker and continues running the legacy
+service even when the latest image builds successfully. Keep the worker's
+separate RQ start command. Redeploy web after changing this setting.
+Verify the public `GET /` response reports `version: "7.3"` and
+`ai_features.reranking_engine: "qdrant_maxsim"` before evaluating searches.
+
 The default text model is `gpt-6-luna` for focused query understanding, translation,
 and ingestion summaries. Verify access in your OpenAI account, or override
 `OPENAI_TEXT_MODEL` with a compatible Chat Completions model. Requests use
@@ -82,18 +90,34 @@ Literal/normalized/alias transcript and title searches do not require an LLM.
   "query": "Hafiz Naeem speech on children's rights",
   "search_mode": "semantic",
   "top_k": 20,
-  "min_score": 0.35
+  "min_score": 0.0
 }
 ```
 
-`min_score` is the **initial dense retrieval threshold**. Response `dense_score`
-retains that similarity. For semantic results, `score` and `llm_relevance_score`
+`min_score` now filters the **final verified relevance score**, not dense cosine.
+Older UI requests containing `min_score: 0.50` therefore cannot discard a valid
+passage before reranking. The default is 0.0; mandatory evidence validation still
+requires complete, independently verified support. `dense_score` retains the
+initial similarity (or is null for a full-text-only candidate). For semantic results, `score` and `llm_relevance_score`
 retain the upstream verified 0–1 relevance score; `rerank_score` holds BGE-M3 mean
 MaxSim (Qdrant sum divided by query-token count). Neither is a probability or
 accuracy percentage. Qdrant determines ordering; evidence validation determines
 admission. `ranking` reports the model, candidate count, score type, context,
 and query-understanding status. `SEMANTIC_CANDIDATE_LIMIT` bounds both inference
-work and the total reranked candidate set. `top_k` is an output maximum; fewer
+work and the total reranked candidate set (default 60). Bounded topic terms from query understanding can recover
+candidates using the existing transcript text index; these get no score boost.
+Qdrant orders the combined pool. Evidence validation checks the best 20 native
+ranked passages by default (`SEARCH_VALIDATION_CANDIDATE_LIMIT`, maximum 60).
+Increasing this limit deepens coverage at the cost of latency and model calls.
+A completed validation means that bounded selection was evaluated; it does not
+mean the entire collection was exhaustively searched. Complete judgments are
+shared through Redis for five minutes, and cursor snapshots for 30 minutes, so
+all web replicas can reuse them. Cache failures fall back to live evaluation;
+partial/error judgments are not cached. The speaker prefilter supports existing keyword
+or text indexes without replacing either. Adjacent same-speaker source turns
+may form a displayed passage with their real IDs, text and seek times; context
+labels and other speakers never become evidence. `ranking.timings` reports
+understanding, retrieval, context, reranking and validation durations. `top_k` is an output maximum; fewer
 results may be returned. Increase candidate depth if constrained-speaker recall
 is insufficient and your hardware can support it.
 
@@ -141,7 +165,9 @@ simple filter parameters remain. These settings cannot disable evidence verifica
   [Native ranking documentation](https://qdrant.tech/documentation/search/hybrid-queries/)
   and [BGE-M3 usage and MIT license](https://huggingface.co/BAAI/bge-m3).
 - BGE-M3 requires a multi-GB model download and substantial RAM. CPU cold inference
-  can be slow; GPU inference is recommended for sustained traffic. On a CUDA host,
+  can be slow; GPU inference is recommended for sustained traffic. CPU inference threads are
+  capped to the container quota (at most 8 by default), with tokenizer thread
+  parallelism disabled by default. `QDRANT_RERANK_CPU_THREADS` can lower this cap. On a CUDA host,
   configure suitable PyTorch and `QDRANT_RERANK_DEVICE=cuda:0`. Batch/token limits
   bound memory; inference is serialized per process. Multiple API workers each
   load their own model copy.
