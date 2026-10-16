@@ -2242,6 +2242,9 @@ logger.info("Connecting to Qdrant...")
 qdrant_client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY, timeout=120)
 logger.info("Connected to Qdrant successfully")
 
+from index_operations import register_index_operations
+register_index_operations(app, qdrant_client, SEGMENTS_COLLECTION, redis_conn, API_KEY)
+
 def create_segments_collection():
     try:
         collections = qdrant_client.get_collections().collections

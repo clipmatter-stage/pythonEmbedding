@@ -22,6 +22,7 @@ COPY embeddings_test.py .
 COPY semantic_query_decomposition.py .
 COPY semantic_passage_evidence.py .
 COPY transcript_search_contract.py .
+COPY index_operations.py .
 COPY search_contract_v1.json .
 COPY backfill_transcript_contract.py .
 RUN python -c "from transcript_search_contract import match_spans; assert match_spans('I.P.P.', 'IPP')"
