@@ -18,7 +18,10 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application code
+COPY embeddings_service.py .
 COPY embeddings_test.py .
+COPY contextual_search.py .
+COPY worker.py .
 COPY semantic_query_decomposition.py .
 COPY semantic_passage_evidence.py .
 COPY transcript_search_contract.py .
@@ -33,6 +36,7 @@ COPY start.sh .
 # malformed, or accidentally contains a self-import. This prevents Railway
 # from deploying an image that can only crash-loop at container startup.
 RUN python -c "from semantic_query_decomposition import build_structured_rerank_fallback, decompose_semantic_query, extract_meaningful_query_terms, has_conceptual_topic_evidence, has_complete_facet_coverage, passes_structured_topic_validation, recover_empty_structured_rerank; assert all(callable(fn) for fn in (build_structured_rerank_fallback, decompose_semantic_query, extract_meaningful_query_terms, has_conceptual_topic_evidence, has_complete_facet_coverage, passes_structured_topic_validation, recover_empty_structured_rerank))"
+RUN python -m py_compile embeddings_service.py embeddings_test.py contextual_search.py worker.py
 
 RUN python -c "from semantic_passage_evidence import validate_passages, BoundedRetrieval, requested_speaker_names; assert all(callable(fn) for fn in (validate_passages, BoundedRetrieval, requested_speaker_names))"
 
@@ -50,4 +54,4 @@ EXPOSE 9000
 
 # Start command - Railway will inject environment variables at runtime
 # Python script will read PORT from environment and default to 9000
-CMD ["python", "embeddings_test.py"]
+CMD ["bash", "start.sh"]

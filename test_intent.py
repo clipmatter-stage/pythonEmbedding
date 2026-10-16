@@ -1,7 +1,7 @@
 import sys
 import json
 import asyncio
-from embeddings_test import analyze_query_intent
+from embeddings_service import analyze_query_intent
 
 async def main():
     query = "speech on electric bill  and load shedding"

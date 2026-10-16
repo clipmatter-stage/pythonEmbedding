@@ -4,5 +4,5 @@
 
 echo "Starting application..."
 
-# Run Python directly - it will read PORT from environment
-exec python -u embeddings_test.py
+# Use the new implementation; keep embeddings_test.py as the legacy service.
+exec python -u embeddings_service.py

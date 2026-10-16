@@ -1,7 +1,7 @@
 import sys
 import json
 import asyncio
-from embeddings_test import search
+from embeddings_service import search
 
 async def main():
     try:

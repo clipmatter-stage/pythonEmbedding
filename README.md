@@ -1,249 +1,137 @@
-# Video Transcript ADVANCED Search API v5.0
+# Contextual video transcript search
 
-A **TOP-LEVEL ACCURACY** FastAPI service for semantic search over video transcripts powered by OpenAI embeddings, GPT query expansion, and Cohere reranking.
-
-## 🚀 Advanced Features (v5.0)
-
-### World-Class Search Accuracy
-- 🤖 **OpenAI Embeddings** - text-embedding-3-large (3072-dim) for superior semantic understanding
-- 🎯 **GPT Query Expansion** - Automatically expands queries with synonyms for 3-5x better recall
-- 🏆 **Cohere Reranking** - State-of-the-art reranking for 2-4x better relevance
-- 🔍 **Semantic Search** - AI-powered search using advanced embeddings
-- ⚡ **Fuzzy Matching** - Typo-tolerant search (e.g., "Muhamad" matches "Muhammad")
-- 💾 **Smart Caching** - Query caching (1000 queries, 1 hour TTL)
-- 🎨 **HNSW Tuning** - Optimized vector search parameters (ef=128)
-
-### Security & Performance
-- 🔐 **API Key Authentication** - Optional API key protection
-- ⚡ **Rate Limiting** - Prevents abuse (configurable)
-- 📝 **Input Validation** - Pydantic models for all inputs
-- 📊 **Proper Logging** - Structured logging
-- 🚀 **Railway Ready** - Configured for Railway deployment
-
-## 📊 Performance Improvements
-
-| Feature | Improvement | Impact |
-|---------|-------------|---------|
-| OpenAI Embeddings | 10x better | Semantic understanding |
-| Query Expansion | 3-5x better | Search recall |
-| Cohere Reranking | 2-4x better | Result relevance |
-| Overall Accuracy | **TOP LEVEL** | Best in class |
+FastAPI service using OpenAI dense embeddings to retrieve transcript candidates,
+then **Qdrant native MaxSim multivector search** to rank contextual passages.
+The local `BAAI/bge-m3` model generates multilingual token vectors; Qdrant computes
+relevance. Semantic search has no GPT scoring prompt, weighted score blend, title
+score floor, or mandatory query-word overlap.
 
 ## Setup
 
-### 1. Environment Variables
+Use Python 3.11 or 3.12 with a supported PyTorch installation:
 
-Copy `.env.example` to `.env` and configure:
-
-```bash
-cp .env.example .env
-```
-
-Required variables:
-```env
-# Qdrant (Required)
-QDRANT_URL=https://your-qdrant-instance.cloud.qdrant.io:6333
-QDRANT_API_KEY=your-qdrant-api-key
-
-# OpenAI (Required for advanced features)
-OPENAI_API_KEY=sk-your-openai-key
-USE_OPENAI_EMBEDDINGS=true
-OPENAI_EMBEDDING_MODEL=text-embedding-3-large
-EMBEDDING_DIMENSION=3072
-ENSURE_INDEXES_ON_STARTUP=true
-
-# Cohere (Optional but highly recommended)
-COHERE_API_KEY=your-cohere-key
-USE_RERANKING=true
-
-# Query Expansion (Optional)
-USE_QUERY_EXPANSION=true
-
-# Optional Security
-API_KEY=your-api-key-for-clients  # Leave empty to disable auth
-RATE_LIMIT_REQUESTS=100
-RATE_LIMIT_WINDOW=60
-LOG_LEVEL=INFO
-```
-
-`ENSURE_INDEXES_ON_STARTUP=true` is recommended so Qdrant payload/text indexes are created on boot for faster filtering and keyword queries.
-
-### 2. Install Dependencies
-
-```bash
+```sh
+python3.11 -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
+cp .env.example .env
+# Fill in credentials and export/load .env in your deployment environment.
+uvicorn embeddings_service:app --host 0.0.0.0 --port 9000
 ```
 
-### 3. Get API Keys
+Run Redis and the existing RQ video-processing worker for `/embed-video` jobs.
+Docker/Railway and the Procfile use `start.sh`, which starts
+`embeddings_service.py` with unbuffered logging. Run `python worker.py` as a
+separate worker process with the same environment variables.
+After pulling this change, rebuild and redeploy the image so the renamed module
+and new dependencies are installed. Startup does not run a vector migration.
+`embeddings_test.py` retains the legacy upstream implementation. Previously queued
+`embeddings_test.process_video_task` jobs still resolve to that implementation;
+new jobs use `embeddings_service.process_video_task`.
+Loading `.env` is the responsibility of the shell or deployment; starting the
+Python module does not load it automatically.
 
-#### OpenAI API Key (Required for Advanced Features)
-1. Go to [https://platform.openai.com/api-keys](https://platform.openai.com/api-keys)
-2. Create account or sign in
-3. Click "Create new secret key"
-4. Copy the key to your `.env` file
+The default text model is `gpt-6-luna` for focused query understanding, translation,
+and ingestion summaries. Verify access in your OpenAI account, or override
+`OPENAI_TEXT_MODEL` with a compatible Chat Completions model. Requests use
+`max_completion_tokens` and `reasoning_effort="none"`, without sampling parameters.
+An override must support these parameters. `text-embedding-3-large` remains the
+most capable OpenAI embedding model, so its 3072-dimensional default is retained.
+See the [OpenAI model catalog](https://developers.openai.com/api/docs/models)
+and [embedding documentation](https://developers.openai.com/api/docs/models/text-embedding-3-large).
 
-**Cost Estimates:**
-- text-embedding-3-large: $0.13 per 1M tokens (~1M words = $1-2)
-- text-embedding-3-small: $0.02 per 1M tokens (~1M words = $0.20)
-- GPT-3.5-turbo (query expansion): $0.50-1.50 per 1M tokens
+## Search behavior
 
-#### Cohere API Key (Optional but Recommended for Reranking)
-1. Go to [https://dashboard.cohere.com/api-keys](https://dashboard.cohere.com/api-keys)
-2. Sign up for free account
-3. Copy API key to `.env`
+1. Parse the full query meaning and an explicit spoken-by constraint. Known
+   speaker-plus-topic phrases are decomposed conservatively before LLM analysis.
+2. Retrieve candidates using OpenAI embeddings of the topic and, when available,
+   its translation. English queries do not automatically exclude Urdu videos.
+3. Enforce searchable-video eligibility, video/language/date/time constraints,
+   and explicit speaker/title constraints. Known speaker variants are filtered
+   before retrieval; arbitrary fuzzy speaker/title constraints are post-filtered
+   within the bounded candidate pool.
+4. Build a passage from the focus transcript plus the nearest preceding/following
+   same-speaker segments within `SEARCH_CONTEXT_SECONDS`. Context is restricted
+   to the same eligible video and caller filters. Titles are excluded as evidence.
+   The focus comes first so token truncation cannot discard it in favor of context.
+   Unknown-speaker segments do not inherit other turns.
+5. Encode passages with BGE-M3, cache token vectors by content/model/settings in a
+   separate collection, and ask Qdrant to rank only current source candidate IDs.
+   Deleted or changed source passages cannot reappear through the vector cache.
+6. Rank videos by their best passage and keep video groups together for pagination.
+   Text and timestamps refer to the focus segment; `context_text` exposes nearby
+   evidence separately. Contextual relevance can come from this nearby evidence.
 
-**Free Tier:** 1,000 rerank requests/month (usually sufficient)
+All nonnumeric semantic queries, including single words and default `top_k=20`,
+follow this pipeline. `/search/incremental` delegates to it and caches the ranked
+set for pagination. `/search-multi-video` uses it with video-ID filters.
+Numeric-only queries retain literal simple text search. `search_mode="simple"`
+retains structured/fuzzy filters and does not call an LLM reranker.
 
-### 4. Configure Embedding Strategy
-
-Choose your embedding approach:
-
-**Option A: Maximum Accuracy (Recommended)**
-```env
-USE_OPENAI_EMBEDDINGS=true
-OPENAI_EMBEDDING_MODEL=text-embedding-3-large
-EMBEDDING_DIMENSION=3072
-USE_QUERY_EXPANSION=true
-USE_RERANKING=true
-```
-Cost: ~$0.15-0.30 per 1000 searches | Accuracy: TOP LEVEL ⭐⭐⭐⭐⭐
-
-**Option B: Balanced (Good quality, lower cost)**
-```env
-USE_OPENAI_EMBEDDINGS=true
-OPENAI_EMBEDDING_MODEL=text-embedding-3-small
-EMBEDDING_DIMENSION=1536
-USE_QUERY_EXPANSION=false
-USE_RERANKING=true
-```
-Cost: ~$0.03-0.05 per 1000 searches | Accuracy: Excellent ⭐⭐⭐⭐
-
-**Option C: Free (Basic quality)**
-```env
-USE_OPENAI_EMBEDDINGS=false
-EMBEDDING_DIMENSION=384
-USE_QUERY_EXPANSION=false
-USE_RERANKING=false
-```
-Cost: FREE | Accuracy: Good ⭐⭐⭐
-
-### 5. Run Locally
-
-```bash
-python embeddings_test.py
-# or
-uvicorn embeddings_test:app --reload --port 9000
+```json
+{
+  "query": "Hafiz Naeem speech on children's rights",
+  "search_mode": "semantic",
+  "top_k": 20,
+  "min_score": 0.35
+}
 ```
 
-## API Endpoints
+`min_score` is the **initial dense retrieval threshold**. Response `dense_score`
+retains that similarity; `score` and `rerank_score` are BGE-M3 mean MaxSim scores
+(Qdrant sum divided by query-token count). They are **not probabilities or accuracy
+percentages**. `ranking` reports the model, candidate count, score type, context,
+and query-understanding status. `SEMANTIC_CANDIDATE_LIMIT` bounds both inference
+work and the total reranked candidate set. `top_k` is an output maximum; fewer
+results may be returned. Increase candidate depth if constrained-speaker recall
+is insufficient and your hardware can support it.
 
-| Method | Endpoint | Description | Auth Required |
-|--------|----------|-------------|---------------|
-| POST | `/embed-video` | Embed video transcript | Yes |
-| POST | `/search` | Elastic search | Yes |
-| POST | `/search-by-title` | Search by video title | Yes |
-| POST | `/suggest` | Autocomplete suggestions | Yes |
-| GET | `/video/{id}/segments` | Get video segments | Yes |
-| DELETE | `/video/{id}/embeddings` | Delete embeddings | Yes |
-| GET | `/health` | Health check | No |
-| GET | `/stats` | Collection stats | No |
+The deprecated `USE_RERANKING`, `USE_SIMPLE_RERANKING`, `USE_QUERY_EXPANSION`,
+`OPENAI_ONLY_SEARCH`, and `query_decomposition_mode` switches no longer control
+semantic ranking. `USE_LLM_UNDERSTANDING=false` disables LLM interpretation and
+translation but retains native ranking. Existing simple filter parameters remain.
 
-## Authentication
+## Deployment and existing data
 
-If `API_KEY` is set, include header in requests:
+- Use a Qdrant server supporting multivectors (1.10+; 1.17+ recommended), with the
+  client version in `requirements.txt`. No provider key is needed for BGE-M3.
+  [Native ranking documentation](https://qdrant.tech/documentation/search/hybrid-queries/)
+  and [BGE-M3 usage and MIT license](https://huggingface.co/BAAI/bge-m3).
+- BGE-M3 requires a multi-GB model download and substantial RAM. CPU cold inference
+  can be slow; GPU inference is recommended for sustained traffic. On a CUDA host,
+  configure suitable PyTorch and `QDRANT_RERANK_DEVICE=cuda:0`. Batch/token limits
+  bound memory; inference is serialized per process. Multiple API workers each
+  load their own model copy.
+- The Qdrant key must create/read/write the rerank collection. Token vectors use
+  an on-disk configuration without HNSW, since only known candidates are rescored.
+  They are generated on demand: **no destructive schema migration or full backfill
+  is required to start**.
+- The persistent vector cache grows with distinct content/settings. To reclaim
+  stale vectors, stop API workers, recreate **only the rerank cache collection**,
+  then restart. It rebuilds on demand. Do not delete source data for maintenance.
+- New ingestion embeds same-speaker contextual passages. To improve initial
+  retrieval for existing short fragments, back up your source collection, then
+  invoke authenticated `POST /re-embed-all`. It updates dense vectors in place
+  and can incur embedding costs. It is not run automatically. Reranking cannot
+  recover passages that were never retrieved.
+- Keep the source embedding model and dimensions consistent. Changing either
+  requires a full rebuild, preferably into a new `SEGMENTS_COLLECTION`. OpenAI
+  failures propagate instead of padding unrelated FastEmbed vectors into the
+  OpenAI vector space. Rebuild any older fallback vectors with the OpenAI model.
+- These changes do not guarantee correctness. Before rollout, measure relevance
+  and latency on labeled English, Urdu, and Roman Urdu queries, including compound
+  concepts and no-match cases. Set `QDRANT_RERANK_MIN_SCORE` from those measurements.
+  No universal confidence cutoff is assumed. Without a cutoff, the API returns
+  the best matches above the dense threshold even if none fully answers the query.
 
-```bash
-curl -X POST https://your-api.railway.app/search \
-  -H "X-API-Key: your-api-key" \
-  -H "Content-Type: application/json" \
-  -d '{"query": "machine learning"}'
+## Validation
+
+```sh
+python -m unittest discover -s tests -v
 ```
 
-## Security Best Practices
-
-1. **Never commit `.env`** - It's in `.gitignore`
-2. **Use environment variables** - All secrets from env vars
-3. **Enable API key** - Set `API_KEY` in production
-4. **Configure CORS** - Set `CORS_ORIGINS` for your domains
-
-## Railway Deployment
-
-### Secure Secret Management
-
-This project uses a custom Dockerfile (not Nixpacks) to avoid embedding secrets in the Docker image.
-
-**⚠️ IMPORTANT: Secrets are injected at runtime by Railway, NOT baked into the Docker image.**
-
-### Deployment Steps
-
-1. **Push to GitHub**
-   ```bash
-   git add .
-   git commit -m "Add secure Dockerfile"
-   git push origin main
-   ```
-
-2. **Connect to Railway**
-   - Go to [railway.app](https://railway.app)
-   - Create new project from GitHub repo
-   - Railway will detect the Dockerfile automatically
-
-3. **Configure Environment Variables in Railway Dashboard**
-   
-   Go to your project → Variables tab and add:
-   
-   | Variable | Value | Required |
-   |----------|-------|----------|
-   | `QDRANT_URL` | Your Qdrant instance URL | ✅ Yes |
-   | `QDRANT_API_KEY` | Your Qdrant API key | ✅ Yes |
-   | `API_KEY` | Your custom API key | ⚠️ Recommended |
-   | `PORT` | Auto-set by Railway | ✅ Auto |
-   | `LOG_LEVEL` | INFO | Optional |
-   | `RATE_LIMIT_REQUESTS` | 100 | Optional |
-   | `RATE_LIMIT_WINDOW` | 60 | Optional |
-   | `CORS_ORIGINS` | * or your domains | Optional |
-
-4. **Deploy**
-   - Railway will automatically build and deploy
-   - Check logs for any errors
-   - Test with: `https://your-app.railway.app/health`
-
-### Why Custom Dockerfile?
-
-The custom Dockerfile:
-- ✅ Does NOT use `ARG` or `ENV` for secrets (Docker security best practice)
-- ✅ Expects secrets from Railway environment variables at runtime
-- ✅ Uses multi-stage builds for smaller image size
-- ✅ Runs as non-root user for security
-- ✅ Includes health checks
-
-### Troubleshooting
-
-**Error: "Missing required environment variables"**
-- Ensure `QDRANT_URL` and `QDRANT_API_KEY` are set in Railway Variables tab
-
-**Error: "401 Unauthorized"**
-- If `API_KEY` is set, include `X-API-Key` header in requests
-- To disable auth, remove `API_KEY` variable
-
-**Build fails**
-- Check Railway build logs
-- Ensure `requirements.txt` is up to date
-- Verify Dockerfile syntax
-
-### Testing Your Deployment
-
-```bash
-# Health check
-curl https://your-app.railway.app/health
-
-# Search (with API key)
-curl -X POST https://your-app.railway.app/search \
-  -H "X-API-Key: your-api-key" \
-  -H "Content-Type: application/json" \
-  -d '{"query": "machine learning", "top_k": 5}'
-```
-
-## License
-
-MIT
+Tests use real local Qdrant with deterministic token vectors and a mocked OpenAI
+transport. They cover ordering, default/single-word searches, cross-language
+filters, eligibility, context isolation, cache freshness, provider errors, Chat
+Completions parameters, and cursor pagination. They do not measure model semantic
+accuracy or call live OpenAI/Qdrant services.
