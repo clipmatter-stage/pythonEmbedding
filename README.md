@@ -1,9 +1,8 @@
 # Video transcript search
 
 `embeddings_service.py` preserves the legacy API and indexing contracts while
-using a faster semantic retrieval pipeline by default. `embeddings_test.py` is
-unchanged. Production remains on its saved Railway legacy start command until
-you explicitly switch it.
+using a faster semantic retrieval pipeline by default. `embeddings_test.py` remains available for legacy jobs and endpoints. The Docker image retains its legacy default command; the Railway API
+uses the modern service when its custom start command is `bash start.sh`.
 
 ## Setup
 
@@ -26,7 +25,33 @@ The Docker image includes both implementations and still defaults to the legacy
 script. To select the new service, set Railway's web Custom Start Command to
 `bash start.sh`, or run that command locally. Rebuild the image first. Leave the
 worker's separate RQ command in place. Verify `GET /` reports version `8.1` and
-`ai_features.search_pipeline: fast`. No deployment or migration is automatic.
+`ai_features.search_pipeline: fast`. Sparse-index migrations are explicit operations; pushing to a Railway-linked
+branch can deploy automatically according to that service's settings.
+
+## Phase 3 exact search and worker callbacks
+
+The deterministic `/search/exact` path uses `exact_cursor_v1` with the shared
+`transcript_contract_v2` matching rules. Continue using the opaque returned
+cursor until `counts_final=true`; an empty partial page is not a final no-match.
+Cursor expiry, authorization changes and index changes require a new search.
+This path makes no embedding or generative model requests.
+
+Phase 3 requires no new Railway environment variable. In **both** API and RQ
+worker services, configure the same `API_KEY`, `REDIS_URL`, `QDRANT_URL`,
+`QDRANT_API_KEY`, `OPENAI_API_KEY`, `USE_OPENAI_EMBEDDINGS=true`,
+`OPENAI_EMBEDDING_MODEL=text-embedding-3-large` and `EMBEDDING_DIMENSION=3072`.
+Use the current index's compatible model/dimensions; these are not migration
+instructions. `API_KEY` must match Laravel's `EMBEDDING_API_KEY`. Variables on
+one Railway service are not proof that the other service receives them.
+
+New jobs carry generation-scoped callback credentials issued by the API.
+Legacy queued jobs still need the worker's shared `API_KEY`. The read-only
+`/operations/callback-probe` queues the real processing worker and distinguishes
+legacy shared-key delivery from job-token delivery without embedding a video.
+`CALLBACK_ALLOWED_HOSTS=clip.digitalmatters.pk` is optional and already the code
+default; change it only when the callback host changes. Laravel's
+`EMBEDDING_EXACT_CURSOR_ENABLED` setting belongs in Laravel, not Python Railway.
+Deploy/restart both services after changing their variables.
 
 ## Fast search (default)
 
