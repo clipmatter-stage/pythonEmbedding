@@ -1,14 +1,14 @@
 """Diverse semantic candidates -> original nearby turns -> one grounded rerank.
 No embedding-space change or new identity assertions. Exact matching is separate.
 """
-import copy,hashlib,json,time,os
+import copy,hashlib,json,time,os,re
 from dataclasses import asdict
 from collections import defaultdict
 from qdrant_client import models
-from contextual_search import source_filter,source_passage
+from contextual_search import source_filter
 from grounded_validation import VERSION,SYSTEM,validate_grounded,candidate_id
 from semantic_passage_evidence import ValidationUnavailable
-from transcript_search_contract import CONFIG,normalize,valid_interval
+from transcript_search_contract import CONFIG,normalize,valid_interval,GROUNDED_STRATEGY_VERSION
 FIELDS=['video_id','text','speaker','transcript_speaker','diarization_speaker','start_time','end_time','timestamp_unit','video_title','youtube_url','language','video_created_at']
 def diverse(rows,limit,key="retrieval_score"):
     groups=defaultdict(list)
@@ -28,54 +28,173 @@ def semantic_gloss(query):
         if value in normalized:extras.extend([canonical,*aliases])
     return query if not extras else query+' ('+'; '.join(dict.fromkeys(extras))+')'
 
+def coherent_passage(focus, neighbors):
+    """Extend only adjacent original turns with the same source speaker label."""
+    from contextual_search import timestamp_url
+    current=focus.copy()
+    ordered=sorted([focus,*[r for r in neighbors if str(r['id'])!=str(focus['id'])
+                    and r.get('video_id')==focus.get('video_id')and valid_interval(r)]],key=lambda r:(r['start_time'],r['end_time']))
+    center=next(i for i,r in enumerate(ordered)if str(r['id'])==str(focus['id']))
+    turns=[focus];label=focus.get('transcript_speaker')or focus.get('diarization_speaker')
+    directions=()if str(focus.get('speaker')or'').casefold()in{'','unknown','unknown speaker'}and not label else (-1,1)
+    for direction in directions:
+        index=center+direction
+        while 0<=index<len(ordered)and len(turns)<32:
+            row=ordered[index]
+            if (row.get('speaker')!=focus.get('speaker')or(row.get('transcript_speaker')or row.get('diarization_speaker'))!=label
+                    or not str(row.get('text')or'').strip()):break
+            gap=turns[0]['start_time']-row['end_time']if direction<0 else row['start_time']-turns[-1]['end_time']
+            proposed=sorted([*turns,row],key=lambda r:r['start_time'])
+            if (not 0<=gap<=1 or proposed[-1]['end_time']-proposed[0]['start_time']>40
+                    or sum(len(r['text'])+1 for r in proposed)>2400):break
+            turns=proposed;index+=direction
+    current.update(text=' '.join(r['text'].strip()for r in turns),start_time=turns[0]['start_time'],
+                   end_time=turns[-1]['end_time'],segment_ids=[str(r['id'])for r in turns],
+                   source_utterances=[{k:r.get(k)for k in ['id','text','start_time','end_time','speaker']}for r in turns])
+    current.update(duration=current['end_time']-current['start_time'],match_count=len(turns),
+                   youtube_url_timestamped=timestamp_url(current.get('youtube_url',''),current['start_time']))
+    return current
+
+def ranked_diverse(rows,limit):
+    # Keep strong hits within the best video as well as alternative videos.
+    if limit<=0:return []
+    ranked=sorted(rows,key=lambda r:-r.get('retrieval_score',r['score']))
+    selected=ranked[:max(1,limit//2)];seen={str(r['id'])for r in selected}
+    for row in diverse(rows,len(rows)):
+        if str(row['id'])not in seen:selected.append(row);seen.add(str(row['id']))
+        if len(selected)>=limit:break
+    return selected[:limit]
+
 class GroundedSearch:
-    def __init__(self,base,judge,model,revision,read_cache,write_cache,embedding_contract):
+    def __init__(self,base,judge,model,revision,read_cache,write_cache,embedding_contract,title_intent=None,title_indexed=False):
+        self.title_intent=title_intent;self.title_indexed=title_indexed
         self.base=base;self.base.payload_fields=FIELDS;self.judge=judge;self.model=model;self.revision=revision;self.read_cache=read_cache;self.write_cache=write_cache;self.embedding_contract=embedding_contract
     def search(self,request,video_ids=None):
-        started=time.monotonic();epoch=self.revision();params=request.model_dump()if hasattr(request,'model_dump')else vars(request).copy()
+        started=time.monotonic();epoch=self.revision();initial=int(os.getenv('GROUNDING_INITIAL_CANDIDATES','12'));maximum=int(os.getenv('GROUNDING_MAX_CANDIDATES','24'))
+        if not 1<=initial<=maximum<=32:raise ValueError('Grounding limits must satisfy 1 <= initial <= maximum <= 32')
+        params=request.model_dump()if hasattr(request,'model_dump')else vars(request).copy()
         for k in ['cursor','exact_cursor','search_session_id','batch_size']:params.pop(k,None)
-        key='grounded:'+hashlib.sha256(json.dumps([VERSION,hashlib.sha256(SYSTEM.encode()).hexdigest(),os.getenv('RAILWAY_GIT_COMMIT_SHA','development'),asdict(self.base.settings),self.base.sparse_enabled,self.model,self.embedding_contract,epoch,params,video_ids],sort_keys=True,ensure_ascii=False,default=str).encode()).hexdigest()
-        cached=self.read_cache(key)
+        cache_key='grounded:'+hashlib.sha256(json.dumps([GROUNDED_STRATEGY_VERSION,initial,maximum,VERSION,hashlib.sha256(SYSTEM.encode()).hexdigest(),os.getenv('RAILWAY_GIT_COMMIT_SHA','development'),asdict(self.base.settings),self.base.sparse_enabled,self.model,self.embedding_contract,epoch,params,video_ids],sort_keys=True,ensure_ascii=False,default=str).encode()).hexdigest()
+        cached=self.read_cache(cache_key)
         if cached is not None:
             if self.revision()!=epoch:raise ValidationUnavailable('Search index changed',reason='search_index_changed')
             result=copy.deepcopy(cached);meta=result['metadata']['passage_validation'];meta['cache_hit']=True;meta['cached_provider_calls']=meta['provider_calls'];meta['provider_calls']=0;meta['provider_usage']=[];result['ranking']['embedding_usage']=[];result['ranking']['timings']['total_seconds']=round(time.monotonic()-started,3);return result
         original=' '.join([request.query or '',request.word or '',*(request.words or [])]).strip()
+        from grounded_title_search import title_candidates,merge_title_candidates
+        title_rows=[];title_metadata={'matching_videos':0,'elapsed_seconds':0,'warnings':[],'exhaustive':True}
+        title_plan=self.title_intent(original)if self.title_intent else {'queries':[original],'person_only':False}
+        if getattr(request,'search_mode','semantic')=='semantic'and not getattr(request,'filter_type',None):
+            try:title_rows,title_metadata=title_candidates(self.base,request,title_plan['queries'],video_ids,self.title_indexed)
+            except Exception:
+                title_metadata.update(exhaustive=False,warnings=['title_retrieval_unavailable'])
+        if title_plan.get('person_only')and getattr(request,'search_mode','semantic')=='semantic'and not getattr(request,'filter_type',None):
+            if self.revision()!=epoch:raise ValidationUnavailable('Search index changed',reason='search_index_changed')
+            _,metadata=validate_grounded(original,[],self.judge)
+            metadata.update(status='not_applicable',reason='name_only_title_lookup',exhaustive=False)
+            result={'query':original,'words':request.words,'speaker_filter':request.speaker,'search_mode':'semantic',
+                'results':title_rows[:request.top_k],'returned':min(request.top_k,len(title_rows)),
+                'unique_videos':min(request.top_k,len(title_rows)),
+                'metadata':{'passage_validation':metadata,'title_retrieval':title_metadata},
+                'ranking':{'engine':'grounded_title_lookup','score_type':'title_lexical_match',
+                    'evidence_verified':False,'candidate_sources':['video_title'],
+                    'candidates_retrieved':len(title_rows),'embedding_usage':[],'index_revision':epoch,
+                    'timings':{'title_seconds':title_metadata['elapsed_seconds'],'total_seconds':round(time.monotonic()-started,3)}}}
+            if title_metadata['exhaustive']:self.write_cache(cache_key,result,300)
+            return result
         changes={'query':semantic_gloss(original),'word':None,'words':[],'top_k':self.base.settings.candidate_limit}
         expanded=request.model_copy(update=changes)if hasattr(request,'model_copy')else __import__('types').SimpleNamespace(**{**vars(request),**changes})
         from search_observability import capture_embeddings
+        semantic_started=time.monotonic()
         with capture_embeddings() as embedding_usage:response=self.base.search(expanded,video_ids)
-        retrieved=time.monotonic();rows=diverse(response['results'],32);trace=[{'point_id':str(r['id']),'video_id':r['video_id'],'stage':'candidate_retrieval','retrieval_score':r.get('retrieval_score',r['score']),'selected_for_context':str(r['id'])in {str(x['id'])for x in rows}}for r in response['results']]
-        filters=source_filter(request,video_ids);groups=defaultdict(list)
-        for row in rows:groups[row['video_id']].append(row)
-        contexts=[];warnings=[];context_reads=0
-        context_deadline=time.monotonic()+10
-        for video,focus in groups.items():
-            if time.monotonic()>=context_deadline:
-                warnings.append("context_budget_reached");contexts.extend(focus);continue
-            windows=[models.FieldCondition(key='start_time',range=models.Range(gte=max(0,r['start_time']-20),lte=r['end_time']+20))for r in focus]
-            window=models.Filter(must=[*filters.must,models.FieldCondition(key='video_id',match=models.MatchValue(value=video)),models.Filter(should=windows)])
-            points,offset=self.base.client.scroll(collection_name=self.base.collection,scroll_filter=window,limit=500,with_payload=FIELDS,with_vectors=False,timeout=max(1,min(8,int(context_deadline-time.monotonic()))));context_reads+=1
-            neighbors=[{'id':str(p.id),**(p.payload or {})}for p in points]
-            if offset is not None:warnings.append('context_window_truncated')
+        retrieved=time.monotonic()
+        decomposition=response.get('query_decomposition')or{}
+        speaker=request.speaker or response.get('speaker_filter')
+        # Only deterministic decomposition may remove an actor from the judge's
+        # request. A title, anonymous diarization ID or fuzzy name is no proof.
+        named_constraint=bool(speaker and not re.match(r'^(?:speaker[ _-]*\d+|unknown(?: speaker)?)$',speaker,re.I))
+        judging_query=decomposition.get('topic')if named_constraint and decomposition.get('decomposed')else original
+        variants=self.base.speaker_values(speaker)if speaker and self.base.speaker_values else []
+        named={normalize(name)for name in [speaker,*variants]if name}
+        pool=response['results']
+        if named:pool=[r for r in pool if normalize(r.get('speaker',''))in named]
+        rows=ranked_diverse(pool,initial)
+        chosen={str(row['id'])for row in rows}
+        rows+=ranked_diverse([row for row in pool if str(row['id'])not in chosen],maximum-len(rows))if len(rows)<maximum else []
+        trace=[{'point_id':str(r['id']),'video_id':r['video_id'],'stage':'candidate_retrieval',
+                'retrieval_score':r.get('retrieval_score',r['score']),
+                'selected_for_context':str(r['id'])in{str(x['id'])for x in rows}}for r in response['results']]
+        filters=source_filter(request,video_ids)
+        contexts=[];warnings=[];context_reads=0;accepted=[];stages=[];seen=set()
+        context_seconds=validation_seconds=0.;deadline=time.monotonic()+25
+        for offset in range(0,len(rows),initial):
+            calls_left=6-sum(m['provider_calls']for m in stages)
+            if calls_left<=0:warnings.append('validation_call_budget_reached');break
+            if offset and len({r['video_id']for r in accepted})>=min(request.top_k,10):break
+            if time.monotonic()>=deadline:warnings.append('validation_budget_reached');break
+            focus=rows[offset:offset+initial];tick=time.monotonic()
+            windows=[models.Filter(must=[models.FieldCondition(key='video_id',match=models.MatchValue(value=r['video_id'])),
+                models.FieldCondition(key='start_time',range=models.Range(gte=max(0,r['start_time']-20),lte=r['end_time']+20))])for r in focus]
+            window=models.Filter(must=[*filters.must,models.Filter(should=windows)])
+            points,next_offset=self.base.client.scroll(collection_name=self.base.collection,scroll_filter=window,
+                limit=500,with_payload=FIELDS,with_vectors=False,timeout=6);context_reads+=1
+            if next_offset is not None:warnings.append('context_window_truncated')
+            neighbors=[{'id':str(p.id),**(p.payload or{})}for p in points];batch=[]
             for row in focus:
-                expanded=source_passage(row,neighbors,20)
-                passage={**row,**expanded}if expanded else row.copy()
-                if not expanded:passage['source_utterances']=[{k:row.get(k)for k in ['id','text','start_time','end_time','speaker']}]
-                passage['speaker_identity_status']='unverified_source_label'
-                passage['context_speaker_continuity']='anonymous_label' if row.get('transcript_speaker') or row.get('diarization_speaker') else 'unverified'
+                passage=coherent_passage(row,neighbors)
+                passage['speaker_identity_status']='named_source_label_match'if named_constraint else 'unverified_source_label'
+                passage['context_speaker_continuity']='anonymous_label'if row.get('transcript_speaker')or row.get('diarization_speaker')else 'unverified'
                 passage['segment_ids']=list(map(str,passage.get('segment_ids')or[row['id']]))
+                passage_key=candidate_id(passage)
+                if passage_key in seen:continue
+                seen.add(passage_key)
                 if len(passage['text'])>6000:warnings.append('source_passage_exceeds_validation_budget');continue
-                contexts.append(passage)
-        contexts=list({candidate_id(r):r for r in contexts}.values());context_done=time.monotonic()
-        accepted,metadata=validate_grounded(original,contexts,self.judge)
-        if warnings:metadata.update(status='partial',retryable=True,context_warnings=sorted(set(warnings)))
+                batch.append(passage)
+            context_seconds+=time.monotonic()-tick
+            if not batch:continue
+            if time.monotonic()>=deadline:warnings.append('validation_budget_reached');break
+            contexts.extend(batch)
+            try:
+                passed,stage=validate_grounded(judging_query,batch,self.judge,batch_size=6,max_calls=min(3,calls_left),
+                    deadline_seconds=max(.1,deadline-time.monotonic()),concurrency=2)
+            except ValidationUnavailable:
+                if not accepted and not title_rows:raise
+                warnings.append('expansion_validation_unavailable');break
+            accepted.extend(r for r in passed if r['score']>=request.min_score);stages.append(stage)
+            validation_seconds+=stage['elapsed_seconds']
+        # Empty candidate sets are evaluated without a provider call.
+        if not stages:
+            _,metadata=validate_grounded(judging_query,[],self.judge)
+        else:
+            metadata=copy.deepcopy(stages[0])
+            for key in ['candidate_count','evaluated_count','provider_calls','unresolved_count','elapsed_seconds']:
+                metadata[key]=sum(m[key]for m in stages)
+            for key in ['trace','provider_usage','failure_reasons','retried_errors']:
+                metadata[key]=[x for m in stages for x in m[key]]
+        checked_ids={str(identity) for row in contexts for identity in row.get('segment_ids',[row['id']])}
+        metadata['evaluated_source_segments']=len(checked_ids)
+        metadata.update(status='partial'if any(m['status']=='partial'for m in stages)or warnings else 'completed'if accepted else 'no_matches',
+                        retryable=any(m['retryable']for m in stages)or bool(warnings),
+                        context_warnings=warnings,original_query=original,grounding_query=judging_query,
+                        speaker_constraint=speaker,speaker_identity_authority='source_metadata_only',
+                        initial_candidate_limit=initial,maximum_candidate_limit=maximum,
+                        retrieval_candidates=len(response['results']),selected_candidates=len(rows),
+                        has_unchecked_candidates=len(checked_ids)<len(pool),exhaustive=False)
         if self.revision()!=epoch:raise ValidationUnavailable('Search index changed',reason='search_index_changed')
         accepted=[r for r in accepted if r['score']>=request.min_score];accepted=diverse(accepted,request.top_k,key="score")
         # Grouping occurs AFTER diversity/output selection, so one video cannot consume the output budget.
         final=defaultdict(list)
         for row in sorted(accepted,key=lambda r:-r['score']):final[row['video_id']].append(row)
-        result={**response,'query':original,'results':[r for group in final.values()for r in group],'returned':len(accepted),'unique_videos':len(final),'metadata':{'passage_validation':metadata},'ranking':{**response['ranking'],'engine':'grounded_contextual','score_type':'grounded_relevance','evidence_verified':True,'candidate_trace':trace,'candidate_scope':'bounded_dense_or_hybrid_pool','context_reads':context_reads,'embedding_usage':embedding_usage,'model':self.model,'rules_version':VERSION,'index_revision':epoch,'timings':{'retrieval_seconds':round(retrieved-started,3),'context_seconds':round(context_done-retrieved,3),'validation_seconds':metadata['elapsed_seconds'],'total_seconds':round(time.monotonic()-started,3)}}}
-        if metadata['status']in{'completed','no_matches'}:self.write_cache(key,result,300)
+        result={**response,'query':original,'results':[r for group in final.values()for r in group],'returned':len(accepted),'unique_videos':len(final),'metadata':{'passage_validation':metadata},'ranking':{**response['ranking'],'engine':'grounded_contextual','score_type':'grounded_relevance','evidence_verified':True,'candidate_trace':trace,'candidate_scope':'bounded_dense_or_hybrid_pool','context_reads':context_reads,'embedding_usage':embedding_usage,'model':self.model,'rules_version':VERSION,'index_revision':epoch,'timings':{'retrieval_seconds':round(retrieved-semantic_started,3),'context_seconds':round(context_seconds,3),'validation_seconds':round(validation_seconds,3),'total_seconds':round(time.monotonic()-started,3)}}}
+        merged=merge_title_candidates(result['results'],title_rows,request.top_k)
+        result.update(results=merged,returned=len(merged),unique_videos=len({r['video_id']for r in merged}))
+        result['metadata']['title_retrieval']=title_metadata
+        result['ranking'].update(candidate_sources=['video_title','transcript'],
+            evidence_verified=bool(merged)and all(r['transcript_verified']for r in merged),
+            transcript_verified_passages=sum(r['transcript_verified']for r in merged),
+            title_only_videos=sum(r.get('is_video_only',False)for r in merged))
+        if any(r.get('is_video_only')for r in merged):result['ranking']['score_type']='mixed_source_relevance'
+        result['ranking']['timings']['title_seconds']=title_metadata['elapsed_seconds']
+        if metadata['status']in{'completed','no_matches'}and title_metadata['exhaustive']:self.write_cache(cache_key,result,300)
         return result
 
 def summary_search(engine,request):

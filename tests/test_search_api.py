@@ -432,6 +432,31 @@ class SearchApiTest(unittest.TestCase):
                 for span in row["match_spans"]:
                     self.assertEqual(span["text"], row["text"][span["start"]:span["end"]])
 
+    def test_grounded_name_title_pagination_keeps_evidence_and_coverage(self):
+        for identity in (9055,9056):self.put(identity,"Unrelated transcript",video_id=identity,video_title="Hafiz Naeem Rehman event")
+        request=self.api.IncrementalSearchRequest(query="HNR",batch_size=1,allowed_video_ids=[9055,9056])
+        with patch.dict(os.environ,{"SEARCH_PIPELINE":"grounded"}),patch.object(self.api,"get_semantic_query_embedding",side_effect=AssertionError("No embeddings for name lookup")):
+            first=asyncio.run(self.api.search_incremental(request,True))
+            self.assertTrue(first["cursor"]["has_more"])
+            self.assertEqual(2,first["metadata"]["title_retrieval"]["matching_videos"])
+            self.assertFalse(first["results"][0]["transcript_verified"])
+            continuation=request.model_copy(update={"cursor":first["cursor"]["next"],"search_session_id":first["search_session_id"]})
+            second=asyncio.run(self.api.search_incremental(continuation,True))
+            self.assertFalse(second["cursor"]["has_more"])
+            self.assertNotEqual(first["results"][0]["video_id"],second["results"][0]["video_id"])
+            self.assertEqual(first["metadata"]["title_retrieval"],second["metadata"]["title_retrieval"])
+
+    def test_grounded_title_alias_expansion_is_exact_and_preserves_topic(self):
+        plan=self.api.grounded_title_intent("HNR")
+        self.assertTrue(plan["person_only"])
+        self.assertIn("Hafiz Naeem Rehman",plan["queries"])
+        topic=self.api.grounded_title_intent("HNR namaz")
+        self.assertFalse(topic["person_only"])
+        self.assertTrue(all("namaz"in q for q in topic["queries"]))
+        unknown=self.api.grounded_title_intent("HNRish")
+        self.assertFalse(unknown["person_only"])
+        self.assertEqual(["HNRish"],unknown["queries"])
+
     def test_title_contract_returns_video_without_invented_passage(self):
         self.put(9011, "Unrelated content.", video_id=9011, video_title="Graduation ceremony")
         response = asyncio.run(self.api.search(self.api.SearchRequest(

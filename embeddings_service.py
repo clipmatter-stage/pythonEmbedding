@@ -1200,6 +1200,26 @@ def validate_indexing_input(data: dict) -> None:
             raise HTTPException(status_code=422, detail="Invalid seconds interval")
 
 
+def grounded_title_intent(query):
+    """Expand explicit configured aliases without treating a name as a quote."""
+    from transcript_search_contract import normalize
+    value=normalize(query)
+    for person in PERSON_ALIASES.values():
+        names=[person['canonical'],*person['aliases'],*person['speaker_variants']]
+        if value in {normalize(name)for name in names}:
+            queries=list(dict.fromkeys([query,*[name for name in names if len(name.split())>=2]]))
+            return {'queries':queries,'person_only':True}
+    queries=[query]
+    for person in PERSON_ALIASES.values():
+        for alias in sorted(person['aliases'],key=len,reverse=True):
+            if len(alias.split())<2 and alias.lower()not in {'hnr','h.n.r.','h.n.r'}:continue
+            pattern=r'(?<!\w)'+re.escape(alias)+r'(?!\w)'
+            if re.search(pattern,query,re.I):
+                queries.extend(re.sub(pattern,name,query,flags=re.I)for name in [person['canonical'],*person['speaker_variants']]if len(name.split())>=2)
+                break
+    return {'queries':list(dict.fromkeys(queries)),'person_only':False}
+
+
 @lru_cache(maxsize=3)
 def get_contextual_search(pipeline_override: Optional[str] = None) -> ContextualSearch | FastSemanticSearch:
     if not USE_OPENAI_EMBEDDINGS or not openai_client:
@@ -1298,7 +1318,8 @@ def get_contextual_search(pipeline_override: Optional[str] = None) -> Contextual
             speaker_index_types={key:value.data_type for key,value in source_info.payload_schema.items()},
             sparse_enabled=SPARSE_NAME in (source_info.config.params.sparse_vectors or {}))
         model=os.getenv("SEARCH_JUDGE_MODEL",OPENAI_TEXT_MODEL)
-        return GroundedSearch(base,provider_judge(openai_client,model),model,current_revision,read_shared_cache,write_shared_cache,(OPENAI_EMBEDDING_MODEL,EMBEDDING_DIMENSION))
+        return GroundedSearch(base,provider_judge(openai_client,model),model,current_revision,read_shared_cache,write_shared_cache,(OPENAI_EMBEDDING_MODEL,EMBEDDING_DIMENSION),
+            title_intent=grounded_title_intent,title_indexed=str(getattr(source_info.payload_schema.get('video_title'),'data_type','')) in {'text','PayloadSchemaType.TEXT'})
 
     if pipeline == "fast":
         rerank = os.getenv("SEARCH_RERANKING", "false").lower() == "true"
@@ -3628,6 +3649,7 @@ async def search_incremental(data: IncrementalSearchRequest, authorized: bool = 
                 "ranking": query_params.get("ranking"),
                 "search_contract": query_params.get("search_contract"),
                 "passage_validation": query_params.get("passage_validation"),
+                "title_retrieval": query_params.get("title_retrieval"),
                 "lexical_backstop_requested": bool(query_params.get("lexical_backstop_requested", False)),
                 "lexical_backstop_applied": bool(query_params.get("lexical_backstop_applied", False)),
                 "lexical_backstop_reason": query_params.get("lexical_backstop_reason"),
@@ -3731,6 +3753,7 @@ async def search_incremental(data: IncrementalSearchRequest, authorized: bool = 
         "contract_binding": search_session_binding(data),
         "search_contract": delegated.get("search_contract"),
         "passage_validation": delegated.get("metadata", {}).get("passage_validation"),
+        "title_retrieval": delegated.get("metadata", {}).get("title_retrieval"),
         "ranking": delegated.get("ranking"),
     }
     shared_available = await asyncio.to_thread(
@@ -3789,6 +3812,7 @@ async def search_incremental(data: IncrementalSearchRequest, authorized: bool = 
             "ranking": delegated.get("ranking"),
             "search_contract": delegated.get("search_contract"),
             "passage_validation": delegated.get("metadata", {}).get("passage_validation"),
+            "title_retrieval": delegated.get("metadata", {}).get("title_retrieval"),
         }
     }
 

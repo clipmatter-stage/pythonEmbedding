@@ -303,3 +303,62 @@ transport. They cover ordering, default/single-word searches, cross-language
 filters, eligibility, context isolation, cache freshness, provider errors, Chat
 Completions parameters, and cursor pagination. They do not measure model semantic
 accuracy or call live OpenAI/Qdrant services.
+
+
+## Small grounding with separate speaker constraints
+
+With `SEARCH_PIPELINE=grounded` (or `verify_relevance=true`), fast Qdrant
+retrieval is followed by a 12-candidate grounding stage, in parallel batches of
+six. If fewer than ten videos pass (or the requested `top_k` when smaller), one
+more stage is allowed, up to 24 source candidates and a shared 25-second context
+and validation budget. This is not a hard HTTP latency limit. Set
+`GROUNDING_INITIAL_CANDIDATES` and `GROUNDING_MAX_CANDIDATES` to tune these bounds
+(`1 <= initial <= maximum <= 32`). It does not change the default fast pipeline.
+
+Explicit known-speaker/action requests, including
+`hafiz naeem nojawano ko namaz ki talqeen`, separate the speaker constraint from
+the action. Retrieval matches configured names; grounding accepts only exact
+normalized named speaker aliases from source metadata and checks the remaining
+complete action, audience, direction and negation against transcript quotes.
+The person need not introduce themselves in the transcript. Anonymous labels
+such as `SPEAKER_02` cannot establish that person. A named source-label match is
+reported as `named_source_label_match`, not authenticated identity; incorrect
+source tagging still requires correction at ingestion.
+
+Grounding joins adjacent original turns from the same speaker and diarization
+label, with a one-second maximum gap, within bounded 40-second / 2,400-character
+passages. It does not use titles or other speakers to invent missing evidence.
+The response reports the original and grounded queries, speaker constraint,
+checked candidate counts, and whether retrieved candidates remain unchecked.
+Whole-query results remain cached against source revision, scope, model and
+rules. Existing pagination pages the evaluated result snapshot; it does not
+lazily judge unchecked candidates on View More, and counts are not collection-wide.
+No-match results never fall back to unchecked semantic hits. Simple topic
+searches without an attributed speaker continue to ground the complete query.
+
+
+## Titles in grounded AI search
+
+Grounded AI search now also retrieves lexical candidates from `video_title`.
+It uses the existing Qdrant title text index when available, or a scoped,
+payload-only scan bounded to 10,000 source points / approximately three seconds.
+It does not add or rebuild an index at startup. `metadata.title_retrieval`
+reports the method, checked coverage, warnings and matched video count; bounded
+coverage is not an exhaustive collection-wide count. Eligibility, allowed video
+IDs, language, date and time restrictions apply to both candidate sources.
+
+An exact configured person alias such as `HNR` expands to known full-name title
+variants. Name-only lookup returns title matches without embedding or grounding
+calls. A compound query such as `HNR namaz` retains the topic in every expanded
+title query; the alias cannot turn a compound request into a name-only search.
+Other queries combine title matches with existing grounded transcript retrieval.
+
+Title-only results have `is_video_only=true`, empty `text`, `evidence_source=title`
+and `transcript_verified=false`. They never contain fabricated timestamps or
+transcript quotes and do not confirm who actually spoke. Results supported by
+both sources keep their verified passages and add title evidence, without a
+second video-only result. Verified passages are ranked before title-only videos;
+title lexical scores and grounded relevance scores are not compared. The
+response-wide `ranking.evidence_verified` is false when title-only rows are present.
+The existing Laravel presenter already recognizes video-only title matches.
+The separate **Search by Title** category continues to use its existing route.

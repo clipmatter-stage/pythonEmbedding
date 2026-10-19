@@ -11,6 +11,7 @@ import unicodedata
 from semantic_passage_evidence import consolidate_candidates, validate_passages, RetrievalBudgetReached
 CONFIG=json.loads(pathlib.Path(__file__).with_name('search_contract_v1.json').read_text())
 VERSION=CONFIG['version']
+GROUNDED_STRATEGY_VERSION='speaker_scoped_title_and_transcript_v2'
 
 def normalized_with_spans(text):
     chars=[];spans=[]
@@ -79,6 +80,8 @@ def search_session_binding(request):
     data={key:getattr(request,key,None) for key in fields}
     data.update(rules_version=VERSION,build=os.getenv('RAILWAY_GIT_COMMIT_SHA','development'),pipeline=os.getenv('SEARCH_PIPELINE','fast'),judge_model=os.getenv('SEARCH_JUDGE_MODEL',os.getenv('OPENAI_TEXT_MODEL','gpt-6-luna')))
     data.update(embedding_contract=[os.getenv('OPENAI_EMBEDDING_MODEL','text-embedding-3-large'),os.getenv('EMBEDDING_DIMENSION','3072')],candidate_limit=os.getenv('FAST_SEARCH_CANDIDATE_LIMIT','100'),minimum_dense_score=os.getenv('SEARCH_MIN_DENSE_SCORE','0'))
+    if data['pipeline']=='grounded'or data.get('verify_relevance'):
+        data['grounding_strategy']=[GROUNDED_STRATEGY_VERSION,os.getenv('GROUNDING_INITIAL_CANDIDATES','12'),os.getenv('GROUNDING_MAX_CANDIDATES','24')]
     return hashlib.sha256(json.dumps(data,sort_keys=True,ensure_ascii=False).encode()).hexdigest()
 
 def contract_search(request,reader,collection,models,embed,judge,*,use_normalized_index=False,verifier=None):

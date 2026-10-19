@@ -111,7 +111,11 @@ def decompose_semantic_query(
         if not match:
             continue
         if pattern is roman_pattern and not roman_action.search(match.group("topic")):
-            continue
+            # Common abbreviated actor/action request: "Hafiz Naeem nojawano
+            # ko namaz ki talqeen". Keep every audience, action and negation term.
+            tail=match.group("topic")
+            if not (re.search(r"\bko\b",tail,re.I) and re.search(r"\b(?:talqeen|targheeb|hidayat|naseehat|dawat)\s*$",tail,re.I)):
+                continue
 
         topic = re.sub(r"\s+", " ", match.group("topic")).strip(" .?!")
         speaker_text = re.sub(r"\s+", " ", match.group("speaker")).strip(" .?!")
