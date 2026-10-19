@@ -5,6 +5,7 @@ import hashlib
 import json
 import math
 import pathlib
+import os
 import re
 import unicodedata
 from semantic_passage_evidence import consolidate_candidates, validate_passages, RetrievalBudgetReached
@@ -48,7 +49,9 @@ def query_variants(query,contract):
 def match_spans(text,query,contract='normalized'):
     return CompiledMatcher(query,contract).spans(text)
 
-def indexed_text_fields(text):return {'search_contract_version':VERSION,'transcript_normalized_v1':normalize(text)}
+def indexed_text_fields(text):
+    from exact_lexical import derived_fields
+    return {'search_contract_version':VERSION,'transcript_normalized_v1':normalize(text),**derived_fields(text)}
 
 def title_score(title,query):
     title=normalize(title.replace('_',' '));query=normalize(query.replace('_',' '))
@@ -72,8 +75,9 @@ def transcript_results(rows,query,contract='normalized'):
     return results
 
 def search_session_binding(request):
-    fields=['query','words','word','search_mode','filter_type','transcript_contract','video_id','speaker','title','language','time_range','filter_year','filter_month','filter_date','query_decomposition_mode','summary_candidates','min_score']
+    fields=['query','words','word','search_mode','filter_type','transcript_contract','video_id','speaker','title','language','time_range','filter_year','filter_month','filter_date','query_decomposition_mode','summary_candidates','min_score','allowed_video_ids','authorization_scope','scope_revision','index_revision']
     data={key:getattr(request,key,None) for key in fields}
+    data.update(rules_version=VERSION,build=os.getenv('RAILWAY_GIT_COMMIT_SHA','development'),pipeline=os.getenv('SEARCH_PIPELINE','grounded'),judge_model=os.getenv('SEARCH_JUDGE_MODEL',os.getenv('OPENAI_TEXT_MODEL','gpt-6-luna')))
     return hashlib.sha256(json.dumps(data,sort_keys=True,ensure_ascii=False).encode()).hexdigest()
 
 def contract_search(request,reader,collection,models,embed,judge,*,use_normalized_index=False,verifier=None):

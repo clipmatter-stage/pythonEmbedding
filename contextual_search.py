@@ -245,6 +245,9 @@ def eligibility_conditions() -> list:
 
 def source_filter(request, video_ids: list[int] | None = None):
     conditions = eligibility_conditions()
+    allowed=getattr(request,"allowed_video_ids",None)
+    if allowed is not None:
+        conditions.append(models.FieldCondition(key="video_id",match=models.MatchAny(any=allowed or [-1])))
     if video_ids is not None:
         conditions.append(models.FieldCondition(key="video_id", match=models.MatchAny(any=video_ids)))
     if request.video_id is not None:

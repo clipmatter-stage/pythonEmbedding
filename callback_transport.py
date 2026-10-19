@@ -40,7 +40,9 @@ def deliver(url,payload,key,error_type,max_attempts=5,callback_token=None):
 
 def worker_canary(data,key,module,revision_tracking=False):
     nonce=data['challenge'];signature=hmac.new((key or '').encode(),nonce.encode(),hashlib.sha256).hexdigest()
-    result={'index_revision_tracking':revision_tracking,'worker_module':module,'worker_revision':os.getenv('RAILWAY_GIT_COMMIT_SHA','unknown'),'api_key_configured':bool(key),'configured_key_matches_expected':hmac.compare_digest(signature,data['expected_signature']),'transport_sha256':hashlib.sha256(inspect.getsource(post_callback).encode()).hexdigest(),'provider_calls':0}
+    from rq import get_current_job
+    current_job=get_current_job()
+    result={'index_revision_tracking':revision_tracking,'worker_module':module,'worker_name':getattr(current_job,'worker_name',None),'worker_revision':os.getenv('RAILWAY_GIT_COMMIT_SHA','unknown'),'api_key_configured':bool(key),'configured_key_matches_expected':hmac.compare_digest(signature,data['expected_signature']),'transport_sha256':hashlib.sha256(inspect.getsource(post_callback).encode()).hexdigest(),'provider_calls':0}
     try:
         legacy=post_callback(data['callback_url'],{'probe_nonce':nonce,'probe_signature':signature},key)
         try:legacy_body=legacy.json()
@@ -63,6 +65,24 @@ def register_callback_probe(app,queue,redis,api_key,worker_function):
         callback_url:str=Field(max_length=500)
         challenge:str=Field(pattern='^[a-f0-9]{32}$')
         expected_signature:str=Field(pattern='^[a-f0-9]{64}$')
+    @app.get('/operations/callback-queue-audit')
+    async def queue_audit(authorized=Depends(auth)):
+        from rq.job import Job
+        from rq import Worker
+        from rq.registry import StartedJobRegistry,FailedJobRegistry
+        registries={'queued':queue,'started':StartedJobRegistry(queue=queue),'failed':FailedJobRegistry(queue=queue)}
+        output={'registries':{},'workers':[],'api_key_configured':bool(api_key),'inspection_limit_per_registry':100}
+        for state,registry in registries.items():
+            ids=registry.get_job_ids(offset=0,length=100)if state=='queued'else registry.get_job_ids(start=0,end=99,cleanup=False);rows=[]
+            for job_id in ids:
+                try:
+                    job=Job.fetch(job_id,connection=redis);data=job.args[0]if job.args and isinstance(job.args[0],dict)else {}
+                    rows.append({'job_id':job_id,'function':job.func_name,'video_id':data.get('video_id'),'run_id':data.get('run_id'),'operation':data.get('operation'),'has_scoped_callback_token':bool(data.get('_callback_token')),'retained_callback_401_hint':bool(job.exc_info and '401'in job.exc_info and 'callback'in job.exc_info.lower())})
+                except Exception:rows.append({'job_id':job_id,'inspection_failed':True})
+            total=redis.llen(registry.key)if state=='queued'else redis.zcard(registry.key)
+            output['registries'][state]={'total':total,'inspected':len(rows),'complete':len(rows)>=total,'jobs':rows}
+        for worker in Worker.all(connection=redis):output['workers'].append({'name':worker.name,'queues':worker.queue_names(),'state':str(worker.get_state()),'revision':'unverified_until_processing_canary'})
+        return output
     @app.post('/operations/callback-probe')
     async def submit(data:Probe,authorized=Depends(auth)):
         url=urllib.parse.urlsplit(data.callback_url)

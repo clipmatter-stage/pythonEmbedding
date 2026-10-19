@@ -1,7 +1,7 @@
 # Video transcript search
 
 `embeddings_service.py` preserves the legacy API and indexing contracts while
-using a faster semantic retrieval pipeline by default. `embeddings_test.py` remains available for legacy jobs and endpoints. The Docker image retains its legacy default command; the Railway API
+using grounded contextual retrieval by default. `embeddings_test.py` remains available for legacy jobs and endpoints. The Docker image retains its legacy default command; the Railway API
 uses the modern service when its custom start command is `bash start.sh`.
 
 ## Setup
@@ -28,6 +28,41 @@ worker's separate RQ command in place. Verify `GET /` reports version `8.1` and
 `ai_features.search_pipeline: fast`. Sparse-index migrations are explicit operations; pushing to a Railway-linked
 branch can deploy automatically according to that service's settings.
 
+## Phase 4 grounded contextual search (default)
+
+`SEARCH_PIPELINE=grounded` retrieves the existing compatible dense/sparse candidate
+pool, selects diverse videos before output truncation, and expands nearby original
+turns only within the same source speaker label and a bounded time window. One
+stable-ID structured judge both ranks and checks the complete query intent with
+quotes mapped back to original transcript evidence. Only affected missing or
+malformed judgments are retried; verified peers survive with explicit partial
+status. Provider/protocol failure is not a completed no-match or an unverified
+retrieval fallback. Candidate IDs, stage scores and bounded reason codes support
+diagnostics without printing transcripts or credentials.
+
+`SEARCH_JUDGE_MODEL` optionally overrides `OPENAI_TEXT_MODEL` for grounded search;
+the default remains `gpt-6-luna` after the controlled Phase 4 comparison. No
+embedding model/dimension change or reranking-weight download is required. The
+old `SEARCH_RERANKING`/`SEARCH_VALIDATE_RESULTS` flags govern `fast` mode, not this
+grounded path. Set `SEARCH_PIPELINE=fast` only as an explicit unverified-retrieval
+rollback. Set `verified` for the older independently checked MaxSim path.
+
+Summary candidate selection remains in Laravel with shared multilingual rules.
+The full authorized candidate registry (up to 10,000 videos) enters a single
+bounded semantic retrieval instead of truncating the first 60 candidate videos.
+Bounded semantic evaluation is explicit; summary text is never passage evidence.
+Grounded result caches bind query/filter/authorization, source revision, rules,
+judge and embedding contract. Cached verified results incur no new judge calls.
+
+Exact search can use versioned keyword-array payload indexes after proving
+complete eligible field coverage. It still checks original transcript spans;
+missing coverage or unavailable schema falls back to complete continuation.
+Literal search retains the original scan path. Payload-only backfills require
+explicit video IDs, reviewed checkpoints and post-state verification; no vector,
+source text, timestamp or producer metadata changes are made. The private
+checkpoint is required for guarded rollback. Do not clear uncertain-write state
+without inspecting and verifying the affected operation.
+
 ## Phase 3 exact search and worker callbacks
 
 The deterministic `/search/exact` path uses `exact_cursor_v1` with the shared
@@ -53,7 +88,7 @@ default; change it only when the callback host changes. Laravel's
 `EMBEDDING_EXACT_CURSOR_ENABLED` setting belongs in Laravel, not Python Railway.
 Deploy/restart both services after changing their variables.
 
-## Fast search (default)
+## Fast search (explicit rollback mode)
 
 1. Resolve known speaker aliases and conservatively decompose explicit speaker
    plus topic requests locally. A mere name mention does not impose a speaker filter.

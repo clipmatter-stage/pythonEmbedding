@@ -20,6 +20,8 @@ class RevisionedClient:
         method=getattr(self.client,name)
         if name not in self.MUTATIONS:return method
         def write(*args,**kwargs):
+            from exact_lexical import protect_text_mutation
+            args,kwargs=protect_text_mutation(name,args,kwargs)
             with self.redis.lock('exact-index-write',timeout=300,blocking_timeout=30):
                 token=secrets.token_hex(16);self.redis.set('exact:index:writing',token,ex=300);self.redis.set('exact:index:revision',token)
                 kwargs['wait']=True
@@ -54,6 +56,10 @@ def exact_page(data,client,redis,collection,models,clock=time.time):
         if data.get(key) is not None:conditions.append(models.FieldCondition(key=key,match=models.MatchValue(value=data[key])))
     filter_=models.Filter(must=conditions)
     current=revision(redis)
+    from exact_lexical import prefilter
+    if hasattr(client,'get_collection'):
+        scan_filter,indexed=prefilter(client,collection,filter_,data['query'],data.get('transcript_contract','normalized'),models)
+    else:scan_filter,indexed=filter_,False
     count=client.count(collection_name=collection,count_filter=filter_,exact=True,timeout=10).count
     if token:
         if not isinstance(token,str) or not token.startswith('ex1_') or len(token)!=52:raise CursorError('search_session_expired','Invalid or expired continuation.')
@@ -77,7 +83,7 @@ def exact_page(data,client,redis,collection,models,clock=time.time):
         deadline=time.perf_counter()+18
         while examined<MAX_POINTS and len(results)<size and time.perf_counter()<deadline:
             limit=min(capacity,size-len(results),MAX_POINTS-examined)
-            t=time.perf_counter();points,next_offset=client.scroll(collection_name=collection,scroll_filter=filter_,offset=state['offset'],limit=limit,with_payload=FIELDS,with_vectors=False,timeout=10);read_seconds+=time.perf_counter()-t;calls+=1;examined+=len(points)
+            t=time.perf_counter();points,next_offset=client.scroll(collection_name=collection,scroll_filter=scan_filter,offset=state['offset'],limit=limit,with_payload=FIELDS,with_vectors=False,timeout=10);read_seconds+=time.perf_counter()-t;calls+=1;examined+=len(points)
             if not points and next_offset is not None:raise CursorError('search_read_incomplete','Index read could not advance. Retry this page.',503)
             batch=[]
             for point in points:
@@ -106,7 +112,7 @@ def exact_page(data,client,redis,collection,models,clock=time.time):
         if len(state['videos'])>10000:raise CursorError('search_scope_too_large','Search scope exceeds the bounded authorization registry.',503)
         counts={'matching_videos':len(state['videos']),'displayed_passages':state['passages'],'matched_transcript_occurrences':state['occurrences'],'merged_passages':None}
         next_token=None if done else 'ex1_'+secrets.token_hex(24)
-        metadata={'authority':'python_contract_v1','representation':VERSION,'protocol':PROTOCOL,'contract':data.get('transcript_contract','normalized'),'status':('completed' if state['passages'] else 'no_matches') if done else 'partial','exhaustive':done,'counts_final':done,'counts':counts,'scanned_segments':state['scanned'],'scope':'authorized_eligible_indexed_segments','index_revision':current,'passage_unit':'indexed_source_utterance','merged_passages_note':'Cross-utterance merging is not performed; counts are not merged-window totals.','expires_at':state['expires'],'metrics':{'points_examined':examined,'read_calls':calls,'retrieval_ms':round(read_seconds*1000,2),'normalization_ms':round(normalization*1000,2),'elapsed_ms':round((time.perf_counter()-started)*1000,2),'result_payload_bytes':bytes_used,'provider_calls':0,'response_cache_hit':False}}
+        metadata={'authority':'python_contract_v1','representation':VERSION,'protocol':PROTOCOL,'contract':data.get('transcript_contract','normalized'),'status':('completed' if state['passages'] else 'no_matches') if done else 'partial','exhaustive':done,'counts_final':done,'counts':counts,'scanned_segments':state['scanned'],'scope':'authorized_eligible_indexed_segments','index_revision':current,'lexical_index_used':indexed,'passage_unit':'indexed_source_utterance','merged_passages_note':'Cross-utterance merging is not performed; counts are not merged-window totals.','expires_at':state['expires'],'metrics':{'points_examined':examined,'read_calls':calls,'retrieval_ms':round(read_seconds*1000,2),'normalization_ms':round(normalization*1000,2),'elapsed_ms':round((time.perf_counter()-started)*1000,2),'result_payload_bytes':bytes_used,'provider_calls':0,'response_cache_hit':False}}
         result={'results':results,'returned':len(results),'query':data['query'],'search_mode':'simple','filter_type':'text','search_contract':metadata,'cursor':{'next':next_token,'has_more':not done},'search_session_id':state['session']}
         ttl=max(1,int(state['expires']-clock()))
         # Response and next state are committed together; retries replay the same page.

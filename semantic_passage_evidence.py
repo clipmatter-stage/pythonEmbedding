@@ -55,7 +55,7 @@ def validation_error_detail(exc):
     """Public errors expose bounded reason codes, never provider payloads."""
     reason = exc.reason or 'validation_failed'
     evidence_reasons = {'quote_not_in_passage', 'missing_facet_evidence'}
-    protocol_reasons = set(_VALIDATION_REASONS.values()) - {'provider_not_configured'}
+    protocol_reasons = (set(_VALIDATION_REASONS.values()) - {'provider_not_configured'}) | {'duplicate_or_missing_candidate_id','unknown_candidate_id','invalid_positive_judgment','invalid_negative_judgment'}
     if reason in evidence_reasons:
         code = 'passage_evidence_invalid'
         message = ('Search could not verify the results because the validation evidence '

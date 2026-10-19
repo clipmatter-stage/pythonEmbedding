@@ -87,6 +87,9 @@ class SearchApiTest(unittest.TestCase):
         cache_patch = patch.object(self.api, "search_cache_redis", self.shared_cache)
         cache_patch.start()
         self.addCleanup(cache_patch.stop)
+        redis_patch = patch.object(self.api, "redis_conn", self.shared_cache)
+        redis_patch.start()
+        self.addCleanup(redis_patch.stop)
         self.api.search_result_cache.clear()
         self.api.embedding_cache.clear()
         self.api.passage_validation_cache.clear()
@@ -250,7 +253,7 @@ class SearchApiTest(unittest.TestCase):
         self.assertEqual(0, second["metadata"]["passage_validation"]["provider_calls"])
 
     def test_search_session_survives_replica_local_cache_miss(self):
-        request = self.api.IncrementalSearchRequest(query="rights")
+        request = self.api.IncrementalSearchRequest(query="rights", index_revision="initial")
         rows = [{"id": 1, "video_id": 1, "score": .9}, {"id": 2, "video_id": 2, "score": .8}]
         self.api.cache_search_results("shared-session", rows, {"contract_binding": self.api.search_session_binding(request)})
         self.api.search_result_cache.clear()
@@ -366,7 +369,7 @@ class SearchApiTest(unittest.TestCase):
         self.put(9012, "Children deserve protection.", video_id=9012)
         request = self.api.SearchRequest(query="rights", search_mode="simple", filter_type="summary",
             summary_candidates=[{"video_id": 9012, "matched_summary_fields": ["video_summary_english"]}])
-        with patch.object(self.api, "get_semantic_query_embedding", return_value=[1.0, 0.0]), patch.object(
+        with patch.dict(os.environ, {"SEARCH_PIPELINE": "verified"}), patch.object(self.api, "get_semantic_query_embedding", return_value=[1.0, 0.0]), patch.object(
             self.api, "judge_passage_batch", side_effect=self.evidence,
         ), patch.object(self.api, "verify_passage_batch", side_effect=self.evidence):
             response = asyncio.run(self.api.search(request, True))
