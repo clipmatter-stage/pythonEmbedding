@@ -45,3 +45,15 @@ class GroundedTests(unittest.TestCase):
    if len(b)>2:raise ValidationUnavailable('Incomplete provider response')
    return {'judgments':[judgment(r)for r in b]}
   rows,meta=validate_grounded('fees',[row(i)for i in range(4)],judge);self.assertEqual([4,2,2],calls);self.assertEqual(4,len(rows));self.assertEqual('completed',meta['status'])
+
+ def test_bounded_concurrency_never_exceeds_two(self):
+  import threading,time
+  lock=threading.Lock();active=0;maximum=0
+  def judge(q,b,t):
+   nonlocal active,maximum
+   with lock:active+=1;maximum=max(maximum,active)
+   time.sleep(.01)
+   with lock:active-=1
+   return {'judgments':[judgment(r)for r in b]}
+  rows,meta=validate_grounded('fees',[row(i)for i in range(24)],judge,concurrency=100)
+  self.assertEqual(24,len(rows));self.assertLessEqual(maximum,2);self.assertEqual(2,meta['limits']['concurrency']);self.assertEqual(3,meta['provider_calls'])

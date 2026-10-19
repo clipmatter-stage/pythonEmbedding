@@ -57,7 +57,8 @@ judge and embedding contract. Cached verified results incur no new judge calls.
 Exact search can use versioned keyword-array payload indexes after proving
 complete eligible field coverage. It still checks original transcript spans;
 missing coverage or unavailable schema falls back to complete continuation.
-Literal search retains the original scan path. Payload-only backfills require
+Literal matching has a separate case-sensitive token field; punctuation-only
+queries without usable tokens retain complete traversal. Payload-only backfills require
 explicit video IDs, reviewed checkpoints and post-state verification; no vector,
 source text, timestamp or producer metadata changes are made. The private
 checkpoint is required for guarded rollback. Do not clear uncertain-write state

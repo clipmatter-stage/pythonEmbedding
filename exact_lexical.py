@@ -3,20 +3,20 @@ No vector writes, text edits, point deletion or producer relabeling.
 """
 import hashlib,json,re
 from transcript_search_contract import VERSION,normalize,alias_with_spans
-INDEX_VERSION='exact_terms_v1:'+VERSION
+INDEX_VERSION='exact_terms_v2:'+VERSION
 GUARD_FIELDS=['text','video_id','start_time','end_time','duration','timestamp_unit','speaker','transcript_speaker','diarization_speaker','segment_index','processing_status','approval_status','is_archived','indexing_run_id','source_snapshot_sha256','source_segment_id','embedding_model','embedding_dimensions','recovery_contract']
 GUARD_VERSION='exact_payload_guard_v1'
-KEYS=['exact_terms_version','exact_normalized_terms_v1','exact_alias_terms_v1','exact_source_sha256']
+KEYS=['exact_terms_version','exact_normalized_terms_v1','exact_alias_terms_v1','exact_literal_terms_v1','exact_source_sha256']
 def digest(value):return hashlib.sha256(json.dumps(value,ensure_ascii=False,sort_keys=True,separators=(',',':'),allow_nan=False).encode()).hexdigest()
 def derived_fields(text):
     text=str(text or '')
-    return {'exact_terms_version':INDEX_VERSION,'exact_source_sha256':hashlib.sha256(text.encode()).hexdigest(),'exact_normalized_terms_v1':sorted(set(re.findall(r'\w+',normalize(text)))),'exact_alias_terms_v1':sorted(set(re.findall(r'\w+',alias_with_spans(text)[0])))}
+    return {'exact_terms_version':INDEX_VERSION,'exact_source_sha256':hashlib.sha256(text.encode()).hexdigest(),'exact_literal_terms_v1':sorted(set(re.findall(r'\w+',text))),'exact_normalized_terms_v1':sorted(set(re.findall(r'\w+',normalize(text)))),'exact_alias_terms_v1':sorted(set(re.findall(r'\w+',alias_with_spans(text)[0])))}
 def prefilter(client,collection,base,query,contract,models):
-    if contract not in {'normalized','alias'}:return base,False
-    words=re.findall(r'\w+',alias_with_spans(query)[0]if contract=='alias'else normalize(query))
+    if contract not in {'literal','normalized','alias'}:return base,False
+    words=re.findall(r'\w+',query.strip()if contract=='literal'else alias_with_spans(query)[0]if contract=='alias'else normalize(query))
     if not words:return base,False
     schema=client.get_collection(collection).payload_schema
-    field='exact_alias_terms_v1'if contract=='alias'else 'exact_normalized_terms_v1'
+    field='exact_literal_terms_v1'if contract=='literal'else 'exact_alias_terms_v1'if contract=='alias'else 'exact_normalized_terms_v1'
     if any(getattr(getattr(schema.get(k),'data_type',None),'value',getattr(schema.get(k),'data_type',None))!='keyword' for k in ['exact_terms_version',field]):return base,False
     covered=models.Filter(must=[*base.must,models.FieldCondition(key='exact_terms_version',match=models.MatchValue(value=INDEX_VERSION))])
     if client.count(collection_name=collection,count_filter=base,exact=True,timeout=10).count!=client.count(collection_name=collection,count_filter=covered,exact=True,timeout=10).count:return base,False
@@ -88,9 +88,9 @@ def register_operations(app,client,redis,collection,models,authorized):
     async def indexes(auth=Depends(authorized)):
         import asyncio
         def create():
-            for key in ['exact_terms_version','exact_normalized_terms_v1','exact_alias_terms_v1']:
+            for key in ['exact_terms_version','exact_normalized_terms_v1','exact_alias_terms_v1','exact_literal_terms_v1']:
                 client.create_payload_index(collection_name=collection,field_name=key,field_schema=models.PayloadSchemaType.KEYWORD,wait=True,timeout=30)
-            return {'version':INDEX_VERSION,'fields':['exact_terms_version','exact_normalized_terms_v1','exact_alias_terms_v1'],'vectors_written':0}
+            return {'version':INDEX_VERSION,'fields':['exact_terms_version','exact_normalized_terms_v1','exact_alias_terms_v1','exact_literal_terms_v1'],'vectors_written':0}
         return await asyncio.to_thread(create)
 
 def protect_text_mutation(name,args,kwargs):

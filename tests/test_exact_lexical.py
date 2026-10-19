@@ -19,12 +19,12 @@ class LexicalTests(unittest.TestCase):
   with self.assertRaises(ValueError):apply_video(self.c,'source',plan,models)
  def test_index_prefilter_keeps_complete_occurrences_beyond_2400(self):
   plan=plan_video(self.c,'source',1,models);apply_video(self.c,'source',plan,models)
-  info=self.c.get_collection('source');info.payload_schema={k:NS(data_type='keyword')for k in ['exact_terms_version','exact_normalized_terms_v1','exact_alias_terms_v1']}
+  info=self.c.get_collection('source');info.payload_schema={k:NS(data_type='keyword')for k in ['exact_terms_version','exact_normalized_terms_v1','exact_alias_terms_v1','exact_literal_terms_v1']}
   with patch.object(self.c,'get_collection',return_value=info):
-   for query,contract in [('IPP','normalized'),('k electric','alias')]:
+   for query,contract in [('IPP','normalized'),('k electric','alias'),('I.P.P.','literal'),('.P.','literal')]:
     response=exact_page({'query':query,'transcript_contract':contract,'allowed_video_ids':[1]},self.c,Redis(),'source',models);self.assertTrue(response['search_contract']['lexical_index_used']);self.assertEqual(1,response['search_contract']['scanned_segments']);self.assertEqual(1,response['search_contract']['counts']['matched_transcript_occurrences']);self.assertTrue(response['search_contract']['counts_final'])
  def test_missing_coverage_falls_back_without_losing_matches(self):
-  self.c.set_payload('source',derived_fields('other text'),[1]);info=self.c.get_collection('source');info.payload_schema={k:NS(data_type='keyword')for k in ['exact_terms_version','exact_normalized_terms_v1','exact_alias_terms_v1']}
+  self.c.set_payload('source',derived_fields('other text'),[1]);info=self.c.get_collection('source');info.payload_schema={k:NS(data_type='keyword')for k in ['exact_terms_version','exact_normalized_terms_v1','exact_alias_terms_v1','exact_literal_terms_v1']}
   with patch.object(self.c,'get_collection',return_value=info):
    r=exact_page({'query':'IPP','transcript_contract':'normalized','allowed_video_ids':[1]},self.c,Redis(),'source',models);self.assertFalse(r['search_contract']['lexical_index_used']);self.assertEqual('partial',r['search_contract']['status']);self.assertEqual(1000,r['search_contract']['scanned_segments'])
 

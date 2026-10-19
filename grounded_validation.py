@@ -1,5 +1,6 @@
 """Stable-ID grounded judgments. Provider adapters are injected; no service imports."""
 import collections,hashlib,json,math,time,uuid
+from concurrent.futures import ThreadPoolExecutor
 from semantic_passage_evidence import ValidationUnavailable,validation_failure_reason
 from transcript_search_contract import normalized_with_spans
 VERSION='grounded_passage_v1'
@@ -42,14 +43,23 @@ def grounded_quotes(text,quotes):
         out.append({'start':a,'end':b,'quote':text[a:b]})
     return out
 
-def validate_grounded(query,candidates,judge,*,batch_size=8,max_candidates=32,max_calls=6,deadline_seconds=45,clock=time.monotonic):
+def validate_grounded(query,candidates,judge,*,batch_size=8,max_candidates=32,max_calls=6,deadline_seconds=45,concurrency=2,clock=time.monotonic):
+    max_candidates=max(1,min(max_candidates,32));max_calls=max(1,min(max_calls,6));batch_size=max(1,min(batch_size,8));deadline_seconds=max(.1,min(deadline_seconds,45));concurrency=max(1,min(concurrency,2))
     started=clock();diagnostic=uuid.uuid4().hex;pool=list({candidate_id(r):r for r in candidates}.values())[:max_candidates]
     pending=[pool[i:i+batch_size]for i in range(0,len(pool),batch_size)];attempts=collections.Counter();accepted={};evaluated=set();trace={};calls=0;usage=[];failures=[];recovered_errors=[]
-    while pending and calls<max_calls and clock()-started<deadline_seconds:
-        batch=pending.pop(0);calls+=1;ids={candidate_id(r):r for r in batch}
-        for key in ids:attempts[key]+=1
+    executor=ThreadPoolExecutor(max_workers=concurrency);inflight=[]
+    while pending or inflight:
+        while pending and len(inflight)<concurrency and calls<max_calls and clock()-started<deadline_seconds:
+            batch=pending.pop(0);calls+=1
+            for r in batch:attempts[candidate_id(r)]+=1
+            future=executor.submit(judge,query,batch,min(18,max(.1,deadline_seconds-(clock()-started))))
+            inflight.append((batch,future))
+        if not inflight:break
+        if clock()-started>=deadline_seconds and not any(f.done()for _,f in inflight):break
+        ready=next((i for i,(_,f)in enumerate(inflight)if f.done()),0)
+        batch,future=inflight.pop(ready);ids={candidate_id(r):r for r in batch}
         try:
-            response=judge(query,batch,min(18,max(.1,deadline_seconds-(clock()-started))));items=response.get('judgments');usage.append(response.get('_usage',{}))
+            response=future.result(timeout=max(.1,deadline_seconds-(clock()-started)));items=response.get('judgments');usage.append(response.get('_usage',{}))
             if not isinstance(items,list):raise ValidationUnavailable('Incomplete validation response')
             counts=collections.Counter(j.get('candidate_id') for j in items if isinstance(j,dict) and isinstance(j.get('candidate_id'),str));unknown=set(counts)-set(ids)
             if unknown:failures.append('unknown_candidate_id')
@@ -80,8 +90,9 @@ def validate_grounded(query,candidates,judge,*,batch_size=8,max_candidates=32,ma
                     middle=len(batch)//2;pending[0:0]=[batch[:middle],batch[middle:]]
                 else:pending.insert(0,batch)
             else:failures.append(reason)
+    executor.shutdown(wait=False,cancel_futures=True)
     unresolved=len(pool)-len(evaluated);partial=bool(unresolved or len(candidates)>max_candidates or failures)
     if (unresolved or failures)and not accepted:raise ValidationUnavailable('Passage validation unavailable; retry the search',diagnostic_id=diagnostic,reason=failures[-1]if failures else 'incomplete_judgments')
     rows=sorted(accepted.values(),key=lambda r:(-r['score'],str(r['video_id']),r['start_time']))
-    metadata={'authority':VERSION,'diagnostic_id':diagnostic,'status':'partial'if partial else 'completed'if rows else 'no_matches','retryable':partial,'candidate_count':len(candidates),'evaluated_count':len(evaluated),'provider_calls':calls,'provider_usage':usage,'unresolved_count':unresolved,'failure_reasons':list(dict.fromkeys(failures)),'retried_errors':recovered_errors,'independent_verification':False,'trace':list(trace.values()),'elapsed_seconds':round(clock()-started,3),'cache_hit':False,'evaluation_scope':'bounded_retrieved_contextual_passages','limits':{'candidates':max_candidates,'calls':max_calls,'deadline_seconds':deadline_seconds}}
+    metadata={'authority':VERSION,'diagnostic_id':diagnostic,'status':'partial'if partial else 'completed'if rows else 'no_matches','retryable':partial,'candidate_count':len(candidates),'evaluated_count':len(evaluated),'provider_calls':calls,'provider_usage':usage,'unresolved_count':unresolved,'failure_reasons':list(dict.fromkeys(failures)),'retried_errors':recovered_errors,'independent_verification':False,'trace':list(trace.values()),'elapsed_seconds':round(clock()-started,3),'cache_hit':False,'evaluation_scope':'bounded_retrieved_contextual_passages','limits':{'candidates':max_candidates,'calls':max_calls,'deadline_seconds':deadline_seconds,'concurrency':concurrency}}
     return rows,metadata

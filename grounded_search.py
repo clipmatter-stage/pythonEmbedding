@@ -1,7 +1,8 @@
 """Diverse semantic candidates -> original nearby turns -> one grounded rerank.
 No embedding-space change or new identity assertions. Exact matching is separate.
 """
-import copy,hashlib,json,time
+import copy,hashlib,json,time,os
+from dataclasses import asdict
 from collections import defaultdict
 from qdrant_client import models
 from contextual_search import source_filter,source_passage
@@ -33,7 +34,7 @@ class GroundedSearch:
     def search(self,request,video_ids=None):
         started=time.monotonic();epoch=self.revision();params=request.model_dump()if hasattr(request,'model_dump')else vars(request).copy()
         for k in ['cursor','exact_cursor','search_session_id','batch_size']:params.pop(k,None)
-        key='grounded:'+hashlib.sha256(json.dumps([VERSION,hashlib.sha256(SYSTEM.encode()).hexdigest(),self.model,self.embedding_contract,epoch,params,video_ids],sort_keys=True,ensure_ascii=False,default=str).encode()).hexdigest()
+        key='grounded:'+hashlib.sha256(json.dumps([VERSION,hashlib.sha256(SYSTEM.encode()).hexdigest(),os.getenv('RAILWAY_GIT_COMMIT_SHA','development'),asdict(self.base.settings),self.base.sparse_enabled,self.model,self.embedding_contract,epoch,params,video_ids],sort_keys=True,ensure_ascii=False,default=str).encode()).hexdigest()
         cached=self.read_cache(key)
         if cached is not None:
             if self.revision()!=epoch:raise ValidationUnavailable('Search index changed',reason='search_index_changed')
