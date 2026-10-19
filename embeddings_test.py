@@ -6740,4 +6740,4 @@ if __name__ == "__main__":
 
 def recovery_worker_probe():
     from index_recovery_contract import VERSION
-    return {"recovery_contract": VERSION, "model": OPENAI_EMBEDDING_MODEL, "dimensions": EMBEDDING_DIMENSION}
+    return {"recovery_contract": VERSION, "model": OPENAI_EMBEDDING_MODEL, "dimensions": EMBEDDING_DIMENSION, "authenticated_callbacks": True}
