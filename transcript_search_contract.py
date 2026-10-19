@@ -75,9 +75,9 @@ def transcript_results(rows,query,contract='normalized'):
     return results
 
 def search_session_binding(request):
-    fields=['query','words','word','search_mode','filter_type','transcript_contract','video_id','speaker','title','language','time_range','filter_year','filter_month','filter_date','query_decomposition_mode','summary_candidates','min_score','allowed_video_ids','authorization_scope','scope_revision','index_revision']
+    fields=['query','words','word','search_mode','filter_type','transcript_contract','video_id','speaker','title','language','time_range','filter_year','filter_month','filter_date','query_decomposition_mode','summary_candidates','min_score','allowed_video_ids','authorization_scope','scope_revision','index_revision','verify_relevance']
     data={key:getattr(request,key,None) for key in fields}
-    data.update(rules_version=VERSION,build=os.getenv('RAILWAY_GIT_COMMIT_SHA','development'),pipeline=os.getenv('SEARCH_PIPELINE','grounded'),judge_model=os.getenv('SEARCH_JUDGE_MODEL',os.getenv('OPENAI_TEXT_MODEL','gpt-6-luna')))
+    data.update(rules_version=VERSION,build=os.getenv('RAILWAY_GIT_COMMIT_SHA','development'),pipeline=os.getenv('SEARCH_PIPELINE','fast'),judge_model=os.getenv('SEARCH_JUDGE_MODEL',os.getenv('OPENAI_TEXT_MODEL','gpt-6-luna')))
     data.update(embedding_contract=[os.getenv('OPENAI_EMBEDDING_MODEL','text-embedding-3-large'),os.getenv('EMBEDDING_DIMENSION','3072')],candidate_limit=os.getenv('FAST_SEARCH_CANDIDATE_LIMIT','100'),minimum_dense_score=os.getenv('SEARCH_MIN_DENSE_SCORE','0'))
     return hashlib.sha256(json.dumps(data,sort_keys=True,ensure_ascii=False).encode()).hexdigest()
 

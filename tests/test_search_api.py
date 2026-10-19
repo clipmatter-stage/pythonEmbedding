@@ -60,6 +60,13 @@ class MemoryRedis:
     def exists(self, key):
         return int(key in self.values or key in self.hashes)
 
+    def delete(self, *keys):
+        count = sum(key in self.values or key in self.hashes for key in keys)
+        for key in keys:
+            self.values.pop(key, None)
+            self.hashes.pop(key, None)
+        return count
+
 
 class SearchApiTest(unittest.TestCase):
     @classmethod
@@ -87,6 +94,10 @@ class SearchApiTest(unittest.TestCase):
         cache_patch = patch.object(self.api, "search_cache_redis", self.shared_cache)
         cache_patch.start()
         self.addCleanup(cache_patch.stop)
+        if hasattr(self.api.qdrant_client, "redis"):
+            revision_patch = patch.object(self.api.qdrant_client, "redis", self.shared_cache)
+            revision_patch.start()
+            self.addCleanup(revision_patch.stop)
         redis_patch = patch.object(self.api, "redis_conn", self.shared_cache)
         redis_patch.start()
         self.addCleanup(redis_patch.stop)
@@ -125,6 +136,71 @@ class SearchApiTest(unittest.TestCase):
         self.assertEqual("qdrant_dense", response["ranking"]["engine"])
         self.assertFalse(response["ranking"]["evidence_verified"])
         embedding.assert_called_once_with("fast passage", 8)
+
+    def test_unset_pipeline_defaults_to_fast_and_grounded_remains_explicit(self):
+        from fast_search import FastSemanticSearch
+        from grounded_search import GroundedSearch
+        with patch.dict(os.environ):
+            os.environ.pop("SEARCH_PIPELINE", None)
+            fast = self.api.get_contextual_search()
+            grounded = self.api.get_contextual_search("grounded")
+            self.assertIsInstance(fast, FastSemanticSearch)
+            self.assertIsNone(fast.validator)
+            self.assertIsNone(fast.reranker)
+            self.assertIsInstance(grounded, GroundedSearch)
+            self.assertIs(fast, self.api.get_contextual_search())
+
+    def test_verification_opt_in_selects_grounded_engine(self):
+        from unittest.mock import Mock
+        service = Mock()
+        service.search.return_value = {"results": [], "ranking": {"engine": "grounded_contextual"}}
+        with patch.object(self.api, "get_contextual_search", return_value=service) as factory:
+            asyncio.run(self.api.search(self.api.SearchRequest(query="falast", verify_relevance=True), True))
+        factory.assert_called_once_with("grounded")
+        self.assertTrue(service.search.call_args.args[0].verify_relevance)
+
+    def test_merged_summary_verification_preserves_engine_choice_and_typed_errors(self):
+        from unittest.mock import Mock
+        request = self.api.SearchRequest(query="falast", search_mode="simple",
+                                         filter_type="summary", verify_relevance=True)
+        service = Mock()
+        for reason, status in [("search_index_changed", 409), ("provider_timeout", 503)]:
+            with self.subTest(reason=reason), patch.object(self.api, "get_contextual_search", return_value=service) as factory, patch(
+                    "grounded_search.summary_search", side_effect=self.api.ValidationUnavailable("unavailable", reason=reason)) as summary:
+                with self.assertRaises(self.api.HTTPException) as error:
+                    asyncio.run(self.api.search(request, True))
+                self.assertEqual(status, error.exception.status_code)
+                factory.assert_called_once_with("grounded")
+                summary.assert_called_once_with(service, request)
+
+    def test_merged_cursor_binding_keeps_mode_and_retrieval_configuration(self):
+        request = self.api.IncrementalSearchRequest(query="falast")
+        settings = {"SEARCH_PIPELINE": "fast", "OPENAI_EMBEDDING_MODEL": "text-embedding-3-large",
+                    "EMBEDDING_DIMENSION": "3072", "FAST_SEARCH_CANDIDATE_LIMIT": "100",
+                    "SEARCH_MIN_DENSE_SCORE": "0"}
+        with patch.dict(os.environ, settings):
+            baseline = self.api.search_session_binding(request)
+            self.assertNotEqual(baseline, self.api.search_session_binding(request.model_copy(update={"verify_relevance": True})))
+            for name, value in {"OPENAI_EMBEDDING_MODEL": "other-model", "EMBEDDING_DIMENSION": "1536",
+                                "FAST_SEARCH_CANDIDATE_LIMIT": "200", "SEARCH_MIN_DENSE_SCORE": "0.2"}.items():
+                with self.subTest(setting=name), patch.dict(os.environ, {name: value}):
+                    self.assertNotEqual(baseline, self.api.search_session_binding(request))
+
+    def test_incremental_verification_is_forwarded_and_cursor_cannot_change_mode(self):
+        from unittest.mock import AsyncMock
+        query = self.api.IncrementalSearchRequest(query="falast", verify_relevance=True, batch_size=1)
+        rows = [{"id": 1, "video_id": 1, "score": .9}, {"id": 2, "video_id": 2, "score": .8}]
+        with patch.dict(os.environ, {"SEARCH_PIPELINE": "fast"}), patch.object(self.api, "redis_conn", self.shared_cache), patch.object(
+                self.api, "search", new=AsyncMock(return_value={"results": rows})) as search:
+            first = asyncio.run(self.api.search_incremental(query, True))
+            self.assertTrue(search.call_args.args[0].verify_relevance)
+            continuation = query.model_copy(update={"cursor": first["cursor"]["next"]})
+            second = asyncio.run(self.api.search_incremental(continuation, True))
+            self.assertEqual(2, second["results"][0]["id"])
+            with self.assertRaises(self.api.HTTPException) as error:
+                asyncio.run(self.api.search_incremental(continuation.model_copy(update={"verify_relevance": False}), True))
+        self.assertEqual(409, error.exception.status_code)
+        self.assertEqual("search_session_mismatch", error.exception.detail["code"])
 
     def test_fast_incremental_reuses_snapshot_without_another_embedding(self):
         self.put(9802, "Fast pagination passage.", video_id=9802)

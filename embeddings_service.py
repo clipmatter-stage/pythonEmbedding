@@ -519,6 +519,7 @@ class EmbedVideoRequest(BaseModel):
     video_summary_urdu: str = Field(default="", max_length=10000)
 
 class SearchRequest(BaseModel):
+    verify_relevance: bool = False
     exact_cursor: Optional[str] = Field(default=None,max_length=100)
     exact_page_size: int = Field(default=100,ge=1,le=100)
     allowed_video_ids: Optional[List[int]] = Field(default=None,max_length=10000)
@@ -560,6 +561,7 @@ class TitleSearchRequest(BaseModel):
     limit: int = Field(default=10, ge=1, le=100)
 
 class IncrementalSearchRequest(BaseModel):
+    verify_relevance: bool = False
     exact_cursor: Optional[str] = Field(default=None,max_length=100)
     exact_page_size: int = Field(default=100,ge=1,le=100)
     allowed_video_ids: Optional[List[int]] = Field(default=None,max_length=10000)
@@ -1198,8 +1200,8 @@ def validate_indexing_input(data: dict) -> None:
             raise HTTPException(status_code=422, detail="Invalid seconds interval")
 
 
-@lru_cache(maxsize=1)
-def get_contextual_search() -> ContextualSearch | FastSemanticSearch:
+@lru_cache(maxsize=3)
+def get_contextual_search(pipeline_override: Optional[str] = None) -> ContextualSearch | FastSemanticSearch:
     if not USE_OPENAI_EMBEDDINGS or not openai_client:
         raise RuntimeError("Contextual search requires OpenAI embeddings and OPENAI_API_KEY")
     source_info = qdrant_client.get_collection(SEGMENTS_COLLECTION)
@@ -1207,7 +1209,7 @@ def get_contextual_search() -> ContextualSearch | FastSemanticSearch:
     if isinstance(vector_config, dict) or vector_config.size != EMBEDDING_DIMENSION:
         raise RuntimeError("Source collection dimension/schema mismatch; reindex into a new collection")
     settings = SearchSettings.from_env()
-    pipeline = os.getenv("SEARCH_PIPELINE", "grounded").lower()
+    pipeline = (pipeline_override or os.getenv("SEARCH_PIPELINE", "fast")).lower()
     if pipeline not in {"fast", "verified", "grounded"}:
         raise ValueError("SEARCH_PIPELINE must be grounded, fast or verified")
 
@@ -2554,11 +2556,19 @@ async def embed(data: dict):
         "status": "success"
     }
 
+def search_pipeline(request):
+    return "grounded" if request.verify_relevance else os.getenv("SEARCH_PIPELINE", "fast").lower()
+
+
+def search_engine(request):
+    return get_contextual_search("grounded") if request.verify_relevance else get_contextual_search()
+
+
 @app.post("/search")
 async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)):
-    if data.search_mode=='simple' and data.filter_type=='summary' and os.getenv("SEARCH_PIPELINE","grounded")=="grounded":
+    if data.search_mode=='simple' and data.filter_type=='summary' and search_pipeline(data)=="grounded":
         from grounded_search import summary_search
-        try:return await asyncio.to_thread(lambda:summary_search(get_contextual_search(),data))
+        try:return await asyncio.to_thread(lambda:summary_search(search_engine(data),data))
         except ValidationUnavailable as error:raise HTTPException(409 if error.reason=="search_index_changed" else 503,detail=validation_error_detail(error)) from error
         except ValueError as error:raise HTTPException(422,detail=str(error)) from error
         except HTTPException:raise
@@ -3485,7 +3495,7 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
         })
 
     try:
-        return await asyncio.to_thread(lambda: get_contextual_search().search(data))
+        return await asyncio.to_thread(lambda: search_engine(data).search(data))
     except ValidationUnavailable as error:
         raise HTTPException(status_code=409 if error.reason=="search_index_changed" else 503, detail=validation_error_detail(error)) from error
     except HTTPException:
@@ -3536,7 +3546,7 @@ async def search_incremental(data: IncrementalSearchRequest, authorized: bool = 
       }
     """
     from exact_search_cursor import revision,CursorError
-    if os.getenv("SEARCH_PIPELINE","grounded")=="grounded":
+    if search_pipeline(data)=="grounded":
         try:data=data.model_copy(update={"index_revision":revision(redis_conn)})
         except CursorError as error:raise HTTPException(error.status,detail={'code':error.code,'message':error.message,'retryable':True}) from error
         except Exception as error:raise HTTPException(503,detail={'code':'search_session_unavailable','message':'Search revision cache is temporarily unavailable. Retry this page.','retryable':True}) from error
@@ -3684,6 +3694,7 @@ async def search_incremental(data: IncrementalSearchRequest, authorized: bool = 
         words=list(data.words) if data.words else [],
         word=data.word,
         transcript_contract=data.transcript_contract,
+        verify_relevance=data.verify_relevance,
         summary_candidates=data.summary_candidates,
         allowed_video_ids=data.allowed_video_ids,authorization_scope=data.authorization_scope,scope_revision=data.scope_revision,index_revision=getattr(data,"index_revision",None),
         top_k=delegate_top_k,
@@ -3863,10 +3874,11 @@ async def search_multi_video(data: dict, authorized: bool = Depends(verify_api_k
         raise HTTPException(status_code=400, detail="top_k and number of video_ids must be between 1 and 1000")
     request = SearchRequest(
         query=query, top_k=min(top_k * len(video_ids), 1000),
+        verify_relevance=data.get("verify_relevance", False),
         min_score=data.get("min_score", 0.0), language=data.get("language"),
     )
     try:
-        response = await asyncio.to_thread(lambda: get_contextual_search().search(request, video_ids))
+        response = await asyncio.to_thread(lambda: search_engine(request).search(request, video_ids))
     except ValidationUnavailable as error:
         raise HTTPException(status_code=409 if error.reason=="search_index_changed" else 503, detail=validation_error_detail(error)) from error
     except HTTPException:
@@ -4387,9 +4399,9 @@ async def health():
                 "fastembed_model": FASTEMBED_MODEL_NAME,
                 "llm_understanding": os.getenv("USE_LLM_UNDERSTANDING", "true"),
                 "text_model": OPENAI_TEXT_MODEL,
-                "search_pipeline": os.getenv("SEARCH_PIPELINE", "grounded"),
-                "reranking_enabled": os.getenv("SEARCH_PIPELINE", "grounded") in {"grounded","verified"} or os.getenv("SEARCH_RERANKING", "false").lower() == "true",
-                "reranking_engine": "grounded_judge" if os.getenv("SEARCH_PIPELINE","grounded")=="grounded" else "qdrant_maxsim" if os.getenv("SEARCH_PIPELINE", "grounded") in {"grounded","verified"} or os.getenv("SEARCH_RERANKING", "false").lower() == "true" else "disabled",
+                "search_pipeline": os.getenv("SEARCH_PIPELINE", "fast"),
+                "reranking_enabled": os.getenv("SEARCH_PIPELINE", "fast") in {"grounded","verified"} or os.getenv("SEARCH_RERANKING", "false").lower() == "true",
+                "reranking_engine": "grounded_judge" if os.getenv("SEARCH_PIPELINE","fast")=="grounded" else "qdrant_maxsim" if os.getenv("SEARCH_PIPELINE", "fast") in {"grounded","verified"} or os.getenv("SEARCH_RERANKING", "false").lower() == "true" else "disabled",
                 "reranking_model": SearchSettings.from_env().model,
                 "sparse_index_available": SPARSE_NAME in (collection_info.config.params.sparse_vectors or {}),
             }
@@ -4424,16 +4436,16 @@ async def root():
     settings = SearchSettings.from_env()
     return {
         "service": "Contextual Video Transcript Search API",
-        "version": "8.1",
+        "version": "8.2",
         "ai_features": {
             "text_model": OPENAI_TEXT_MODEL,
             "embedding_model": OPENAI_EMBEDDING_MODEL,
             "embedding_dimension": EMBEDDING_DIMENSION,
-            "search_pipeline": os.getenv("SEARCH_PIPELINE", "grounded"),
-            "reranking_engine": "grounded_judge" if os.getenv("SEARCH_PIPELINE","grounded")=="grounded" else "qdrant_maxsim" if os.getenv("SEARCH_PIPELINE", "grounded") in {"grounded","verified"} or os.getenv("SEARCH_RERANKING", "false").lower() == "true" else "disabled",
+            "search_pipeline": os.getenv("SEARCH_PIPELINE", "fast"),
+            "reranking_engine": "grounded_judge" if os.getenv("SEARCH_PIPELINE","fast")=="grounded" else "qdrant_maxsim" if os.getenv("SEARCH_PIPELINE", "fast") in {"grounded","verified"} or os.getenv("SEARCH_RERANKING", "false").lower() == "true" else "disabled",
             "reranking_model": settings.model,
-            "passage_evidence_validation": os.getenv("SEARCH_PIPELINE", "grounded") in {"grounded","verified"} or os.getenv("SEARCH_VALIDATE_RESULTS", "false").lower() == "true",
-            "independent_verification": os.getenv("SEARCH_PIPELINE", "grounded") == "verified" or os.getenv("SEARCH_VALIDATE_RESULTS", "false").lower() == "true",
+            "passage_evidence_validation": os.getenv("SEARCH_PIPELINE", "fast") in {"grounded","verified"} or os.getenv("SEARCH_VALIDATE_RESULTS", "false").lower() == "true",
+            "independent_verification": os.getenv("SEARCH_PIPELINE", "fast") == "verified" or os.getenv("SEARCH_VALIDATE_RESULTS", "false").lower() == "true",
             "reranking_collection": settings.rerank_collection,
             "context_seconds": settings.context_seconds,
             "cross_language_search": True,

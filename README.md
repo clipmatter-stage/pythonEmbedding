@@ -1,7 +1,7 @@
 # Video transcript search
 
 `embeddings_service.py` preserves the legacy API and indexing contracts while
-using grounded contextual retrieval by default. `embeddings_test.py` remains available for legacy jobs and endpoints. The Docker image retains its legacy default command; the Railway API
+using fast vector retrieval by default, with optional grounded verification. `embeddings_test.py` remains available for legacy jobs and endpoints. The Docker image retains its legacy default command; the Railway API
 uses the modern service when its custom start command is `bash start.sh`.
 
 ## Setup
@@ -24,11 +24,22 @@ backfilling the sparse index because legacy upserts do not preserve sparse data.
 The Docker image includes both implementations and still defaults to the legacy
 script. To select the new service, set Railway's web Custom Start Command to
 `bash start.sh`, or run that command locally. Rebuild the image first. Leave the
-worker's separate RQ command in place. Verify `GET /` reports version `8.1` and
+worker's separate RQ command in place. Verify `GET /` reports version `8.2` and
 `ai_features.search_pipeline: fast`. Sparse-index migrations are explicit operations; pushing to a Railway-linked
 branch can deploy automatically according to that service's settings.
 
-## Phase 4 grounded contextual search (default)
+## Ordinary search and optional verification
+
+`SEARCH_PIPELINE=fast` is the default: one cached query embedding, bounded Qdrant
+retrieval, and no mandatory passage judging. `POST /search`, `/search/incremental`
+and `/search-multi-video` accept `verify_relevance: true` to select grounded
+checking explicitly. This runs a new search and can take tens of seconds.
+Laravel forwards this flag and the results page offers **Verify relevance**.
+The selected mode is retained in subsequent pages and bound to the cursor;
+changing it requires a fresh search. Metadata/exact searches retain their routes.
+Summary search keeps its existing evidence requirements and can still be slow.
+
+## Grounded contextual verification (optional)
 
 `SEARCH_PIPELINE=grounded` retrieves the existing compatible dense/sparse candidate
 pool, selects diverse videos before output truncation, and expands nearby original
@@ -44,8 +55,8 @@ diagnostics without printing transcripts or credentials.
 the default remains `gpt-6-luna` after the controlled Phase 4 comparison. No
 embedding model/dimension change or reranking-weight download is required. The
 old `SEARCH_RERANKING`/`SEARCH_VALIDATE_RESULTS` flags govern `fast` mode, not this
-grounded path. Set `SEARCH_PIPELINE=fast` only as an explicit unverified-retrieval
-rollback. Set `verified` for the older independently checked MaxSim path.
+grounded path. `SEARCH_PIPELINE=grounded` can still make checking mandatory for
+an entire deployment. Set `verified` for the older independently checked MaxSim path.
 
 Summary candidate selection remains in Laravel with shared multilingual rules.
 The full authorized candidate registry (up to 10,000 videos) enters a single
