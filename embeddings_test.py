@@ -2442,7 +2442,7 @@ def send_webhook_with_retry(webhook_url: str, payload: dict, max_attempts: int =
 
     for attempt in range(1, max_attempts + 1):
         try:
-            response = requests.post(webhook_url, json=payload, timeout=30)
+            response = requests.post(webhook_url, json=payload, timeout=30, headers={"X-API-Key": API_KEY} if API_KEY else {})
             response.raise_for_status()
             logger.info(
                 "[WORKER] Webhook delivered on attempt %s/%s: status=%s response=%s",
