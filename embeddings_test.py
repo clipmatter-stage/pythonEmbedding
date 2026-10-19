@@ -511,6 +511,12 @@ class EmbedVideoRequest(BaseModel):
     video_summary_urdu: str = Field(default="", max_length=10000)
 
 class SearchRequest(BaseModel):
+    exact_cursor: Optional[str] = Field(default=None,max_length=100)
+    exact_page_size: int = Field(default=100,ge=1,le=100)
+    allowed_video_ids: Optional[List[int]] = Field(default=None,max_length=10000)
+    authorization_scope: Optional[str] = None
+    scope_revision: Optional[str] = None
+
     summary_candidates: Optional[List[dict]] = Field(default=None, max_length=60)
     transcript_contract: str = Field(default="normalized", pattern="^(literal|normalized|alias)$")
     query: str = Field(default="", max_length=1000)
@@ -545,6 +551,12 @@ class TitleSearchRequest(BaseModel):
     limit: int = Field(default=10, ge=1, le=100)
 
 class IncrementalSearchRequest(BaseModel):
+    exact_cursor: Optional[str] = Field(default=None,max_length=100)
+    exact_page_size: int = Field(default=100,ge=1,le=100)
+    allowed_video_ids: Optional[List[int]] = Field(default=None,max_length=10000)
+    authorization_scope: Optional[str] = None
+    scope_revision: Optional[str] = None
+
     transcript_contract: str = Field(default="normalized", pattern="^(literal|normalized|alias)$")
     """Request model for incremental cursor-based search"""
     query: str = Field(default="", max_length=1000)
@@ -2243,6 +2255,11 @@ logger.info("Connecting to Qdrant...")
 qdrant_client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY, timeout=120)
 logger.info("Connected to Qdrant successfully")
 
+from callback_transport import register_callback_probe
+register_callback_probe(app,task_queue,redis_conn,API_KEY,"embeddings_test.process_video_task")
+from exact_search_cursor import RevisionedClient, register_exact_search
+qdrant_client = RevisionedClient(qdrant_client, redis_conn)
+register_exact_search(app, qdrant_client, redis_conn, SEGMENTS_COLLECTION, models, verify_api_key, API_KEY)
 from index_operations import register_index_operations
 register_index_operations(app, qdrant_client, SEGMENTS_COLLECTION, redis_conn, API_KEY,
     recovery_settings={"model": OPENAI_EMBEDDING_MODEL, "dimensions": EMBEDDING_DIMENSION}, queue=task_queue)
@@ -2436,42 +2453,15 @@ class WebhookDeliveryError(RuntimeError):
     """Raised when processing succeeded but Laravel could not be notified."""
 
 
-def send_webhook_with_retry(webhook_url: str, payload: dict, max_attempts: int = 5) -> None:
-    """Deliver a Laravel status webhook and fail loudly if it cannot be delivered."""
-    last_error = None
+def send_webhook_with_retry(webhook_url: str, payload: dict, max_attempts: int = 5, callback_token=None) -> None:
+    from callback_transport import deliver
+    return deliver(webhook_url,payload,API_KEY,WebhookDeliveryError,max_attempts,callback_token)
 
-    for attempt in range(1, max_attempts + 1):
-        try:
-            response = requests.post(webhook_url, json=payload, timeout=30, headers={"X-API-Key": API_KEY} if API_KEY else {})
-            response.raise_for_status()
-            logger.info(
-                "[WORKER] Webhook delivered on attempt %s/%s: status=%s response=%s",
-                attempt,
-                max_attempts,
-                response.status_code,
-                response.text[:500],
-            )
-            return
-        except requests.RequestException as exc:
-            last_error = exc
-            response = getattr(exc, "response", None)
-            logger.warning(
-                "[WORKER] Webhook attempt %s/%s failed: error=%s status=%s response=%s",
-                attempt,
-                max_attempts,
-                exc,
-                response.status_code if response is not None else None,
-                response.text[:500] if response is not None else None,
-            )
 
-            if attempt < max_attempts:
-                time.sleep(min(2 ** (attempt - 1), 15))
-
-    raise WebhookDeliveryError(
-        f"Webhook delivery failed after {max_attempts} attempts: {last_error}"
-    )
-    
 def process_video_task(data_dict: dict):
+    if data_dict.get("operation") == "callback_probe":
+        from callback_transport import worker_canary
+        return worker_canary(data_dict, API_KEY, __name__, isinstance(qdrant_client, RevisionedClient))
     """Background worker task to process video embeddings and upsert to Qdrant."""
     from transcript_search_contract import indexed_text_fields
     from index_recovery_contract import VERSION as RECOVERY_VERSION, lexical, commit_recovery
@@ -2726,7 +2716,7 @@ def process_video_task(data_dict: dict):
                 **({"coverage_verified": True, "recovery_contract": RECOVERY_VERSION,
                     "source_sha256": recovery["source_sha256"]} if recovery else {})
             }
-            send_webhook_with_retry(webhook_url, payload_success)
+            send_webhook_with_retry(webhook_url, payload_success, callback_token=data_dict.get("_callback_token"))
                 
     except Exception as e:
         logger.error(f"[WORKER] Error processing video {video_id}: {str(e)}")
@@ -2740,7 +2730,7 @@ def process_video_task(data_dict: dict):
                 "error": str(e)
             }
             try:
-                send_webhook_with_retry(webhook_url, payload_error)
+                send_webhook_with_retry(webhook_url, payload_error, callback_token=data_dict.get("_callback_token"))
             except Exception as we:
                 logger.error(f"[WORKER] Webhook error notification failed: {str(we)}")
         raise
@@ -2754,6 +2744,8 @@ async def embed_video(data: EmbedVideoRequest, authorized: bool = Depends(verify
         if data.embedding_dimensions and data.embedding_dimensions != EMBEDDING_DIMENSION:
             raise HTTPException(status_code=422, detail="Embedding dimension contract mismatch")
         data_dict = data.model_dump()
+        from callback_transport import attach_callback_token
+        data_dict = attach_callback_token(data_dict, API_KEY)
         if data.recovery_contract:
             from index_recovery_contract import VERSION as recovery_version
             if data.recovery_contract.get("version") != recovery_version or not data.run_id:
@@ -2853,6 +2845,12 @@ async def embed(data: dict):
 
 @app.post("/search")
 async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)):
+    if data.search_mode == 'simple' and data.filter_type == 'text':
+        from exact_search_cursor import exact_response
+        payload=data.model_dump();payload['query']=data.query or data.word or ' '.join(data.words or [])
+        payload['exact_cursor']=data.exact_cursor or getattr(data,'cursor',None)
+        return await exact_response(payload,qdrant_client,redis_conn,SEGMENTS_COLLECTION,models)
+
     """
     ADVANCED SEARCH with:
     - OpenAI embeddings for superior semantic understanding
@@ -2927,6 +2925,11 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
     # Eligibility: processing_status=completed, approval_status=approved, is_archived=false
     # ═══════════════════════════════════════════════════════════════════════════
     if search_mode == "simple" and filter_type in {"text", "title", "summary"}:
+        if filter_type == "text":
+            from exact_search_cursor import exact_response
+            payload=data.model_dump();payload['query']=data.query or data.word or ' '.join(data.words or [])
+            return await exact_response(payload,qdrant_client,redis_conn,SEGMENTS_COLLECTION,models)
+
         try:
             return contract_search(data, BoundedRetrieval(qdrant_client), SEGMENTS_COLLECTION,
                                    models, get_semantic_query_embedding, judge_passage_batch,
@@ -5249,6 +5252,12 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
 
 @app.post("/search/incremental")
 async def search_incremental(data: IncrementalSearchRequest, authorized: bool = Depends(verify_api_key)):
+    if data.search_mode == 'simple' and data.filter_type == 'text':
+        from exact_search_cursor import exact_response
+        payload=data.model_dump();payload['query']=data.query or data.word or ' '.join(data.words or [])
+        payload['exact_cursor']=data.exact_cursor or getattr(data,'cursor',None)
+        return await exact_response(payload,qdrant_client,redis_conn,SEGMENTS_COLLECTION,models)
+
     """
     INCREMENTAL CURSOR-BASED SEARCH for fast pagination.
     

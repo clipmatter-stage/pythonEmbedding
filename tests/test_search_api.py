@@ -31,10 +31,22 @@ class MemoryRedis:
         if nx and key in self.values:
             return False
         self.values[key] = str(value).encode()
-        return True
+        return self
 
     def get(self, key):
         return self.values.get(key)
+
+    def exists(self, key):
+        return key in self.values
+
+    def delete(self, key):
+        self.values.pop(key, None)
+
+    def pipeline(self, **kwargs):
+        return self
+
+    def execute(self):
+        return []
 
     def hset(self, key, field, value):
         self.hashes.setdefault(key, {})[str(field).encode()] = value.encode()
@@ -504,18 +516,21 @@ class SearchApiTest(unittest.TestCase):
         client.close()
 
     def test_incremental_contract_metadata_survives_cache_and_contract_changes_fail(self):
+        from fastapi import HTTPException
         self.put(9032, "IPP IPP", video_id=9032)
         self.put(9033, "IPP", video_id=9033)
-        request = self.api.IncrementalSearchRequest(query="IPP", search_mode="simple", filter_type="text", batch_size=1)
-        first = asyncio.run(self.api.search_incremental(request, True))
-        second = asyncio.run(self.api.search_incremental(request.model_copy(update={"cursor": first["cursor"]["next"]}), True))
-        self.assertTrue(second["metadata"]["cache_hit"])
-        self.assertEqual(first["metadata"]["search_contract"], second["metadata"]["search_contract"])
-        with self.assertRaises(self.api.HTTPException) as error:
-            asyncio.run(self.api.search_incremental(request.model_copy(update={
-                "cursor": first["cursor"]["next"], "transcript_contract": "literal",
-            }), True))
-        self.assertEqual(409, error.exception.status_code)
+        request = self.api.IncrementalSearchRequest(query="IPP", search_mode="simple", filter_type="text", batch_size=1, exact_page_size=1)
+        with patch.object(self.api, "redis_conn", self.shared_cache):
+            first = asyncio.run(self.api.search_incremental(request, True))
+            continuation = request.model_copy(update={"cursor": first["cursor"]["next"]})
+            second = asyncio.run(self.api.search_incremental(continuation, True))
+            replay = asyncio.run(self.api.search_incremental(continuation, True))
+            self.assertTrue(replay["search_contract"]["metrics"]["response_cache_hit"])
+            self.assertEqual(second["results"], replay["results"])
+            self.assertEqual(second["cursor"], replay["cursor"])
+            with self.assertRaises(HTTPException) as error:
+                asyncio.run(self.api.search_incremental(continuation.model_copy(update={"transcript_contract": "literal"}), True))
+            self.assertEqual(409, error.exception.status_code)
 
     def test_enqueue_registers_generation_and_preserves_new_job_module(self):
         from unittest.mock import Mock
@@ -531,6 +546,19 @@ class SearchApiTest(unittest.TestCase):
         self.assertEqual(b"generation-1", redis.get("index-active:9034"))
         self.assertEqual("embeddings_service.process_video_task", queue.enqueue.call_args.args[0])
         self.assertEqual("generation-1", queue.enqueue.call_args.args[1]["run_id"])
+
+    def test_recovery_contract_uses_strict_recovery_worker(self):
+        from unittest.mock import Mock
+        from index_recovery_contract import VERSION
+        queue = Mock()
+        queue.enqueue.return_value.id = "recovery-job"
+        request = self.api.EmbedVideoRequest(video_id=9034, run_id="recovery-generation",
+            recovery_contract={"version": VERSION},
+            identification_segments=[{"text": "Source text", "start": 1, "end": 5}])
+        with patch.object(self.api, "redis_conn", MemoryRedis()), patch.object(self.api, "task_queue", queue):
+            asyncio.run(self.api.embed_video(request, True))
+        self.assertEqual("embeddings_test.process_video_task", queue.enqueue.call_args.args[0])
+        self.assertEqual({"version": VERSION}, queue.enqueue.call_args.args[1]["recovery_contract"])
 
     def test_stale_generation_does_not_overwrite_current_index(self):
         redis = MemoryRedis()
@@ -575,7 +603,8 @@ class SearchApiTest(unittest.TestCase):
             self.api.requests, "post", return_value=response,
         ) as post:
             self.api.send_webhook_with_retry("https://laravel.test/api/embeddings/callback", {"status": "processing"})
-        self.assertEqual({"X-API-Key": "shared-secret"}, post.call_args.kwargs["headers"])
+        self.assertEqual("shared-secret", post.call_args.kwargs["headers"]["X-API-Key"])
+        self.assertFalse(post.call_args.kwargs["allow_redirects"])
 
     def test_callbacks_complete_only_after_all_generation_batches_commit(self):
         redis = MemoryRedis()

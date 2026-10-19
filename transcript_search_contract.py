@@ -28,6 +28,11 @@ def normalized_with_spans(text):
             replacement=[spans[i] for i in letter_offsets]
             spans[m.start():m.end()]=replacement
             value=value[:m.start()]+acronym+value[m.end():]
+
+    # Orthographic plural of this acronym; this is not topic expansion.
+    for m in reversed(list(re.finditer(r'(?<!\w)ipps(?!\w)',value))):
+        original=spans[m.start():m.end()];spans[m.start():m.end()]=original[:2]+[(original[2][0],original[3][1])]
+        value=value[:m.start()]+'ipp'+value[m.end():]
     return value,spans
 
 def normalize(text):return normalized_with_spans(text)[0]
@@ -41,23 +46,12 @@ def query_variants(query,contract):
     return [value]
 
 def match_spans(text,query,contract='normalized'):
-    if contract not in {'literal','normalized','alias'}:raise ValueError('Invalid transcript contract')
-    if contract=='literal':haystack=text;variants=[query.strip()];mapping=None
-    else:haystack,mapping=normalized_with_spans(text);variants=query_variants(query,contract)
-    found={}
-    for value in variants:
-        if not value:continue
-        pattern=(r'(?<!\w)' if re.match(r'\w',value[0]) else '')+re.escape(value)+(r'(?!\w)' if re.match(r'\w',value[-1]) else '')
-        for m in re.finditer(pattern,haystack):
-            start=m.start() if mapping is None else mapping[m.start()][0]
-            end=m.end() if mapping is None else mapping[m.end()-1][1]
-            found[(start,end)]={'start':start,'end':end,'text':text[start:end]}
-    return [found[key] for key in sorted(found)]
+    return CompiledMatcher(query,contract).spans(text)
 
 def indexed_text_fields(text):return {'search_contract_version':VERSION,'transcript_normalized_v1':normalize(text)}
 
 def title_score(title,query):
-    title=normalize(title);query=normalize(query)
+    title=normalize(title.replace('_',' '));query=normalize(query.replace('_',' '))
     if not query:return 0
     return 1 if title==query else .9 if set(query.split()).issubset(title.split()) else 0
 
@@ -136,7 +130,7 @@ def contract_search(request,reader,collection,models,embed,judge,*,use_normalize
         if summary_candidates is None:
             candidates={}
             for r in rows:
-                matched=[f for f in summaries if title_score(r.get(f,'') or '',query)]
+                matched=[f for f in summaries if summary_score(r.get(f,'') or '',query)]
                 if matched:candidates.setdefault(r['video_id'],set()).update(matched)
             summary_candidates=[{'video_id':k,'matched_summary_fields':sorted(v)} for k,v in candidates.items()]
         passages=[];fields_by_video={};query_vector=embed(query,8) if summary_candidates else None
@@ -157,3 +151,33 @@ def contract_search(request,reader,collection,models,embed,judge,*,use_normalize
     metadata={'authority':'python_contract_v1','representation':VERSION,'contract':contract if kind=='text' else kind,'exhaustive':exhaustive,'status':'partial' if not exhaustive else 'completed' if results else 'no_matches','retryable':not exhaustive,'counts':counts,'scanned_segments':scanned,'normalized_index_used':normalized_index_used,'scope':'eligible_indexed_segments'}
     if passage_validation:metadata['passage_validation']=passage_validation
     return {'results':results,'returned':len(results),'search_contract':metadata,'search_mode':'simple','filter_type':kind,'query':query}
+
+
+def alias_with_spans(text):
+    value,spans=normalized_with_spans(text)
+    variants={normalize(alias):normalize(key) for key,aliases in CONFIG['aliases'].items() for alias in [key,*aliases]}
+    pattern=re.compile(r'(?<!\w)(?:'+'|'.join(re.escape(x) for x in sorted(variants,key=len,reverse=True))+r')(?!\w)')
+    for m in reversed(list(pattern.finditer(value))):
+        key=variants[m.group()];source=(spans[m.start()][0],spans[m.end()-1][1]);spans[m.start():m.end()]=[source]*len(key);value=value[:m.start()]+key+value[m.end():]
+    return value,spans
+
+class CompiledMatcher:
+    def __init__(self,query,contract):
+        if contract not in {'literal','normalized','alias'}:raise ValueError('Invalid transcript contract')
+        self.contract=contract
+        value=query.strip() if contract=='literal' else alias_with_spans(query)[0] if contract=='alias' else normalize(query)
+        if not value:raise ValueError('Empty normalized query')
+        self.pattern=re.compile((r'(?<!\w)' if re.match(r'\w',value[0]) else '')+re.escape(value)+(r'(?!\w)' if re.match(r'\w',value[-1]) else ''))
+    def spans(self,text):
+        if self.contract=='literal':value=text;mapping=None
+        else:value,mapping=alias_with_spans(text) if self.contract=='alias' else normalized_with_spans(text)
+        out=[]
+        for m in self.pattern.finditer(value):
+            start=m.start() if mapping is None else mapping[m.start()][0];end=m.end() if mapping is None else mapping[m.end()-1][1]
+            out.append({'start':start,'end':end,'text':text[start:end]})
+        return out
+
+
+def summary_score(text,query):
+    body=alias_with_spans(text)[0];wanted=alias_with_spans(query)[0]
+    return bool(wanted) and set(wanted.split()).issubset(body.split())

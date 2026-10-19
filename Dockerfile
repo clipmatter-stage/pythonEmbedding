@@ -30,6 +30,8 @@ RUN python -m py_compile embeddings_service.py contextual_search.py fast_search.
 COPY semantic_query_decomposition.py .
 COPY semantic_passage_evidence.py .
 COPY transcript_search_contract.py .
+COPY exact_search_cursor.py .
+COPY callback_transport.py .
 COPY index_operations.py .
 COPY index_recovery_contract.py .
 COPY search_contract_v1.json .

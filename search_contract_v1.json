@@ -1,1 +1,54 @@
-{"version":"transcript_contract_v1","acronyms":{"ipp":["i","p","p"]},"aliases":{"ipp":["ipp","آئی پی پی"]}}
+{
+  "version": "transcript_contract_v2",
+  "acronyms": {
+    "ipp": [
+      "i",
+      "p",
+      "p"
+    ],
+    "imf": [
+      "i",
+      "m",
+      "f"
+    ]
+  },
+  "aliases": {
+    "ipp": [
+      "ipp",
+      "ipps",
+      "آئی پی پی"
+    ],
+    "imf": [
+      "imf",
+      "آئی ایم ایف"
+    ],
+    "k electric": [
+      "k electric",
+      "kelectric",
+      "کے الیکٹرک"
+    ],
+    "palestine": [
+      "palestine",
+      "falasteen",
+      "palesteen",
+      "فلسطین"
+    ],
+    "naujawan": [
+      "naujawan",
+      "nojawan",
+      "نوجوان"
+    ],
+    "bijli": [
+      "bijli",
+      "بجلی"
+    ],
+    "mehngai": [
+      "mehngai",
+      "مہنگائی"
+    ],
+    "sood": [
+      "sood",
+      "سود"
+    ]
+  }
+}
