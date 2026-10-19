@@ -21,3 +21,8 @@ class ValidationErrorTests(unittest.TestCase):
 
     def test_arbitrary_reason_is_not_exposed(self):
         self.assertEqual('validation_failed', validation_error_detail(ValidationUnavailable('', reason='private payload'))['reason'])
+
+    def test_index_change_is_not_mislabeled_as_provider_outage(self):
+        detail=validation_error_detail(ValidationUnavailable('private',reason='search_index_changed'))
+        self.assertEqual('search_index_changed',detail['code'])
+        self.assertNotIn('private',str(detail))

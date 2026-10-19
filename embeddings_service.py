@@ -1285,14 +1285,18 @@ def get_contextual_search() -> ContextualSearch | FastSemanticSearch:
     if pipeline == "grounded":
         from grounded_search import GroundedSearch
         from grounded_validation import provider_judge
-        from exact_search_cursor import revision
+        from exact_search_cursor import revision,CursorError
+        def current_revision():
+            try:return revision(redis_conn)
+            except CursorError as error:raise HTTPException(error.status,detail={'code':error.code,'message':error.message,'retryable':True}) from error
+            except Exception as error:raise HTTPException(503,detail={'code':'search_session_unavailable','message':'Search revision cache is temporarily unavailable. Please retry.','retryable':True}) from error
         base=FastSemanticSearch(qdrant_client,SEGMENTS_COLLECTION,lambda text:get_semantic_query_embedding(text,8),analyze,
             lambda query,value:fuzzy_match_speaker(query,value,threshold=75),
             lambda query,value:fuzzy_match_text(query,value,threshold=75),speaker_values=speaker_values,
             speaker_index_types={key:value.data_type for key,value in source_info.payload_schema.items()},
             sparse_enabled=SPARSE_NAME in (source_info.config.params.sparse_vectors or {}))
         model=os.getenv("SEARCH_JUDGE_MODEL",OPENAI_TEXT_MODEL)
-        return GroundedSearch(base,provider_judge(openai_client,model),model,lambda:revision(redis_conn),read_shared_cache,write_shared_cache,(OPENAI_EMBEDDING_MODEL,EMBEDDING_DIMENSION))
+        return GroundedSearch(base,provider_judge(openai_client,model),model,current_revision,read_shared_cache,write_shared_cache,(OPENAI_EMBEDDING_MODEL,EMBEDDING_DIMENSION))
 
     if pipeline == "fast":
         rerank = os.getenv("SEARCH_RERANKING", "false").lower() == "true"
@@ -2555,7 +2559,7 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
     if data.search_mode=='simple' and data.filter_type=='summary' and os.getenv("SEARCH_PIPELINE","grounded")=="grounded":
         from grounded_search import summary_search
         try:return await asyncio.to_thread(lambda:summary_search(get_contextual_search(),data))
-        except ValidationUnavailable as error:raise HTTPException(503,detail=validation_error_detail(error)) from error
+        except ValidationUnavailable as error:raise HTTPException(409 if error.reason=="search_index_changed" else 503,detail=validation_error_detail(error)) from error
         except ValueError as error:raise HTTPException(422,detail=str(error)) from error
         except HTTPException:raise
         except Exception:raise HTTPException(503,detail={'code':'summary_search_unavailable','retryable':True,'message':'Summary passage retrieval is temporarily unavailable.'})
@@ -2629,7 +2633,7 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
                 verifier=verify_passage_batch,
             )
         except ValidationUnavailable as error:
-            raise HTTPException(status_code=503, detail=validation_error_detail(error)) from error
+            raise HTTPException(status_code=409 if error.reason=="search_index_changed" else 503, detail=validation_error_detail(error)) from error
         except ValueError as error:
             raise HTTPException(status_code=422, detail=str(error)) from error
         except HTTPException:
@@ -3483,7 +3487,7 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
     try:
         return await asyncio.to_thread(lambda: get_contextual_search().search(data))
     except ValidationUnavailable as error:
-        raise HTTPException(status_code=503, detail=validation_error_detail(error)) from error
+        raise HTTPException(status_code=409 if error.reason=="search_index_changed" else 503, detail=validation_error_detail(error)) from error
     except HTTPException:
         raise
     except SearchInputError as error:
@@ -3864,7 +3868,7 @@ async def search_multi_video(data: dict, authorized: bool = Depends(verify_api_k
     try:
         response = await asyncio.to_thread(lambda: get_contextual_search().search(request, video_ids))
     except ValidationUnavailable as error:
-        raise HTTPException(status_code=503, detail=validation_error_detail(error)) from error
+        raise HTTPException(status_code=409 if error.reason=="search_index_changed" else 503, detail=validation_error_detail(error)) from error
     except HTTPException:
         raise
     except SearchInputError as error:
