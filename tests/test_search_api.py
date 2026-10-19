@@ -547,7 +547,7 @@ class SearchApiTest(unittest.TestCase):
         self.assertEqual("embeddings_service.process_video_task", queue.enqueue.call_args.args[0])
         self.assertEqual("generation-1", queue.enqueue.call_args.args[1]["run_id"])
 
-    def test_recovery_contract_uses_strict_recovery_worker(self):
+    def test_recovery_contract_preserved_for_modern_strict_recovery_worker(self):
         from unittest.mock import Mock
         from index_recovery_contract import VERSION
         queue = Mock()
@@ -557,7 +557,7 @@ class SearchApiTest(unittest.TestCase):
             identification_segments=[{"text": "Source text", "start": 1, "end": 5}])
         with patch.object(self.api, "redis_conn", MemoryRedis()), patch.object(self.api, "task_queue", queue):
             asyncio.run(self.api.embed_video(request, True))
-        self.assertEqual("embeddings_test.process_video_task", queue.enqueue.call_args.args[0])
+        self.assertEqual("embeddings_service.process_video_task", queue.enqueue.call_args.args[0])
         self.assertEqual({"version": VERSION}, queue.enqueue.call_args.args[1]["recovery_contract"])
 
     def test_stale_generation_does_not_overwrite_current_index(self):

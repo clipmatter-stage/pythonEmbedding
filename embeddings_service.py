@@ -2448,7 +2448,7 @@ async def embed_video(data: EmbedVideoRequest, authorized: bool = Depends(verify
                 if redis_conn.set(f"index-registered:{data.video_id}:{data.run_id}", "1", nx=True, ex=604800):
                     redis_conn.set(f"index-active:{data.video_id}", data.run_id, ex=604800)
         job = task_queue.enqueue(
-            'embeddings_test.process_video_task' if data.recovery_contract else 'embeddings_service.process_video_task',
+            'embeddings_service.process_video_task',
             data_dict,
             job_timeout='3h',
             retry=Retry(max=3, interval=[30, 60, 120]),
