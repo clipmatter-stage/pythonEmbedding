@@ -12,13 +12,21 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy requirements first for better caching
-COPY requirements.txt .
+COPY requirements.txt requirements-rerank.txt ./
+ARG INSTALL_RERANKING=false
 
 # Install Python dependencies
-RUN pip install --no-cache-dir -r requirements.txt
+RUN if [ "$INSTALL_RERANKING" = "true" ]; then \
+      pip install --no-cache-dir -r requirements-rerank.txt; \
+    else \
+      pip install --no-cache-dir -r requirements.txt; \
+    fi
 
 # Copy application code
 COPY embeddings_test.py .
+COPY embeddings_service.py contextual_search.py fast_search.py worker.py .
+COPY backfill_sparse_search.py .
+RUN python -m py_compile embeddings_service.py contextual_search.py fast_search.py worker.py backfill_sparse_search.py
 COPY semantic_query_decomposition.py .
 COPY semantic_passage_evidence.py .
 COPY transcript_search_contract.py .

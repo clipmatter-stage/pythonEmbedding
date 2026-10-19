@@ -33,6 +33,8 @@ from rq import Queue, Retry
 from contextual_search import (
     ContextualSearch, QdrantReranker, SearchSettings, SearchInputError, nearby_passage,
 )
+from fast_search import FastSemanticSearch, SPARSE_NAME, with_sparse_vectors
+from index_recovery_contract import lexical, valid_vector
 from semantic_query_decomposition import decompose_semantic_query
 from transcript_search_contract import contract_search, search_session_binding, indexed_text_fields, valid_interval
 from semantic_passage_evidence import (
@@ -43,8 +45,14 @@ from semantic_passage_evidence import (
 # ============== REDIS QUEUE INITIALIZATION ==============
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379")
 redis_conn = Redis.from_url(REDIS_URL)
-search_cache_redis = Redis.from_url(REDIS_URL, socket_connect_timeout=0.5, socket_timeout=0.5)
-SHARED_CACHE_NAMESPACE = "contextual:v7.3"
+SEARCH_CACHE_TIMEOUT_SECONDS = float(os.getenv("SEARCH_CACHE_TIMEOUT_SECONDS", "3"))
+if not 0 < SEARCH_CACHE_TIMEOUT_SECONDS <= 10:
+    raise ValueError("SEARCH_CACHE_TIMEOUT_SECONDS must be greater than 0 and at most 10")
+search_cache_redis = Redis.from_url(
+    REDIS_URL, socket_connect_timeout=SEARCH_CACHE_TIMEOUT_SECONDS,
+    socket_timeout=SEARCH_CACHE_TIMEOUT_SECONDS,
+)
+SHARED_CACHE_NAMESPACE = "contextual:v8"
 task_queue = Queue('video_processing', connection=redis_conn)
 
 # ============== LOGGING CONFIGURATION ==============
@@ -492,6 +500,7 @@ class EmbedVideoRequest(BaseModel):
     embedding_model: Optional[str] = None
     embedding_dimensions: Optional[int] = None
     run_id: Optional[str] = None
+    recovery_contract: Optional[dict] = None
     timestamp_unit: str = "seconds"
     batch_info: Optional[dict] = Field(default=None, description="Batch processing info: batch_number, total_batches, segments_in_batch")
     speakers_transcript: Optional[List[dict]] = Field(default=None, description="Full speakers transcript (ignored)")
@@ -647,6 +656,7 @@ passage_validation_cache_lock = threading.Lock()
 # Cache for search results (max 1000 search sessions, 30 minute TTL)
 # Key: search_session_id (UUID), Value: {results: List[Dict], query_params: Dict, timestamp: float}
 search_result_cache = TTLCache(maxsize=1000, ttl=1800)  # 30 minutes
+search_result_cache_lock = threading.RLock()
 
 # Cache for expensive text-index health checks (5 minutes)
 index_health_cache = TTLCache(maxsize=16, ttl=300)
@@ -722,21 +732,27 @@ def decode_cursor(cursor_str: Optional[str]) -> Optional[Dict]:
         logger.warning(f"Failed to decode cursor: {e}")
         return None
 
-def read_shared_cache(key):
+def read_shared_cache(key, *, required=False):
     try:
         value = search_cache_redis.get(f"{SHARED_CACHE_NAMESPACE}:{key}")
         return json_module.loads(value) if value else None
     except Exception as error:
         logger.warning("Shared search cache read unavailable (%s)", type(error).__name__)
+        if required:
+            raise HTTPException(status_code=503, detail={
+                "code": "search_session_unavailable", "retryable": True,
+                "message": "Your search results are temporarily unavailable. Please retry View More Results.",
+            }) from error
         return None
 
 
 def write_shared_cache(key, value, ttl):
     try:
-        search_cache_redis.set(f"{SHARED_CACHE_NAMESPACE}:{key}",
-                               json_module.dumps(value, ensure_ascii=False, default=str), ex=ttl)
+        return bool(search_cache_redis.set(f"{SHARED_CACHE_NAMESPACE}:{key}",
+                               json_module.dumps(value, ensure_ascii=False, default=str), ex=ttl))
     except Exception as error:
         logger.warning("Shared search cache write unavailable (%s)", type(error).__name__)
+        return False
 
 
 def get_cached_results(search_session_id: str) -> Optional[Dict]:
@@ -747,12 +763,14 @@ def get_cached_results(search_session_id: str) -> Optional[Dict]:
     if not search_session_id:
         return None
 
-    cached = search_result_cache.get(search_session_id)
+    with search_result_cache_lock:
+        cached = search_result_cache.get(search_session_id)
     if cached is None:
-        shared = read_shared_cache(f"session:{search_session_id}")
+        shared = read_shared_cache(f"session:{search_session_id}", required=True)
         if isinstance(shared, dict) and isinstance(shared.get("results"), list) and isinstance(shared.get("query_params"), dict):
             cached = shared
-            search_result_cache[search_session_id] = cached
+            with search_result_cache_lock:
+                search_result_cache[search_session_id] = cached
     if cached:
         logger.info(f"Cache HIT for session {search_session_id[:8]}... ({len(cached.get('results', []))} results)")
     else:
@@ -770,9 +788,11 @@ def cache_search_results(search_session_id: str, results: List[Dict], query_para
         "timestamp": time.time(),
         "top_k_used": top_k_used  # Track how many results were queried
     }
-    search_result_cache[search_session_id] = cache_data
-    write_shared_cache(f"session:{search_session_id}", cache_data, 1800)
+    with search_result_cache_lock:
+        search_result_cache[search_session_id] = cache_data
+    shared_available = write_shared_cache(f"session:{search_session_id}", cache_data, 1800)
     logger.info(f"Cached {len(results)} results (top_k={top_k_used}) for session {search_session_id[:8]}...")
+    return shared_available
 
 def extract_batch_from_results(
     results: List[Dict],
@@ -937,7 +957,7 @@ def get_openai_embeddings_batch(texts: List[str], model_name: str = None) -> Lis
                 input=batch, model=model_name, dimensions=EMBEDDING_DIMENSION,
             )
             vectors = [item.embedding for item in sorted(response.data, key=lambda item: item.index)]
-            if len(vectors) != len(batch) or any(len(v) != EMBEDDING_DIMENSION for v in vectors):
+            if len(vectors) != len(batch) or any(not valid_vector(v, EMBEDDING_DIMENSION) for v in vectors):
                 raise RuntimeError("Embedding response does not match collection dimensions")
             embeddings.extend(vectors)
         return embeddings
@@ -1150,7 +1170,7 @@ def validate_indexing_input(data: dict) -> None:
     for segment in data.get("identification_segments", []):
         if not isinstance(segment.get("text", ""), str):
             raise HTTPException(status_code=422, detail="Transcript text must be a string")
-        if not segment.get("text") or len(segment["text"].strip()) < 3:
+        if not lexical(segment.get("text")):
             continue
         try:
             begin, end = float(segment.get("start", 0)), float(segment.get("end", 0))
@@ -1161,7 +1181,7 @@ def validate_indexing_input(data: dict) -> None:
 
 
 @lru_cache(maxsize=1)
-def get_contextual_search() -> ContextualSearch:
+def get_contextual_search() -> ContextualSearch | FastSemanticSearch:
     if not USE_OPENAI_EMBEDDINGS or not openai_client:
         raise RuntimeError("Contextual search requires OpenAI embeddings and OPENAI_API_KEY")
     source_info = qdrant_client.get_collection(SEGMENTS_COLLECTION)
@@ -1169,6 +1189,9 @@ def get_contextual_search() -> ContextualSearch:
     if isinstance(vector_config, dict) or vector_config.size != EMBEDDING_DIMENSION:
         raise RuntimeError("Source collection dimension/schema mismatch; reindex into a new collection")
     settings = SearchSettings.from_env()
+    pipeline = os.getenv("SEARCH_PIPELINE", "fast").lower()
+    if pipeline not in {"fast", "verified"}:
+        raise ValueError("SEARCH_PIPELINE must be fast or verified")
 
     def analyze(query):
         alias = detect_person_alias(query)
@@ -1176,7 +1199,9 @@ def get_contextual_search() -> ContextualSearch:
         aliases = PERSON_ALIASES[alias]["aliases"] if alias else []
         decomposition = decompose_semantic_query(query, canonical, aliases)
         topic = str(decomposition["retrieval_query"])
-        if os.getenv("USE_LLM_UNDERSTANDING", "true").lower() == "true":
+        use_llm = (os.getenv("SEARCH_LLM_UNDERSTANDING", "false").lower() == "true" if pipeline == "fast"
+                   else os.getenv("USE_LLM_UNDERSTANDING", "true").lower() == "true")
+        if use_llm:
             intent = understand_query(topic)
         else:
             intent = {"semantic_query": topic, "understanding_status": "disabled"}
@@ -1227,6 +1252,7 @@ def get_contextual_search() -> ContextualSearch:
             query, candidates, judge_passage_batch,
             speaker_names=names, verifier=verify_passage_batch,
             batch_size=20 if len(query.split()) == 1 else 10,
+            max_candidates=limit,
         )
         metadata["cache_hit"] = False
         metadata["native_candidate_count"] = native_count
@@ -1238,6 +1264,22 @@ def get_contextual_search() -> ContextualSearch:
             write_shared_cache(f"validation:{fingerprint}", [results, metadata], 300)
         return results, metadata
 
+    if pipeline == "fast":
+        rerank = os.getenv("SEARCH_RERANKING", "false").lower() == "true"
+        validate_results = os.getenv("SEARCH_VALIDATE_RESULTS", "false").lower() == "true"
+        from dataclasses import replace
+        small_settings = replace(settings, candidate_limit=min(settings.candidate_limit, 20), context_seconds=0)
+        return FastSemanticSearch(
+            qdrant_client, SEGMENTS_COLLECTION, lambda text: get_semantic_query_embedding(text, 8), analyze,
+            lambda query, value: fuzzy_match_speaker(query, value, threshold=75),
+            lambda query, value: fuzzy_match_text(query, value, threshold=75),
+            speaker_values=speaker_values,
+            speaker_index_types={key: value.data_type for key, value in source_info.payload_schema.items()},
+            sparse_enabled=SPARSE_NAME in (source_info.config.params.sparse_vectors or {}),
+            reranker=QdrantReranker(qdrant_client, small_settings) if rerank else None,
+            validator=validate if validate_results else None,
+        )
+
     return ContextualSearch(
         qdrant_client, SEGMENTS_COLLECTION, lambda text: get_semantic_query_embedding(text, 8), analyze,
         lambda query, value: fuzzy_match_speaker(query, value, threshold=75),
@@ -1247,6 +1289,29 @@ def get_contextual_search() -> ContextualSearch:
         validator=validate,
         speaker_index_types={key: value.data_type for key, value in source_info.payload_schema.items()},
     )
+
+
+def prepare_search_points(points):
+    """Keep the optional lexical index current for new/rebuilt source segments."""
+    info = qdrant_client.get_collection(SEGMENTS_COLLECTION)
+    return with_sparse_vectors(points, SPARSE_NAME in (info.config.params.sparse_vectors or {}))
+
+
+class RecoveryIndexClient:
+    """Adapt the legacy dense recovery contract to an optional sparse field."""
+    def scroll(self, *args, **kwargs):
+        points, offset = qdrant_client.scroll(*args, **kwargs)
+        return [p.model_copy(update={"vector": p.vector.get("")}) if isinstance(p.vector, dict) else p
+                for p in points], offset
+
+    def upsert(self, *, points, **kwargs):
+        return qdrant_client.upsert(points=prepare_search_points(points), **kwargs)
+
+
+def recovery_worker_probe():
+    from index_recovery_contract import VERSION
+    return {"recovery_contract": VERSION, "model": OPENAI_EMBEDDING_MODEL,
+            "dimensions": EMBEDDING_DIMENSION, "authenticated_callbacks": True}
 
 def fuzzy_match_text(query: str, text: str, threshold: int = 65) -> bool:
     """
@@ -2096,9 +2161,14 @@ def send_webhook_with_retry(webhook_url: str, payload: dict, max_attempts: int =
 def process_video_task(data_dict: dict):
     """Background worker task to process video embeddings and upsert to Qdrant."""
     from transcript_search_contract import indexed_text_fields
+    from index_recovery_contract import VERSION as RECOVERY_VERSION, commit_recovery
+    recovery = data_dict.get("recovery_contract")
     webhook_url = data_dict.get('webhook_url')
     video_id = data_dict.get('video_id')
     try:
+        if recovery and (redis_conn.exists(f"index-retired:{video_id}:{data_dict.get('run_id')}")
+                or redis_conn.get(f"index-active:{video_id}") != str(data_dict.get('run_id')).encode()):
+            return {"status": "stale"}
         identification_segments = data_dict.get('identification_segments', [])
         video_title = data_dict.get('video_title', '')
         video_filename = data_dict.get('video_filename', '')
@@ -2155,7 +2225,7 @@ def process_video_task(data_dict: dict):
             match_type = segment.get("match", "")
             confidence = segment.get("confidence", 0)
 
-            if not text or len(text.strip()) < 3:
+            if not lexical(text):
                 segments_without_text += 1
                 continue
 
@@ -2240,6 +2310,9 @@ def process_video_task(data_dict: dict):
                 "embedding_model": OPENAI_EMBEDDING_MODEL if USE_OPENAI_EMBEDDINGS else FASTEMBED_MODEL_NAME,
                 "embedding_dimensions": EMBEDDING_DIMENSION,
                 "indexing_run_id": run_id,
+                **({"source_snapshot_sha256": recovery["source_sha256"],
+                    "source_segment_id": f"{video_id}:{metadata['idx']}",
+                    "recovery_contract": RECOVERY_VERSION} if recovery else {}),
                 "embedding_context_version": 1,
                 "timestamp_unit": "seconds",
                 "transcript_speaker": metadata.get("transcript_speaker"),
@@ -2297,21 +2370,39 @@ def process_video_task(data_dict: dict):
                         all_points.extend(PointStruct(**p) for p in json_module.loads(staged[str(number).encode()]))
                     if len({str(point.id) for point in all_points}) != len(all_points):
                         raise ValueError("Duplicate segment identities across indexing batches")
+                    if recovery:
+                        scope = Filter(must=[FieldCondition(key="video_id", match=MatchValue(value=video_id))])
+                        def delete_owned(ids, owner_run):
+                            qdrant_client.delete(collection_name=SEGMENTS_COLLECTION,
+                                points_selector=models.FilterSelector(filter=Filter(must=[
+                                    FieldCondition(key="video_id", match=MatchValue(value=video_id)),
+                                    FieldCondition(key="indexing_run_id", match=MatchValue(value=owner_run)),
+                                    models.HasIdCondition(has_id=ids)])), wait=True)
+                        verification = commit_recovery(RecoveryIndexClient(), SEGMENTS_COLLECTION, all_points, recovery,
+                            video_id=video_id, run_id=run_id, model=OPENAI_EMBEDDING_MODEL,
+                            dimensions=EMBEDDING_DIMENSION, filter_=scope,
+                            is_current=lambda: redis_conn.get(f"index-active:{video_id}") == run_id.encode()
+                                and not redis_conn.exists(f"index-retired:{video_id}:{run_id}"),
+                            delete_owned=delete_owned)
+                        committed_segments = verification["total_points"]
                     # All provider calls succeeded before replacement starts.
-                    for offset in range(0, len(all_points), 150):
-                        qdrant_client.upsert(collection_name=SEGMENTS_COLLECTION, points=all_points[offset:offset + 150], wait=True)
-                    # Remove only obsolete IDs after successful replacement upserts.
-                    qdrant_client.delete(collection_name=SEGMENTS_COLLECTION,
-                        points_selector=models.FilterSelector(filter=Filter(
-                            must=[FieldCondition(key="video_id", match=MatchValue(value=video_id))],
-                            must_not=[models.HasIdCondition(has_id=[p.id for p in all_points])],
-                        )), wait=True)
+                    else:
+                        for offset in range(0, len(all_points), 150):
+                            qdrant_client.upsert(collection_name=SEGMENTS_COLLECTION, points=prepare_search_points(all_points[offset:offset + 150]), wait=True)
+                        # Remove only obsolete IDs after successful replacement upserts.
+                        qdrant_client.delete(collection_name=SEGMENTS_COLLECTION,
+                            points_selector=models.FilterSelector(filter=Filter(
+                                must=[FieldCondition(key="video_id", match=MatchValue(value=video_id))],
+                                must_not=[models.HasIdCondition(has_id=[p.id for p in all_points])],
+                            )), wait=True)
+                        committed_segments = len(all_points)
                     indexing_complete = True
-                    committed_segments = len(all_points)
+                elif recovery:
+                    return {"status": "staged", "recovery_contract": RECOVERY_VERSION}
         else:
             # Legacy single batches remain accepted, without delete-before-embed.
             for offset in range(0, len(points), 150):
-                qdrant_client.upsert(collection_name=SEGMENTS_COLLECTION, points=points[offset:offset + 150], wait=True)
+                qdrant_client.upsert(collection_name=SEGMENTS_COLLECTION, points=prepare_search_points(points[offset:offset + 150]), wait=True)
 
         if webhook_url:
             payload_success = {
@@ -2323,6 +2414,8 @@ def process_video_task(data_dict: dict):
                 "batch_number": batch_number,
                 "total_batches": total_batches,
                 "message": "Successfully indexed in Qdrant" if indexing_complete else "Waiting for remaining batches",
+                **({"coverage_verified": True, "recovery_contract": RECOVERY_VERSION,
+                    "source_sha256": recovery["source_sha256"]} if recovery and indexing_complete else {}),
             }
             send_webhook_with_retry(webhook_url, payload_success)
 
@@ -2353,6 +2446,12 @@ async def embed_video(data: EmbedVideoRequest, authorized: bool = Depends(verify
             raise HTTPException(status_code=422, detail="Embedding dimension contract mismatch")
         data_dict = data.model_dump()
         validate_indexing_input(data_dict)
+        if data.recovery_contract:
+            from index_recovery_contract import VERSION as recovery_version
+            if data.recovery_contract.get("version") != recovery_version or not data.run_id:
+                raise HTTPException(status_code=422, detail="Recovery contract/run required")
+            if redis_conn.exists(f"index-retired:{data.video_id}:{data.run_id}"):
+                raise HTTPException(status_code=409, detail="Retired recovery generation")
         if data.timestamp_unit != "seconds":
             raise HTTPException(status_code=422, detail="timestamp_unit must be seconds")
         if data.run_id and (data.batch_info or {}).get("batch_number", 1) == 1:
@@ -2446,7 +2545,7 @@ async def embed(data: dict):
 
 @app.post("/search")
 async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)):
-    """Search transcript meaning with Qdrant reranking, or apply simple filters."""
+    """Search transcript meaning with bounded Qdrant retrieval, or simple filters."""
     query_text = data.query
     raw_query_text = (query_text or "").strip()  # Preserve original user query before alias expansion
     words = data.words
@@ -3357,7 +3456,7 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
         })
 
     try:
-        return await asyncio.to_thread(get_contextual_search().search, data)
+        return await asyncio.to_thread(lambda: get_contextual_search().search(data))
     except ValidationUnavailable as error:
         raise HTTPException(status_code=503, detail=validation_error_detail(error)) from error
     except HTTPException:
@@ -3368,7 +3467,7 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
         logger.exception("Contextual search failed")
         raise HTTPException(
             status_code=503,
-            detail="Contextual search unavailable; check embedding and Qdrant reranking configuration",
+            detail="Search unavailable; check embedding and Qdrant configuration",
         ) from error
 
 
@@ -3427,7 +3526,7 @@ async def search_incremental(data: IncrementalSearchRequest, authorized: bool = 
             "retryable": True, "message": "Search session is missing. Retry from the first page."})
 
     # Try to get cached results
-    cached_data = get_cached_results(search_session_id) if search_session_id else None
+    cached_data = await asyncio.to_thread(get_cached_results, search_session_id) if search_session_id else None
 
     if cursor_str and not cursor:
         raise HTTPException(status_code=409, detail={"code": "search_session_expired",
@@ -3582,7 +3681,9 @@ async def search_incremental(data: IncrementalSearchRequest, authorized: bool = 
         "passage_validation": delegated.get("metadata", {}).get("passage_validation"),
         "ranking": delegated.get("ranking"),
     }
-    cache_search_results(search_session_id, delegated_results, delegated_query_params, delegate_req.top_k)
+    shared_available = await asyncio.to_thread(
+        cache_search_results, search_session_id, delegated_results, delegated_query_params, delegate_req.top_k,
+    )
 
     extraction_cursor = cursor if cursor_recovery_mode else None
     batch, next_cursor, has_more = extract_batch_from_results(
@@ -3591,6 +3692,11 @@ async def search_incremental(data: IncrementalSearchRequest, authorized: bool = 
         batch_size,
         search_session_id=search_session_id
     )
+    if not shared_available:
+        # A replica-local cursor cannot be continued reliably behind a load
+        # balancer. Deliver the entire bounded snapshot now instead of hiding
+        # the remaining matches behind a cursor that another replica cannot read.
+        batch, next_cursor, has_more = delegated_results, None, False
 
     unique_video_ids_in_cache = len(set(r.get("video_id") for r in delegated_results if r.get("video_id")))
     elapsed = time.time() - start_time
@@ -3607,6 +3713,7 @@ async def search_incremental(data: IncrementalSearchRequest, authorized: bool = 
         "metadata": {
             "elapsed_seconds": round(elapsed, 3),
             "cache_hit": False,
+            "pagination_mode": "shared_cursor" if shared_available else "inline_snapshot",
             "batch_size": len(batch),
             "batch_start": cursor_index + 1 if cursor_recovery_mode else 0,
             "query": data.query or query_text,
@@ -3626,7 +3733,7 @@ async def search_incremental(data: IncrementalSearchRequest, authorized: bool = 
                 "is_numeric_query": bool(initial_query_shape.get("is_numeric_query")),
                 "is_short_semantic_query": bool(initial_query_shape.get("is_short_semantic_query")),
             },
-            "diagnostics_warnings": [],
+            "diagnostics_warnings": [] if shared_available else ["shared_cache_unavailable_all_snapshot_results_returned"],
             "ranking": delegated.get("ranking"),
             "search_contract": delegated.get("search_contract"),
             "passage_validation": delegated.get("metadata", {}).get("passage_validation"),
@@ -3718,7 +3825,7 @@ async def search_multi_video(data: dict, authorized: bool = Depends(verify_api_k
         min_score=data.get("min_score", 0.0), language=data.get("language"),
     )
     try:
-        response = await asyncio.to_thread(get_contextual_search().search, request, video_ids)
+        response = await asyncio.to_thread(lambda: get_contextual_search().search(request, video_ids))
     except ValidationUnavailable as error:
         raise HTTPException(status_code=503, detail=validation_error_detail(error)) from error
     except HTTPException:
@@ -3982,7 +4089,7 @@ async def re_embed_all(authorized: bool = Depends(verify_api_key)):
 
                 qdrant_client.upsert(
                     collection_name=SEGMENTS_COLLECTION,
-                    points=new_points,
+                    points=prepare_search_points(new_points),
                     wait=True
                 )
                 total_updated += len(new_points)
@@ -4239,8 +4346,11 @@ async def health():
                 "fastembed_model": FASTEMBED_MODEL_NAME,
                 "llm_understanding": os.getenv("USE_LLM_UNDERSTANDING", "true"),
                 "text_model": OPENAI_TEXT_MODEL,
-                "reranking_engine": "qdrant_maxsim",
+                "search_pipeline": os.getenv("SEARCH_PIPELINE", "fast"),
+                "reranking_enabled": os.getenv("SEARCH_PIPELINE", "fast") == "verified" or os.getenv("SEARCH_RERANKING", "false").lower() == "true",
+                "reranking_engine": "qdrant_maxsim" if os.getenv("SEARCH_PIPELINE", "fast") == "verified" or os.getenv("SEARCH_RERANKING", "false").lower() == "true" else "disabled",
                 "reranking_model": SearchSettings.from_env().model,
+                "sparse_index_available": SPARSE_NAME in (collection_info.config.params.sparse_vectors or {}),
             }
         }
     except Exception as e:
@@ -4273,22 +4383,23 @@ async def root():
     settings = SearchSettings.from_env()
     return {
         "service": "Contextual Video Transcript Search API",
-        "version": "7.3",
+        "version": "8.1",
         "ai_features": {
             "text_model": OPENAI_TEXT_MODEL,
             "embedding_model": OPENAI_EMBEDDING_MODEL,
             "embedding_dimension": EMBEDDING_DIMENSION,
-            "reranking_engine": "qdrant_maxsim",
+            "search_pipeline": os.getenv("SEARCH_PIPELINE", "fast"),
+            "reranking_engine": "qdrant_maxsim" if os.getenv("SEARCH_PIPELINE", "fast") == "verified" or os.getenv("SEARCH_RERANKING", "false").lower() == "true" else "disabled",
             "reranking_model": settings.model,
-            "passage_evidence_validation": True,
-            "independent_verification": True,
+            "passage_evidence_validation": os.getenv("SEARCH_PIPELINE", "fast") == "verified" or os.getenv("SEARCH_VALIDATE_RESULTS", "false").lower() == "true",
+            "independent_verification": os.getenv("SEARCH_PIPELINE", "fast") == "verified" or os.getenv("SEARCH_VALIDATE_RESULTS", "false").lower() == "true",
             "reranking_collection": settings.rerank_collection,
             "context_seconds": settings.context_seconds,
             "cross_language_search": True,
         },
         "endpoints": {
             "POST /embed-video": "Queue contextual transcript embedding",
-            "POST /search": "Semantic retrieval and native Qdrant reranking, or simple filters",
+            "POST /search": "Fast dense/hybrid Qdrant retrieval, optional reranking, or simple filters",
             "POST /search/incremental": "Same search pipeline with cached cursor pagination",
             "POST /search-multi-video": "Contextual search scoped to video IDs",
             "POST /re-embed-all": "Admin: rebuild dense vectors with neighboring passage context",

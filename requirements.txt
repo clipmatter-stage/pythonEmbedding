@@ -2,7 +2,7 @@ fastapi==0.109.0
 uvicorn[standard]==0.27.0
 fastembed>=0.3.0
 requests==2.31.0
-qdrant-client>=1.17.0
+qdrant-client>=1.18.0
 rapidfuzz>=3.0.0
 cachetools>=5.0.0
 pydantic>=2.0.0
@@ -11,5 +11,3 @@ openai>=2.0.0
 tiktoken>=0.5.0
 redis>=5.0
 rq>=1.16
-# Multilingual token vectors; relevance is computed by Qdrant MaxSim.
-FlagEmbedding>=1.3.5,<2

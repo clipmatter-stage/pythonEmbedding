@@ -1,0 +1,3 @@
+-r requirements.txt
+# Only needed for optional BGE-M3 reranking or SEARCH_PIPELINE=verified.
+FlagEmbedding>=1.3.5,<2

@@ -45,6 +45,9 @@ class MemoryRedis:
     def expire(self, *args):
         return True
 
+    def exists(self, key):
+        return int(key in self.values or key in self.hashes)
+
 
 class SearchApiTest(unittest.TestCase):
     @classmethod
@@ -56,6 +59,7 @@ class SearchApiTest(unittest.TestCase):
             "QDRANT_URL": "http://localhost:6333", "QDRANT_API_KEY": "test",
             "OPENAI_API_KEY": "test", "EMBEDDING_DIMENSION": "2",
             "ENSURE_INDEXES_ON_STARTUP": "false", "API_KEY": "",
+            "SEARCH_PIPELINE": "verified",
         }
         with patch.dict(sys.modules, {"fastembed": stub}), patch.dict(os.environ, environment), patch(
             "qdrant_client.QdrantClient", return_value=cls.database,
@@ -87,12 +91,81 @@ class SearchApiTest(unittest.TestCase):
         )], wait=True)
 
     def production_service(self):
-        with patch.dict(os.environ, {"QDRANT_RERANK_DIMENSION": "2", "SEARCH_CONTEXT_SECONDS": "0"}):
+        with patch.dict(os.environ, {"SEARCH_PIPELINE": "verified", "QDRANT_RERANK_DIMENSION": "2", "SEARCH_CONTEXT_SECONDS": "0"}):
             service = self.api.get_contextual_search()
         service.embed = lambda query: [1.0, 0.0]
         service.understand = lambda query: {"semantic_query": query}
         service.reranker.encoder = lambda texts: [[[1.0, 0.0]] for text in texts]
         return service
+
+    def test_fast_default_ignores_old_understanding_toggle_and_uses_no_chat_calls(self):
+        self.put(9801, "Fast source passage.", video_id=9801)
+        with patch.dict(os.environ, {"SEARCH_PIPELINE": "fast", "USE_LLM_UNDERSTANDING": "true",
+                "SEARCH_LLM_UNDERSTANDING": "false", "SEARCH_VALIDATE_RESULTS": "false", "SEARCH_RERANKING": "false"}), patch.object(
+                self.api, "understand_query", side_effect=AssertionError("unexpected chat call")), patch.object(
+                self.api, "judge_passage_batch", side_effect=AssertionError("unexpected validation call")), patch.object(
+                self.api, "get_semantic_query_embedding", return_value=[1., 0.]) as embedding:
+            response = asyncio.run(self.api.search(self.api.SearchRequest(query="fast passage", video_id=9801)))
+        self.assertEqual([9801], [r["id"] for r in response["results"]])
+        self.assertEqual("qdrant_dense", response["ranking"]["engine"])
+        self.assertFalse(response["ranking"]["evidence_verified"])
+        embedding.assert_called_once_with("fast passage", 8)
+
+    def test_fast_incremental_reuses_snapshot_without_another_embedding(self):
+        self.put(9802, "Fast pagination passage.", video_id=9802)
+        self.put(9803, "Fast pagination passage.", video_id=9803)
+        with patch.dict(os.environ, {"SEARCH_PIPELINE": "fast", "SEARCH_LLM_UNDERSTANDING": "false",
+                "SEARCH_VALIDATE_RESULTS": "false", "SEARCH_RERANKING": "false"}), patch.object(
+                self.api, "get_semantic_query_embedding", return_value=[1., 0.]) as embedding:
+            first = asyncio.run(self.api.search_incremental(self.api.IncrementalSearchRequest(query="fast pagination", batch_size=1)))
+            second = asyncio.run(self.api.search_incremental(self.api.IncrementalSearchRequest(
+                query="fast pagination", batch_size=1, cursor=first["cursor"]["next"])))
+        self.assertTrue(second["metadata"]["cache_hit"])
+        self.assertEqual(1, embedding.call_count)
+        self.assertNotEqual(first["results"][0]["video_id"], second["results"][0]["video_id"])
+
+    def test_recovery_worker_commits_additively_and_emits_verified_callback(self):
+        from index_recovery_contract import VERSION, baseline_digest
+        contract = {"version": VERSION, "source_sha256": "snapshot", "user_id": 7,
+                    "source_indices": [0], "baseline_payload_digest": baseline_digest([])}
+        redis = MemoryRedis()
+        redis.set("index-active:9804", "recovery-run")
+        with patch.object(self.api, "redis_conn", redis), patch.object(
+                self.api, "get_openai_embeddings_batch", return_value=[[1., 0.]]), patch.object(
+                self.api, "send_webhook_with_retry") as callback:
+            self.api.process_video_task({"video_id": 9804, "run_id": "recovery-run", "user_id": 7,
+                "recovery_contract": contract, "webhook_url": "https://example.test/callback",
+                "identification_segments": [{"text": "کا", "start": 1, "end": 2, "speaker": "Alice"}]})
+        self.assertTrue(callback.call_args.args[1]["coverage_verified"])
+        self.assertEqual("snapshot", callback.call_args.args[1]["source_sha256"])
+        self.assertEqual(VERSION, self.api.recovery_worker_probe()["recovery_contract"])
+
+    def test_recovery_supports_sparse_vectors_without_changing_shared_legacy_contract(self):
+        from index_recovery_contract import VERSION, baseline_digest
+        from backfill_sparse_search import backfill
+        from fast_search import SPARSE_NAME
+        collection = "sparse_recovery_test"
+        self.database.create_collection(collection, vectors_config=models.VectorParams(size=2, distance=models.Distance.COSINE))
+        self.addCleanup(self.database.delete_collection, collection)
+        backfill(self.database, collection, apply=True)
+        contract = {"version": VERSION, "source_sha256": "sparse-snapshot", "user_id": 7,
+                    "source_indices": [0], "baseline_payload_digest": baseline_digest([])}
+        redis = MemoryRedis()
+        redis.set("index-active:9805", "sparse-run")
+        data = {"video_id": 9805, "run_id": "sparse-run", "user_id": 7,
+                "recovery_contract": contract, "webhook_url": "https://example.test/callback",
+                "identification_segments": [{"text": "نماز", "start": 1, "end": 2, "speaker": "Alice"}]}
+        with patch.object(self.api, "SEGMENTS_COLLECTION", collection), patch.object(
+                self.api, "redis_conn", redis), patch.object(self.api, "get_openai_embeddings_batch", return_value=[[1., 0.]]), patch.object(
+                self.api, "send_webhook_with_retry") as callback:
+            self.api.process_video_task(data)
+            # Retrying the same generation must preserve coverage and vectors.
+            self.api.process_video_task(data)
+        rows, _ = self.database.scroll(collection, with_vectors=True)
+        self.assertEqual(1, len(rows))
+        self.assertIn(SPARSE_NAME, rows[0].vector)
+        self.assertEqual([1., 0.], rows[0].vector[""])
+        self.assertTrue(callback.call_args.args[1]["coverage_verified"])
 
     @staticmethod
     def evidence(query, candidates, timeout, facets=None):
@@ -173,6 +246,60 @@ class SearchApiTest(unittest.TestCase):
         result = asyncio.run(self.api.search_incremental(request.model_copy(update={"cursor": cursor}), True))
         self.assertEqual(2, result["results"][0]["id"])
         self.assertTrue(result["metadata"]["cache_hit"])
+
+    @staticmethod
+    def pagination_snapshot():
+        return [{"id": f"{video}-{segment}", "video_id": video, "score": .8}
+                for video in range(1, 27) for segment in range(4 if video <= 22 else 3)]
+
+    def test_all_26_videos_load_10_10_6_across_replica_cache_misses(self):
+        from unittest.mock import AsyncMock
+        rows = self.pagination_snapshot()
+        query = self.api.IncrementalSearchRequest(query="falastine", batch_size=10)
+        batches, seen = [], []
+        with patch.object(self.api, "search", new=AsyncMock(return_value={"results": rows})) as search:
+            for _ in range(3):
+                result = asyncio.run(self.api.search_incremental(query, True))
+                batches.append(len({r["video_id"] for r in result["results"]}))
+                seen.extend(r["id"] for r in result["results"])
+                self.assertEqual(26, result["cursor"]["total_available"])
+                if not result["cursor"]["has_more"]:
+                    break
+                self.api.search_result_cache.clear()  # The next request reaches another replica.
+                query = query.model_copy(update={"cursor": result["cursor"]["next"],
+                                                "search_session_id": result["search_session_id"]})
+        self.assertEqual([10, 10, 6], batches)
+        self.assertEqual([r["id"] for r in rows], seen)
+        self.assertEqual(100, len(set(seen)))
+        self.assertEqual(1, search.await_count)
+
+    def test_failed_shared_write_returns_every_match_without_an_unusable_cursor(self):
+        from unittest.mock import AsyncMock
+        rows = self.pagination_snapshot()
+        with patch.object(self.api, "search", new=AsyncMock(return_value={"results": rows})), patch.object(
+                self.shared_cache, "set", side_effect=TimeoutError("slow Redis")):
+            result = asyncio.run(self.api.search_incremental(self.api.IncrementalSearchRequest(query="falastine", batch_size=10), True))
+        self.assertEqual(rows, result["results"])
+        self.assertEqual({"next": None, "has_more": False, "total_available": 26}, result["cursor"])
+        self.assertEqual("inline_snapshot", result["metadata"]["pagination_mode"])
+        self.assertIn("shared_cache_unavailable_all_snapshot_results_returned", result["metadata"]["diagnostics_warnings"])
+
+    def test_shared_read_timeout_is_retryable_and_same_cursor_works_after_recovery(self):
+        from unittest.mock import AsyncMock
+        rows = self.pagination_snapshot()
+        query = self.api.IncrementalSearchRequest(query="falastine", batch_size=10)
+        with patch.object(self.api, "search", new=AsyncMock(return_value={"results": rows})) as search:
+            first = asyncio.run(self.api.search_incremental(query, True))
+            self.api.search_result_cache.clear()
+            continuation = query.model_copy(update={"cursor": first["cursor"]["next"]})
+            with patch.object(self.shared_cache, "get", side_effect=TimeoutError("temporary")):
+                with self.assertRaises(self.api.HTTPException) as error:
+                    asyncio.run(self.api.search_incremental(continuation, True))
+            self.assertEqual(503, error.exception.status_code)
+            self.assertEqual("search_session_unavailable", error.exception.detail["code"])
+            second = asyncio.run(self.api.search_incremental(continuation, True))
+        self.assertEqual(set(range(11, 21)), {r["video_id"] for r in second["results"]})
+        self.assertEqual(1, search.await_count)
 
     def test_shared_cache_outage_does_not_fail_search(self):
         from unittest.mock import Mock
@@ -434,7 +561,7 @@ class SearchApiTest(unittest.TestCase):
 
     def test_roman_urdu_speaker_is_resolved_before_language_understanding(self):
         query = "hafiz naeem nojawan ko namaz ki talqeen karte huwe"
-        with patch.object(self.api, "understand_query", return_value={"semantic_query": "نوجوانوں کو نماز کی تلقین", "query_type": "general"}) as analyze:
+        with patch.dict(os.environ, {"SEARCH_PIPELINE": "verified"}), patch.object(self.api, "understand_query", return_value={"semantic_query": "نوجوانوں کو نماز کی تلقین", "query_type": "general"}) as analyze:
             service = self.api.get_contextual_search()
             intent = service.understand(query)
         analyze.assert_called_once_with("nojawan ko namaz ki talqeen karte huwe")

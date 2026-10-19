@@ -1,131 +1,133 @@
-# Contextual video transcript search
+# Video transcript search
 
-FastAPI service using OpenAI dense embeddings to retrieve transcript candidates,
-then **Qdrant native MaxSim multivector search** to rank contextual passages.
-The local `BAAI/bge-m3` model generates multilingual token vectors; Qdrant computes
-relevance. The upstream evidence validator then requires complete-topic quotes and
-an independent verification pass before a passage can be returned. There is no
-weighted score blend, title score floor, or mandatory query-word overlap.
+`embeddings_service.py` preserves the legacy API and indexing contracts while
+using a faster semantic retrieval pipeline by default. `embeddings_test.py` is
+unchanged. Production remains on its saved Railway legacy start command until
+you explicitly switch it.
 
 ## Setup
-
-Use Python 3.11 or 3.12 with a supported PyTorch installation:
 
 ```sh
 python3.11 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env
-# Fill in credentials and export/load .env in your deployment environment.
+# Fill in credentials and export/load .env in your shell or deployment.
 uvicorn embeddings_service:app --host 0.0.0.0 --port 9000
 ```
 
-Run Redis and the existing RQ video-processing worker for `/embed-video` jobs.
-Docker/Railway and the Procfile use `start.sh`, which starts
-`embeddings_service.py` with unbuffered logging. Run `python worker.py` as a
-separate worker process with the same environment variables.
-After pulling this change, rebuild and redeploy the image so the renamed module
-and new dependencies are installed. Startup does not run a vector migration.
-`embeddings_test.py` retains the legacy upstream implementation. Previously queued
-`embeddings_test.process_video_task` jobs still resolve to that implementation;
-new jobs use `embeddings_service.process_video_task`.
-Loading `.env` is the responsibility of the shell or deployment; starting the
-Python module does not load it automatically.
+Run Redis and `python worker.py` separately for queued embedding jobs. The
+worker needs the same environment as the web service. Existing queued
+`embeddings_test.process_video_task` jobs still resolve to the legacy module;
+new jobs use `embeddings_service.process_video_task`. Finish legacy jobs before
+backfilling the sparse index because legacy upserts do not preserve sparse data.
 
-In Railway, check the **web service's Custom Start Command**. Set it to
-`bash start.sh` (or clear it to use Docker's CMD). A saved command such as
-`python embeddings_test.py` overrides Docker and continues running the legacy
-service even when the latest image builds successfully. Keep the worker's
-separate RQ start command. Redeploy web after changing this setting.
-Verify the public `GET /` response reports `version: "7.3"` and
-`ai_features.reranking_engine: "qdrant_maxsim"` before evaluating searches.
+The Docker image includes both implementations and still defaults to the legacy
+script. To select the new service, set Railway's web Custom Start Command to
+`bash start.sh`, or run that command locally. Rebuild the image first. Leave the
+worker's separate RQ command in place. Verify `GET /` reports version `8.1` and
+`ai_features.search_pipeline: fast`. No deployment or migration is automatic.
 
-The default text model is `gpt-6-luna` for focused query understanding, translation,
-and ingestion summaries. Verify access in your OpenAI account, or override
-`OPENAI_TEXT_MODEL` with a compatible Chat Completions model. Requests use
-`max_completion_tokens` and `reasoning_effort="none"`, without sampling parameters.
-An override must support these parameters. `text-embedding-3-large` remains the
-most capable OpenAI embedding model, so its 3072-dimensional default is retained.
-See the [OpenAI model catalog](https://developers.openai.com/api/docs/models)
-and [embedding documentation](https://developers.openai.com/api/docs/models/text-embedding-3-large).
+## Fast search (default)
 
-## Search behavior
+1. Resolve known speaker aliases and conservatively decompose explicit speaker
+   plus topic requests locally. A mere name mention does not impose a speaker filter.
+2. Generate one cached query embedding using the existing stored embedding model
+   and dimensions. Do not change either without rebuilding the dense index.
+3. Submit one bounded Qdrant query. If the optional `lexical_tf_v1` sparse index
+   exists, Qdrant retrieves dense and sparse candidates and combines them with
+   native Reciprocal Rank Fusion. Otherwise it retrieves existing dense vectors
+   and reports `sparse_index_unavailable_using_dense` in ranking warnings.
+4. Apply searchable-video eligibility and video/language/date/time restrictions
+   in Qdrant. Apply supported known-speaker filters there too. Speaker/title
+   constraints are also checked against returned payloads. Arbitrary fuzzy names
+   and titles are post-filtered inside the bounded candidate pool; sparse or
+   keyword indexes do not guarantee exhaustive fuzzy recall.
+5. Return source text, real segment IDs, speakers and seek timestamps, grouping
+   videos by their best-ranked passage. No context scans, model downloads,
+   generative query rewriting, or LLM validation run on the default semantic path.
 
-1. Parse the full query meaning and an explicit spoken-by constraint. Known
-   speaker-plus-topic phrases are decomposed conservatively before LLM analysis.
-2. Retrieve candidates using OpenAI embeddings of the topic and, when available,
-   its translation. English queries do not automatically exclude Urdu videos.
-3. Enforce searchable-video eligibility, video/language/date/time constraints,
-   and explicit speaker/title constraints. Known speaker variants are filtered
-   before retrieval; arbitrary fuzzy speaker/title constraints are post-filtered
-   within the bounded candidate pool.
-4. Build a passage from the focus transcript plus the nearest preceding/following
-   same-speaker segments within `SEARCH_CONTEXT_SECONDS`. Context is restricted
-   to the same eligible video and caller filters. Titles are excluded as evidence.
-   The focus comes first so token truncation cannot discard it in favor of context.
-   Unknown-speaker segments do not inherit other turns.
-5. Encode passages with BGE-M3, cache token vectors by content/model/settings in a
-   separate collection, and ask Qdrant to rank only current source candidate IDs.
-   Deleted or changed source passages cannot reappear through the vector cache.
-6. Rank videos by their best passage and keep video groups together for pagination.
-   Text and timestamps refer to the focus segment; `context_text` exposes nearby
-   evidence separately. Context helps retrieval/ranking, but may not supply missing
-   evidence: the validator judges only the complete displayed transcript text.
-7. Apply the upstream bounded evidence validator and independent verifier to the
-   original request. Each required facet needs an exact transcript quote. Provider
-   failures return retryable 503 errors; partial validation is reported explicitly.
-   Only validated passages are returned, ranked by Qdrant MaxSim within video groups.
+`FAST_SEARCH_CANDIDATE_LIMIT=100` bounds retrieval. `top_k` is an output maximum;
+requests larger than the candidate limit may return fewer matches. Cursor paging
+reuses its cached snapshot, including across replicas through Redis, without
+repeating embedding or ranking. `/search-multi-video` uses the same engine and
+candidate budget scoped to the requested IDs; it does not guarantee per-video
+coverage if one video dominates the bounded pool.
 
-All nonnumeric semantic queries, including single words and default `top_k=20`,
-follow this pipeline. `/search/incremental` delegates to it and caches the ranked
-set for pagination. `/search-multi-video` uses it with video-ID filters.
-Numeric-only queries use simple transcript search. `search_mode="simple"` uses the
-upstream contracts for text, title, and summary; speaker/date/language/video filters
-retain their existing behavior. Summary searches retrieve transcript candidates and
-require LLM evidence verification, so they incur embedding and validation calls.
-Literal/normalized/alias transcript and title searches do not require an LLM.
+Cursor snapshots use a bounded Redis timeout (`SEARCH_CACHE_TIMEOUT_SECONDS=3`).
+If the initial shared-cache write fails, the response includes the entire bounded
+snapshot with no continuation cursor (`metadata.pagination_mode=inline_snapshot`),
+so another replica cannot strand the remaining matches. A cache-read outage
+returns retryable 503 `search_session_unavailable`; it does not expire the cursor.
+A genuinely missing/expired snapshot still returns 409 and requires a fresh search.
 
-```json
-{
-  "query": "Hafiz Naeem speech on children's rights",
-  "search_mode": "semantic",
-  "top_k": 20,
-  "min_score": 0.0
-}
+Fast results are **ranked search matches, not independently verified answers**.
+`metadata.passage_validation` is null. `score_type` is `cosine_similarity` for
+dense retrieval or `rrf` for native hybrid retrieval; neither is a probability.
+Fusion scores are not comparable with cosine or LLM relevance scores.
+Legacy `min_score` is a verified relevance cutoff, so it is not applied to these
+retrieval scores and a nonzero supplied value produces an explicit warning.
+Use `SEARCH_MIN_DENSE_SCORE` to tune the dense branch (default 0); it cannot
+exclude sparse matches. Calibrate it on real queries rather than assuming 0.5
+means 50% relevance.
+
+`ranking.timings` separates understanding, embedding, retrieval, reranking,
+validation and total time. The earlier 1–3 second latency estimate is a target,
+not a measured production guarantee. Benchmark relevance, no-match cases and
+latency on English, Urdu and Roman Urdu before switching production.
+
+## Optional native hybrid index
+
+Sparse lexical vectors are normalized word frequencies with stable hashed
+32-bit indices; Qdrant supplies IDF. This is TF-IDF, not BM25 or a learned model.
+Unicode/Urdu character normalization is deterministic. Lexical search does not
+translate Roman Urdu into Urdu; multilingual dense embeddings still provide
+cross-language retrieval. Hash collisions are possible. No extra account or
+model download is required.
+
+Adding a sparse field to an existing collection requires Qdrant server 1.18+
+and the client in `requirements.txt`. Older servers can continue with dense
+search. The backfill uses the additive named-vector schema API and
+`update_vectors`, retaining every existing dense vector and payload. It does not
+regenerate embeddings. Switch indexing workers to the new service first, take
+an ordinary database backup, and run:
+
+```sh
+python backfill_sparse_search.py          # read-only dry run
+python backfill_sparse_search.py --apply  # add sparse field and backfill
 ```
 
-`min_score` now filters the **final verified relevance score**, not dense cosine.
-Older UI requests containing `min_score: 0.50` therefore cannot discard a valid
-passage before reranking. The default is 0.0; mandatory evidence validation still
-requires complete, independently verified support. `dense_score` retains the
-initial similarity (or is null for a full-text-only candidate). For semantic results, `score` and `llm_relevance_score`
-retain the upstream verified 0–1 relevance score; `rerank_score` holds BGE-M3 mean
-MaxSim (Qdrant sum divided by query-token count). Neither is a probability or
-accuracy percentage. Qdrant determines ordering; evidence validation determines
-admission. `ranking` reports the model, candidate count, score type, context,
-and query-understanding status. `SEMANTIC_CANDIDATE_LIMIT` bounds both inference
-work and the total reranked candidate set (default 60). Bounded topic terms from query understanding can recover
-candidates using the existing transcript text index; these get no score boost.
-Qdrant orders the combined pool. Evidence validation checks the best 20 native
-ranked passages by default (`SEARCH_VALIDATION_CANDIDATE_LIMIT`, maximum 60).
-Increasing this limit deepens coverage at the cost of latency and model calls.
-A completed validation means that bounded selection was evaluated; it does not
-mean the entire collection was exhaustively searched. Complete judgments are
-shared through Redis for five minutes, and cursor snapshots for 30 minutes, so
-all web replicas can reuse them. Cache failures fall back to live evaluation;
-partial/error judgments are not cached. The speaker prefilter supports existing keyword
-or text indexes without replacing either. Adjacent same-speaker source turns
-may form a displayed passage with their real IDs, text and seek times; context
-labels and other speakers never become evidence. `ranking.timings` reports
-understanding, retrieval, context, reranking and validation durations. `top_k` is an output maximum; fewer
-results may be returned. Increase candidate depth if constrained-speaker recall
-is insufficient and your hardware can support it.
+Restart web replicas after completion so they discover the new schema. While a
+backfill is partial, dense retrieval remains available but sparse coverage is
+incomplete. The command can resume by rerunning. Pause concurrent transcript
+writes during backfill so lexical vectors cannot be derived from stale text.
+New ingestion, recovery and `/re-embed-all` maintain sparse vectors when the
+field exists. Neither application startup nor a search changes the source schema.
+See [Qdrant vector schema updates](https://qdrant.tech/documentation/manage-data/collections/#update-vector-schema)
+and [native hybrid fusion](https://qdrant.tech/documentation/search/hybrid-queries/).
 
-The deprecated `USE_RERANKING`, `USE_SIMPLE_RERANKING`, `USE_QUERY_EXPANSION`,
-`OPENAI_ONLY_SEARCH`, and `query_decomposition_mode` switches no longer control
-semantic ranking. `USE_LLM_UNDERSTANDING=false` disables LLM interpretation and
-translation but retains native ranking and mandatory passage validation. Existing
-simple filter parameters remain. These settings cannot disable evidence verification.
+## Optional expensive stages
+
+- `SEARCH_LLM_UNDERSTANDING=true`: add the existing LLM query interpretation and
+  translation. The older `USE_LLM_UNDERSTANDING` setting does not override fast
+  mode's default, so existing deployment variables do not silently enable chat calls.
+- `SEARCH_RERANKING=true`: BGE-M3/Qdrant MaxSim reranks at most 20 retrieved
+  passages. Install `pip install -r requirements-rerank.txt` first. CPU model
+  startup/inference may add substantial latency; use only after measuring it.
+  For Docker, build with `--build-arg INSTALL_RERANKING=true` to include these
+  optional dependencies; the default image omits them.
+- `SEARCH_VALIDATE_RESULTS=true`: invoke bounded complete-topic evidence judging
+  and independent verification on the best candidates. `min_score` applies to
+  verified relevance again. Results failing evidence validation are omitted.
+- `SEARCH_PIPELINE=verified`: retain the previous contextual BGE-M3 plus mandatory
+  evidence pipeline, including neighboring source passages and optional LLM
+  understanding via `USE_LLM_UNDERSTANDING`. Requires optional rerank dependencies.
+
+Simple speaker/date/language/video filters, literal/normalized/alias transcript
+search, title search, suggestions, CRUD/admin operations and indexing methods
+remain available. Simple summary search still uses its existing evidence
+contract and can invoke embedding and LLM validation calls. These optional or
+explicit summary operations are not covered by the default fast latency target.
 
 ## Preserved upstream contracts and optimizations
 
@@ -149,29 +151,29 @@ simple filter parameters remain. These settings cannot disable evidence verifica
   `segment_index` values across batches. Legacy jobs without run IDs remain accepted.
 - `/operations/points` and `/operations/patch-timestamps` retain upstream strict API
   authentication, bounded snapshots, hash preconditions, and rollback behavior.
-- Source reads retain the 35-second/12-call budget. Context reads are grouped per
+- The optional verified pipeline retains the 35-second/12-call source-read budget. Context reads are grouped per
   video and incomplete context is reported. The shared validator retains its hard
   60-candidate/6-call/30-second limits, including independent verification.
 - Complete validation results are cached for five minutes (128 entries) by model,
   original query, speaker constraints and candidate content. Source eligibility is
   checked on every fresh search. Changed content invalidates the validation cache;
   partial/error responses are never cached. Existing cursor paging reuses its
-  validated snapshot and does not revalidate each page.
+  ranked snapshot and does not revalidate each page.
 
 ## Deployment and existing data
 
-- Use a Qdrant server supporting multivectors (1.10+; 1.17+ recommended), with the
+- Optional reranking needs Qdrant multivectors (1.10+); adding sparse fields needs 1.18+. Use the
   client version in `requirements.txt`. No provider key is needed for BGE-M3.
   [Native ranking documentation](https://qdrant.tech/documentation/search/hybrid-queries/)
   and [BGE-M3 usage and MIT license](https://huggingface.co/BAAI/bge-m3).
-- BGE-M3 requires a multi-GB model download and substantial RAM. CPU cold inference
+- Optional BGE-M3 requires a multi-GB model download and substantial RAM. CPU cold inference
   can be slow; GPU inference is recommended for sustained traffic. CPU inference threads are
   capped to the container quota (at most 8 by default), with tokenizer thread
   parallelism disabled by default. `QDRANT_RERANK_CPU_THREADS` can lower this cap. On a CUDA host,
   configure suitable PyTorch and `QDRANT_RERANK_DEVICE=cuda:0`. Batch/token limits
   bound memory; inference is serialized per process. Multiple API workers each
   load their own model copy.
-- The Qdrant key must create/read/write the rerank collection. Token vectors use
+- When reranking is enabled, the Qdrant key must create/read/write the rerank collection. Token vectors use
   an on-disk configuration without HNSW, since only known candidates are rescored.
   They are generated on demand: **no destructive schema migration or full backfill
   is required to start**.
@@ -190,7 +192,7 @@ simple filter parameters remain. These settings cannot disable evidence verifica
 - These changes do not guarantee correctness. Before rollout, measure relevance
   and latency on labeled English, Urdu, and Roman Urdu queries, including compound
   concepts and no-match cases. Set `QDRANT_RERANK_MIN_SCORE` from those measurements.
-  No universal MaxSim confidence cutoff is assumed. The upstream evidence gate
+  No universal MaxSim confidence cutoff is assumed. When enabled, the evidence gate
   requires every returned passage to support the complete request, but model
   judgments still need evaluation against human-labeled examples.
 
