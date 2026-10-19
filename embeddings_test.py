@@ -2720,6 +2720,7 @@ def process_video_task(data_dict: dict):
             payload_success = {
                 "status": "completed",
                 "video_id": video_id,
+                "run_id": run_id,
                 "segments_embedded": segments_embedded,
                 "message": "Successfully indexed in Qdrant",
                 **({"coverage_verified": True, "recovery_contract": RECOVERY_VERSION,
@@ -2735,6 +2736,7 @@ def process_video_task(data_dict: dict):
             payload_error = {
                 "status": "failed",
                 "video_id": video_id,
+                "run_id": run_id,
                 "error": str(e)
             }
             try:
