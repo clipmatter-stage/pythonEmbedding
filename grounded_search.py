@@ -29,7 +29,7 @@ def semantic_gloss(query):
 
 class GroundedSearch:
     def __init__(self,base,judge,model,revision,read_cache,write_cache,embedding_contract):
-        self.base=base;self.judge=judge;self.model=model;self.revision=revision;self.read_cache=read_cache;self.write_cache=write_cache;self.embedding_contract=embedding_contract
+        self.base=base;self.base.payload_fields=FIELDS;self.judge=judge;self.model=model;self.revision=revision;self.read_cache=read_cache;self.write_cache=write_cache;self.embedding_contract=embedding_contract
     def search(self,request,video_ids=None):
         started=time.monotonic();epoch=self.revision();params=request.model_dump()if hasattr(request,'model_dump')else vars(request).copy()
         for k in ['cursor','exact_cursor','search_session_id','batch_size']:params.pop(k,None)

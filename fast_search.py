@@ -108,7 +108,7 @@ class FastSemanticSearch:
         sparse = lexical_vector(" ".join([semantic, query]), query=True)
         hybrid = self.sparse_enabled and bool(sparse.indices)
         arguments = dict(collection_name=self.collection, query_filter=filters,
-                         limit=limit, with_payload=True, with_vectors=False,
+                         limit=limit, with_payload=getattr(self,"payload_fields",True), with_vectors=False,
                          timeout=self.settings.timeout)
         if hybrid:
             arguments.update(prefetch=[

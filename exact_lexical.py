@@ -4,6 +4,8 @@ No vector writes, text edits, point deletion or producer relabeling.
 import hashlib,json,re
 from transcript_search_contract import VERSION,normalize,alias_with_spans
 INDEX_VERSION='exact_terms_v1:'+VERSION
+GUARD_FIELDS=['text','video_id','start_time','end_time','duration','timestamp_unit','speaker','transcript_speaker','diarization_speaker','segment_index','processing_status','approval_status','is_archived','indexing_run_id','source_snapshot_sha256','source_segment_id','embedding_model','embedding_dimensions','recovery_contract']
+GUARD_VERSION='exact_payload_guard_v1'
 KEYS=['exact_terms_version','exact_normalized_terms_v1','exact_alias_terms_v1','exact_source_sha256']
 def digest(value):return hashlib.sha256(json.dumps(value,ensure_ascii=False,sort_keys=True,separators=(',',':'),allow_nan=False).encode()).hexdigest()
 def derived_fields(text):
@@ -23,7 +25,7 @@ def prefilter(client,collection,base,query,contract,models):
 def read_video(client,collection,video_id,models):
     out=[];offset=None
     while True:
-        rows,offset=client.scroll(collection_name=collection,scroll_filter=models.Filter(must=[models.FieldCondition(key='video_id',match=models.MatchValue(value=video_id))]),offset=offset,limit=200,with_payload=True,with_vectors=False,timeout=10);out.extend(rows)
+        rows,offset=client.scroll(collection_name=collection,scroll_filter=models.Filter(must=[models.FieldCondition(key='video_id',match=models.MatchValue(value=video_id))]),offset=offset,limit=200,with_payload=GUARD_FIELDS+KEYS,with_vectors=False,timeout=10);out.extend(rows)
         if len(out)>5000:raise ValueError('Explicit video point bound exceeded')
         if offset is None:return out
 
@@ -32,11 +34,11 @@ def plan_video(client,collection,video_id,models):
     for p in points:
         payload=p.payload or {};new=derived_fields(payload.get('text'));before={k:payload[k]for k in KEYS if k in payload}
         if before==new:continue
-        after={**payload,**new};items.append({'id':str(p.id),'before_fields':before,'before_payload_sha256':digest(payload),'after_payload_sha256':digest(after),'source_sha256':new['exact_source_sha256']})
-    return {'version':INDEX_VERSION,'video_id':video_id,'total_points':len(points),'items':items,'plan_sha256':digest(items)}
+        after={**payload,**new};items.append({'id':str(p.id),'before_fields':before,'before_guard_sha256':digest(payload),'after_guard_sha256':digest(after),'source_sha256':new['exact_source_sha256']})
+    return {'version':INDEX_VERSION,'guard_version':GUARD_VERSION,'video_id':video_id,'total_points':len(points),'items':items,'plan_sha256':digest(items)}
 
 def apply_video(client,collection,plan,models,rollback=False):
-    if plan.get('version')!=INDEX_VERSION or digest(plan.get('items'))!=plan.get('plan_sha256'):raise ValueError('Checkpoint version/hash mismatch')
+    if plan.get('guard_version')!=GUARD_VERSION or plan.get('version')!=INDEX_VERSION or digest(plan.get('items'))!=plan.get('plan_sha256'):raise ValueError('Checkpoint version/hash mismatch')
     rows=read_video(client,collection,plan['video_id'],models);points={str(p.id):p for p in rows}
     if len(points)!=plan['total_points']:raise ValueError('Point coverage changed')
     if len({i.get('id')for i in plan['items']})!=len(plan['items']):raise ValueError('Duplicate checkpoint IDs')
@@ -45,8 +47,8 @@ def apply_video(client,collection,plan,models,rollback=False):
     for item in plan['items']:
         p=points.get(item['id']);payload=p.payload if p else None
         if payload is None:raise ValueError('Checkpoint point missing')
-        expected=item['after_payload_sha256']if rollback else item['before_payload_sha256']
-        already=item['before_payload_sha256']if rollback else item['after_payload_sha256']
+        expected=item['after_guard_sha256']if rollback else item['before_guard_sha256']
+        already=item['before_guard_sha256']if rollback else item['after_guard_sha256']
         if digest(payload)==already:
             already_current+=1;continue
         if digest(payload)!=expected or derived_fields(payload.get('text'))['exact_source_sha256']!=item['source_sha256']:raise ValueError('Source or checkpoint payload changed')
@@ -57,7 +59,7 @@ def apply_video(client,collection,plan,models,rollback=False):
     for i in range(0,len(operations),100):client.batch_update_points(collection_name=collection,update_operations=operations[i:i+100],wait=True,timeout=30)
     after={str(p.id):p for p in read_video(client,collection,plan['video_id'],models)}
     for item in plan['items']:
-        expected=item['before_payload_sha256']if rollback else item['after_payload_sha256']
+        expected=item['before_guard_sha256']if rollback else item['after_guard_sha256']
         if item['id']not in after or digest(after[item['id']].payload)!=expected:raise ValueError('Payload verification failed; retain checkpoint and inspect uncertain writes')
     return {'video_id':plan['video_id'],'updated_points':len(plan['items'])-already_current,'already_current_points':already_current,'verified_points':len(plan['items']),'rollback':rollback,'verified':True,'vectors_written':0}
 
