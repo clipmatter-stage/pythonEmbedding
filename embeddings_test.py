@@ -492,6 +492,7 @@ class EmbedVideoRequest(BaseModel):
     embedding_model: Optional[str] = None
     embedding_dimensions: Optional[int] = None
     run_id: Optional[str] = None
+    recovery_contract: Optional[dict] = None
     timestamp_unit: str = "seconds"
     batch_info: Optional[dict] = Field(default=None, description="Batch processing info: batch_number, total_batches, segments_in_batch")
     speakers_transcript: Optional[List[dict]] = Field(default=None, description="Full speakers transcript (ignored)")
@@ -927,14 +928,14 @@ def get_openai_embeddings_batch(texts: List[str], model_name: str = None) -> Lis
             response = openai_client.embeddings.create(
                 input=sub_batch,
                 model=model_name,
-                dimensions=EMBEDDING_DIMENSION
+                dimensions=EMBEDDING_DIMENSION, timeout=45
             )
             
             # Sort by index to maintain order within sub-batch
             sub_embeddings = [item.embedding for item in sorted(response.data, key=lambda x: x.index)]
             all_embeddings.extend(sub_embeddings)
         
-        if len(all_embeddings) != len(texts) or any(len(v) != EMBEDDING_DIMENSION for v in all_embeddings):
+        if len(all_embeddings) != len(texts) or any(not __import__("index_recovery_contract").valid_vector(v, EMBEDDING_DIMENSION) for v in all_embeddings):
             raise ValueError("Provider returned incompatible embeddings")
         return all_embeddings
     except Exception as e:
@@ -2243,7 +2244,8 @@ qdrant_client = QdrantClient(url=QDRANT_URL, api_key=QDRANT_API_KEY, timeout=120
 logger.info("Connected to Qdrant successfully")
 
 from index_operations import register_index_operations
-register_index_operations(app, qdrant_client, SEGMENTS_COLLECTION, redis_conn, API_KEY)
+register_index_operations(app, qdrant_client, SEGMENTS_COLLECTION, redis_conn, API_KEY,
+    recovery_settings={"model": OPENAI_EMBEDDING_MODEL, "dimensions": EMBEDDING_DIMENSION}, queue=task_queue)
 
 def create_segments_collection():
     try:
@@ -2472,9 +2474,14 @@ def send_webhook_with_retry(webhook_url: str, payload: dict, max_attempts: int =
 def process_video_task(data_dict: dict):
     """Background worker task to process video embeddings and upsert to Qdrant."""
     from transcript_search_contract import indexed_text_fields
+    from index_recovery_contract import VERSION as RECOVERY_VERSION, lexical, commit_recovery
+    recovery = data_dict.get("recovery_contract")
     webhook_url = data_dict.get('webhook_url')
     video_id = data_dict.get('video_id')
     try:
+        if recovery and (redis_conn.exists(f"index-retired:{video_id}:{data_dict.get('run_id')}")
+                or redis_conn.get(f"index-active:{video_id}") != str(data_dict.get('run_id')).encode()):
+            return {"status": "stale"}
         identification_segments = data_dict.get('identification_segments', [])
         video_title = data_dict.get('video_title', '')
         video_filename = data_dict.get('video_filename', '')
@@ -2524,7 +2531,7 @@ def process_video_task(data_dict: dict):
             match_type = segment.get("match", "")
             confidence = segment.get("confidence", 0)
             
-            if not text or len(text.strip()) < 3:
+            if not lexical(text):
                 segments_without_text += 1
                 continue
             
@@ -2540,8 +2547,7 @@ def process_video_task(data_dict: dict):
             enriched_text = " ".join(enriched_parts)
             
             if len(enriched_text) > 6000:
-                enriched_text = enriched_text[:6000] + "..."
-                logger.debug(f"Truncated segment {segment_index} from {len(text)} to 6000 chars")
+                raise ValueError("Source segment needs reviewed word-aligned chunking; embedding text is never silently truncated")
             
             texts_to_embed.append(enriched_text)
             segment_metadata.append({
@@ -2573,7 +2579,7 @@ def process_video_task(data_dict: dict):
             vectors = [r.tolist() if hasattr(r, 'tolist') else list(r) for r in results_list]
         
         summaries_en = {}
-        if openai_client and language and language.lower() not in ["english", "en"]:
+        if openai_client and language and language.lower() not in ["english", "en"] and not recovery:
             try:
                 logger.info(f"[WORKER] Generating English summaries for {len(segment_metadata)} segments...")
                 for batch_start in range(0, len(segment_metadata), 20):
@@ -2623,6 +2629,9 @@ def process_video_task(data_dict: dict):
                 "embedding_model": OPENAI_EMBEDDING_MODEL if USE_OPENAI_EMBEDDINGS else FASTEMBED_MODEL_NAME,
                 "embedding_dimensions": EMBEDDING_DIMENSION,
                 "indexing_run_id": run_id,
+                **({"source_snapshot_sha256": recovery["source_sha256"],
+                    "source_segment_id": f"{video_id}:{metadata['idx']}",
+                    "recovery_contract": RECOVERY_VERSION} if recovery else {}),
                 "timestamp_unit": "seconds",
                 "transcript_speaker": metadata.get("transcript_speaker"),
                 "video_title": video_title,
@@ -2675,15 +2684,33 @@ def process_video_task(data_dict: dict):
                     all_points = []
                     for number in range(1, total_batches + 1):
                         all_points.extend(PointStruct(**p) for p in json_module.loads(staged[str(number).encode()]))
-                    # All provider calls succeeded before replacement starts.
-                    for offset in range(0, len(all_points), 150):
-                        qdrant_client.upsert(collection_name=SEGMENTS_COLLECTION, points=all_points[offset:offset + 150], wait=True)
-                    # Remove only obsolete IDs after successful replacement upserts.
-                    qdrant_client.delete(collection_name=SEGMENTS_COLLECTION,
-                        points_selector=models.FilterSelector(filter=Filter(
-                            must=[FieldCondition(key="video_id", match=MatchValue(value=video_id))],
-                            must_not=[models.HasIdCondition(has_id=[p.id for p in all_points])],
-                        )), wait=True)
+                    if recovery:
+                        scope = Filter(must=[FieldCondition(key="video_id", match=MatchValue(value=video_id))])
+                        def delete_owned(ids, owner_run):
+                            qdrant_client.delete(collection_name=SEGMENTS_COLLECTION,
+                                points_selector=models.FilterSelector(filter=Filter(must=[
+                                    FieldCondition(key="video_id", match=MatchValue(value=video_id)),
+                                    FieldCondition(key="indexing_run_id", match=MatchValue(value=owner_run)),
+                                    models.HasIdCondition(has_id=ids)])), wait=True)
+                        verification = commit_recovery(qdrant_client, SEGMENTS_COLLECTION, all_points, recovery,
+                            video_id=video_id, run_id=run_id, model=OPENAI_EMBEDDING_MODEL,
+                            dimensions=EMBEDDING_DIMENSION, filter_=scope,
+                            is_current=lambda: redis_conn.get(f"index-active:{video_id}") == run_id.encode()
+                                and not redis_conn.exists(f"index-retired:{video_id}:{run_id}"),
+                            delete_owned=delete_owned)
+                        segments_embedded = verification["total_points"]
+                    else:
+                        # All provider calls succeeded before replacement starts.
+                        for offset in range(0, len(all_points), 150):
+                            qdrant_client.upsert(collection_name=SEGMENTS_COLLECTION, points=all_points[offset:offset + 150], wait=True)
+                        # Remove only obsolete IDs after successful replacement upserts.
+                        qdrant_client.delete(collection_name=SEGMENTS_COLLECTION,
+                            points_selector=models.FilterSelector(filter=Filter(
+                                must=[FieldCondition(key="video_id", match=MatchValue(value=video_id))],
+                                must_not=[models.HasIdCondition(has_id=[p.id for p in all_points])],
+                            )), wait=True)
+                elif recovery:
+                    return {"status": "staged", "recovery_contract": RECOVERY_VERSION}
         else:
             # Legacy single batches remain accepted, without delete-before-embed.
             for offset in range(0, len(points), 150):
@@ -2694,7 +2721,9 @@ def process_video_task(data_dict: dict):
                 "status": "completed",
                 "video_id": video_id,
                 "segments_embedded": segments_embedded,
-                "message": "Successfully indexed in Qdrant"
+                "message": "Successfully indexed in Qdrant",
+                **({"coverage_verified": True, "recovery_contract": RECOVERY_VERSION,
+                    "source_sha256": recovery["source_sha256"]} if recovery else {})
             }
             send_webhook_with_retry(webhook_url, payload_success)
                 
@@ -2723,6 +2752,12 @@ async def embed_video(data: EmbedVideoRequest, authorized: bool = Depends(verify
         if data.embedding_dimensions and data.embedding_dimensions != EMBEDDING_DIMENSION:
             raise HTTPException(status_code=422, detail="Embedding dimension contract mismatch")
         data_dict = data.model_dump()
+        if data.recovery_contract:
+            from index_recovery_contract import VERSION as recovery_version
+            if data.recovery_contract.get("version") != recovery_version or not data.run_id:
+                raise HTTPException(status_code=422, detail="Recovery contract/run required")
+            if redis_conn.exists(f"index-retired:{data.video_id}:{data.run_id}"):
+                raise HTTPException(status_code=409, detail="Retired recovery generation")
         if data.timestamp_unit != "seconds":
             raise HTTPException(status_code=422, detail="timestamp_unit must be seconds")
         if data.run_id and (data.batch_info or {}).get("batch_number", 1) == 1:
@@ -6701,3 +6736,8 @@ if __name__ == "__main__":
         port=port,
         timeout_keep_alive=120
     )
+
+
+def recovery_worker_probe():
+    from index_recovery_contract import VERSION
+    return {"recovery_contract": VERSION, "model": OPENAI_EMBEDDING_MODEL, "dimensions": EMBEDDING_DIMENSION}
