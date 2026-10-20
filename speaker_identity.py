@@ -2,19 +2,30 @@
 import copy,hashlib,json,re
 VERSION='speaker_identity_v2'
 UNKNOWN='Unknown Speaker'
-FIELDS=['identity_version','identity_status','identity_source','identity_key','identity_review','identity_enrollment_fingerprint','identity_calibration_sha256','identity_run_id','identity_name','identity_revision']
+FIELDS=['identity_version','identity_status','identity_source','identity_key','identity_review','identity_enrollment_fingerprint','identity_calibration_sha256','identity_acceptance_policy','identity_run_id','identity_name','identity_revision']
 def supported(row):
     if row.get('identity_version')!=VERSION or not row.get('identity_key'):return False
     review=row.get('identity_review')or{}
     if row.get('identity_status')=='verified' and row.get('identity_source')=='manual':
         return isinstance(review,dict) and all(review.get(k)for k in ['review_id','reviewer_id','reviewed_at']) and bool(re.fullmatch('[a-f0-9]{64}',str(review.get('evidence_sha256',''))))
-    return row.get('identity_status')=='accepted' and all(row.get(k)for k in ['identity_enrollment_fingerprint','identity_calibration_sha256','identity_run_id'])
+    return row.get('identity_status')=='accepted' and all(row.get(k)for k in ['identity_enrollment_fingerprint','identity_run_id']) and bool(row.get('identity_calibration_sha256') or (row.get('identity_source')=='provider' and row.get('identity_acceptance_policy')=='pyannote_match_v1'))
+def unknown_label(row):
+    label=str(row.get('transcript_speaker') or row.get('diarization_speaker') or row.get('source_speaker') or row.get('speaker') or '')
+    if re.fullmatch('[A-Z]{1,3}',label):return 'Unknown '+label
+    match=re.fullmatch(r'(?:SPEAKER[_ -]?)?(\d+)',label,re.I)
+    if not match or int(match[1])>10000:return UNKNOWN
+    n=int(match[1]);suffix=''
+    while True:
+        suffix=chr(65+n%26)+suffix;n=n//26-1
+        if n<0:break
+    return 'Unknown '+suffix
+
 def view(row):
     out=dict(row)
     name=(row.get('identity_name')or row.get('speaker')or UNKNOWN)if supported(row)else UNKNOWN
     if supported(row)and row.get('identity_key')=='hafiz_naeem_ur_rehman':name='Hafiz Naeem Ur Rehman'
     out['source_identity_group']=row.get('source_identity_group')or hashlib.sha256(json.dumps([row.get('video_id'),row.get('transcript_speaker')or row.get('diarization_speaker'),row.get('speaker')],ensure_ascii=False).encode()).hexdigest()
-    out.update(speaker=name,identity_name=name,identity_key=row.get('identity_key')if supported(row)else None,identity_status=row.get('identity_status')if supported(row)else 'unknown',identity_version=VERSION)
+    out.update(speaker=name,speaker_display_name=unknown_label(row) if name==UNKNOWN else name,identity_name=name,identity_key=row.get('identity_key')if supported(row)else None,identity_status=row.get('identity_status')if supported(row)else 'unknown',identity_version=VERSION)
     return out
 
 def patch_identity(client,collection,video_id,changes,*,rollback=False,dry_run=True):

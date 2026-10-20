@@ -73,7 +73,7 @@ def register_index_operations(app,client,collection,redis,api_key,*,recovery_set
         import os
         from grounded_validation import VERSION as grounded_version
         from exact_lexical import INDEX_VERSION
-        return {'application_revision':os.getenv('RAILWAY_GIT_COMMIT_SHA','unknown'),'pipeline':os.getenv('SEARCH_PIPELINE','fast'),'judge_model':os.getenv('SEARCH_JUDGE_MODEL',os.getenv('OPENAI_TEXT_MODEL','gpt-6-luna')),'grounded_version':grounded_version,'exact_keyword_version':INDEX_VERSION,'exact_keyword_checkpoint_operations':True,'speaker_identity_version':'speaker_identity_v2','speaker_identity_metadata_operations':True,'grounded_configuration_ok':__import__('os').getenv('SEARCH_PIPELINE','fast')=='grounded','point_count':client.count(collection_name=collection,exact=True,timeout=10).count}
+        return {'application_revision':os.getenv('RAILWAY_GIT_COMMIT_SHA','unknown'),'pipeline':os.getenv('SEARCH_PIPELINE','fast'),'judge_model':os.getenv('SEARCH_JUDGE_MODEL',os.getenv('OPENAI_TEXT_MODEL','gpt-6-luna')),'grounded_version':grounded_version,'exact_keyword_version':INDEX_VERSION,'exact_keyword_checkpoint_operations':True,'speaker_identity_version':'speaker_identity_v2','speaker_identity_metadata_operations':True,'speaker_provider_matches_v1':True,'grounded_configuration_ok':__import__('os').getenv('SEARCH_PIPELINE','fast')=='grounded','point_count':client.count(collection_name=collection,exact=True,timeout=10).count}
     @app.get('/operations/points')
     async def snapshot(video_id:Optional[int]=None,offset:Optional[str]=None,limit:int=50,with_vectors:bool=False,auth=Depends(authorized)):
         if not 1<=limit<=100 or (video_id is not None and video_id<1):raise HTTPException(422,detail='Invalid snapshot scope')
