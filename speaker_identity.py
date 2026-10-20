@@ -27,8 +27,12 @@ def patch_identity(client,collection,video_id,changes,*,rollback=False,dry_run=T
     for c in changes:
         p=points.get(str(c['point_id']));payload=p.payload if p else None
         if not payload or payload.get('video_id')!=video_id:raise ValueError('Point scope mismatch')
-        fields=c.get('fields',{});delete=c.get('delete_fields',[])
+        fields=dict(c.get('fields',{}));delete=list(c.get('delete_fields',[]))
         if not fields and not delete or not set(fields).issubset(FIELDS) or not set(delete).issubset(FIELDS)or set(fields)&set(delete):raise ValueError('Identity fields only')
+        # Remote Qdrant omits null payload values whereas the local client can
+        # retain them. Express clearing explicitly so hashes match both stores.
+        delete.extend(k for k,v in fields.items() if v is None)
+        fields={k:v for k,v in fields.items() if v is not None}
         after={k:v for k,v in {**payload,**fields}.items()if k not in delete}
         if payload_hash(payload)==c.get('post_payload_sha256'):continue
         if payload_hash(payload)!=c['expected_payload_sha256']:raise ValueError('Source/run/payload changed')

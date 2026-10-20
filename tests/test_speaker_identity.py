@@ -19,6 +19,12 @@ class IdentityTests(unittest.TestCase):
   change=self.change();self.c.set_payload('s',{'indexing_run_id':'newer'},[1]);
   with self.assertRaises(ValueError):patch_identity(self.c,'s',1079,[change],dry_run=False)
   self.assertNotIn('identity_version',self.c.retrieve('s',[1])[0].payload)
+ def test_null_identity_key_is_explicitly_removed_for_remote_store_parity(self):
+  self.c.set_payload('s',{'identity_key':'unreviewed-old-key'},[1]);change=self.change()
+  dry=patch_identity(self.c,'s',1079,[change]);change['post_payload_sha256']=dry['after_hashes']['1']
+  result=patch_identity(self.c,'s',1079,[change],dry_run=False)
+  actual=self.c.retrieve('s',[1])[0].payload
+  self.assertNotIn('identity_key',actual);self.assertEqual(payload_hash(actual),result['after_hashes']['1'])
  def test_text_edits_and_unproven_named_replacement_are_refused(self):
   change=self.change();change['fields']={'text':'forged'}
   with self.assertRaises(ValueError):patch_identity(self.c,'s',1079,[change],dry_run=False)
