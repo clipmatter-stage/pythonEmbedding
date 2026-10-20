@@ -20,7 +20,7 @@ class SearchTests(unittest.TestCase):
   return {'judgments':out}
  def test_original_turns_supply_context_without_cross_speaker_or_gap(self):
   self.put(1,'University tuition costs 100000 rupees',start=1,end=5);self.put(2,'Families cannot afford it',start=5,end=9);self.put(3,'unrelated filler',start=40,end=50)
-  response=self.engine.search(request(query='students and high education fees'));self.assertTrue(response['ranking']['evidence_verified']);self.assertTrue(response['results']);row=response['results'][0];self.assertEqual([1,9],[row['start_time'],row['end_time']]);self.assertEqual({'1','2'},set(row['segment_ids']));self.assertNotIn('filler',row['text']);self.assertEqual('Unverified Label',row['speaker'])
+  response=self.engine.search(request(query='students and high education fees'));self.assertTrue(response['ranking']['evidence_verified']);self.assertTrue(response['results']);row=response['results'][0];self.assertEqual([1,9],[row['start_time'],row['end_time']]);self.assertEqual({'1','2'},set(row['segment_ids']));self.assertNotIn('filler',row['text']);self.assertEqual('Unknown Speaker',row['speaker'])
  def test_scope_and_index_revision_bind_cached_verification(self):
   self.put(1,'University tuition costs 100000 rupees. Families cannot afford it',video=1);self.put(2,'University tuition costs 100000 rupees. Families cannot afford it',video=2)
   q=request(query='fees',allowed_video_ids=[1],authorization_scope='one',scope_revision='a');first=self.engine.search(q);n=self.calls;second=self.engine.search(q);self.assertEqual(n,self.calls);self.assertTrue(second['metadata']['passage_validation']['cache_hit']);self.assertEqual({1},{r['video_id']for r in first['results']});self.assertEqual({1},{r['video_id']for r in first['ranking']['candidate_trace']});self.epoch='b';self.engine.search(q);self.assertGreater(self.calls,n)
@@ -38,7 +38,7 @@ class SearchTests(unittest.TestCase):
   self.base.understand=lambda q:{'semantic_query':'young people should pray','query_type':'speaker_search','extracted_speaker':'Hafiz Naeem Ur Rehman','query_decomposition':{'decomposed':True,'topic':'young people should pray'}}
   self.base.speaker_values=lambda q:['Hafiz Naeem Rehman']
   for i,speaker in enumerate(['Hafiz Naeem Rehman','SPEAKER_02','Hafiz Ali'],1):
-   self.put(i,'University tuition costs 100000 rupees. Families cannot afford it',video=i,speaker=speaker)
+   self.put(i,'University tuition costs 100000 rupees. Families cannot afford it',video=i,speaker=speaker,identity_version='speaker_identity_v2',identity_status='verified',identity_source='manual',identity_key='hafiz_naeem_ur_rehman'if i==1 else 'fixture',identity_review={'review_id':'fixture','reviewer_id':'fixture','reviewed_at':'2026-10-20','evidence_sha256':'a'*64})
   seen=[];judge=self.engine.judge
   def recording(query,rows,timeout):
    seen.append(query);return judge(query,rows,timeout)
@@ -46,7 +46,7 @@ class SearchTests(unittest.TestCase):
   result=self.engine.search(request(query='Hafiz Naeem young people should pray'))
   self.assertEqual(['young people should pray'],seen)
   self.assertEqual([1],[r['video_id']for r in result['results']])
-  self.assertEqual('named_source_label_match',result['results'][0]['speaker_identity_status'])
+  self.assertEqual('supported_identity',result['results'][0]['speaker_identity_status'])
   self.assertEqual('source_metadata_only',result['metadata']['passage_validation']['speaker_identity_authority'])
  def test_context_chains_short_turns_but_stops_at_speaker_or_gap(self):
   from grounded_search import coherent_passage

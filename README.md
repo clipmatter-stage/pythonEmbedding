@@ -362,3 +362,12 @@ title lexical scores and grounded relevance scores are not compared. The
 response-wide `ranking.evidence_verified` is false when title-only rows are present.
 The existing Laravel presenter already recognizes video-only title matches.
 The separate **Search by Title** category continues to use its existing route.
+
+### Phase 5 identity and citation contract
+Keep Railway `SEARCH_PIPELINE=grounded` on API and workers; capabilities report the actual default (`fast` when unset) and whether grounded configuration is intact. Laravel requests verified relevance explicitly.
+
+Speaker names require `speaker_identity_v2` provenance: reviewed manual evidence, or accepted enrollment/calibration/run metadata. Anonymous labels remain separate; unsupported legacy predictions display as Unknown Speaker. Explicit Unknown filtering is separate from all speakers. Search suggestions and named filters do not promote unsupported names.
+
+`/operations/patch-speaker-identities` accepts guarded explicit identity metadata only (1–50 IDs), supports dry run and guarded rollback, and never writes vectors/text/timestamps. Legacy producer provenance blocks assigning a different named person; negative/Unknown quarantine keeps the raw legacy prediction as audit data. Source/database changes use the paired Laravel private checkpoint workflow.
+
+`GROUNDING_CITATION_MODE=span_id` is the Phase 5 default adapter: the model selects source span IDs, which are resolved to original excerpts. `quote` restores the earlier adapter; both retain complete-intent validation and affected-only retries. Cache bindings include citation/identity versions. Completion-based scheduling retains at most two calls and the existing bounded budgets.

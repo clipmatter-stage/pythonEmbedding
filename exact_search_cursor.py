@@ -2,6 +2,7 @@
 Point-ID order. A passage is one indexed utterance; never silently merge page edges.
 Only app-managed writes are revisioned; external writers must invalidate the revision.
 """
+from speaker_identity import view as identity_view, FIELDS as IDENTITY_FIELDS, matches_identity
 import copy,hashlib,json,os,secrets,time
 from transcript_search_contract import CompiledMatcher,VERSION,valid_interval
 PROTOCOL='exact_cursor_v1'
@@ -9,7 +10,7 @@ TTL=1800
 MAX_POINTS=1000
 PAGE_SIZE=100
 MAX_BYTES=512000
-FIELDS=['video_id','video_title','speaker','diarization_speaker','transcript_speaker','start_time','end_time','timestamp_unit','text','youtube_url','language','video_created_at']
+FIELDS=IDENTITY_FIELDS+['video_id','video_title','speaker','diarization_speaker','transcript_speaker','start_time','end_time','timestamp_unit','text','youtube_url','language','video_created_at']
 class CursorError(Exception):
     def __init__(self,code,message,status=409):self.code=code;self.message=message;self.status=status
 
@@ -87,7 +88,8 @@ def exact_page(data,client,redis,collection,models,clock=time.time):
             if not points and next_offset is not None:raise CursorError('search_read_incomplete','Index read could not advance. Retry this page.',503)
             batch=[]
             for point in points:
-                row={'id':str(point.id),**(point.payload or {})};text=row.get('text') or '';scanned+=1
+                row={'id':str(point.id),**identity_view(point.payload or {})};text=row.get('text') or '';scanned+=1
+                if data.get('speaker')and not matches_identity(data['speaker'],row):continue
                 date=str(row.get('video_created_at') or '');prefix=data.get('filter_date') or (str(data['filter_year'])+(f"-{int(data['filter_month']):02d}" if data.get('filter_month') else '') if data.get('filter_year') else '')
                 tr=data.get('time_range') or {}
                 if not valid_interval(row):

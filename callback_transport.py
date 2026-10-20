@@ -42,7 +42,7 @@ def worker_canary(data,key,module,revision_tracking=False):
     nonce=data['challenge'];signature=hmac.new((key or '').encode(),nonce.encode(),hashlib.sha256).hexdigest()
     from rq import get_current_job
     current_job=get_current_job()
-    result={'index_revision_tracking':revision_tracking,'worker_module':module,'worker_name':getattr(current_job,'worker_name',None),'worker_revision':os.getenv('RAILWAY_GIT_COMMIT_SHA','unknown'),'api_key_configured':bool(key),'configured_key_matches_expected':hmac.compare_digest(signature,data['expected_signature']),'transport_sha256':hashlib.sha256(inspect.getsource(post_callback).encode()).hexdigest(),'provider_calls':0}
+    result={'index_revision_tracking':revision_tracking,'worker_module':module,'worker_name':getattr(current_job,'worker_name',None),'speaker_identity_version':'speaker_identity_v2','search_pipeline':os.getenv('SEARCH_PIPELINE','fast'),'grounding_citation_mode':os.getenv('GROUNDING_CITATION_MODE','span_id'),'worker_revision':os.getenv('RAILWAY_GIT_COMMIT_SHA','unknown'),'api_key_configured':bool(key),'configured_key_matches_expected':hmac.compare_digest(signature,data['expected_signature']),'transport_sha256':hashlib.sha256(inspect.getsource(post_callback).encode()).hexdigest(),'provider_calls':0}
     try:
         legacy=post_callback(data['callback_url'],{'probe_nonce':nonce,'probe_signature':signature},key)
         try:legacy_body=legacy.json()

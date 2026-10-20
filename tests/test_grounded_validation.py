@@ -57,3 +57,20 @@ class GroundedTests(unittest.TestCase):
    return {'judgments':[judgment(r)for r in b]}
   rows,meta=validate_grounded('fees',[row(i)for i in range(24)],judge,concurrency=100)
   self.assertEqual(24,len(rows));self.assertLessEqual(maximum,2);self.assertEqual(2,meta['limits']['concurrency']);self.assertEqual(3,meta['provider_calls'])
+
+class SourceSpanTests(unittest.TestCase):
+ def test_source_spans_are_original_unicode_with_bounded_lengths(self):
+  from grounded_validation import source_spans
+  text=('طلبہ کی تعلیم اور فیس کے مسائل۔ '*30)+'Final evidence.'
+  spans=source_spans(text);self.assertTrue(spans);self.assertEqual(''.join(text.split()),''.join(''.join(s['quote'].split())for s in spans))
+  for s in spans:self.assertEqual(text[s['start']:s['end']],s['quote']);self.assertLessEqual(len(s['quote']),170)
+ def test_fast_future_frees_slot_while_slow_peer_remains_inflight(self):
+  import time
+  started={};finished={}
+  def judge(q,rs,timeout):
+   i=int(rs[0]['id']);started[i]=time.monotonic();time.sleep(.10 if i==0 else .01);finished[i]=time.monotonic();return {'judgments':[judgment(r,yes=False)for r in rs]}
+  rows=[row(i)for i in range(4)]
+  # Use local schema helper to keep the concurrency test independent of provider transport.
+  def judgment(r,yes=False):return {'candidate_id':candidate_id(r),'score':.1,'relevant':False,'complete':False,'roles_supported':False,'relationship_supported':False,'quotes':[],'reason':'related_only'}
+  accepted,meta=validate_grounded('unrelated',rows,judge,batch_size=1,max_calls=4,concurrency=2)
+  self.assertEqual([],accepted);self.assertEqual(4,meta['evaluated_count']);self.assertLess(started[2],finished[0])

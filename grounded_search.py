@@ -1,6 +1,7 @@
 """Diverse semantic candidates -> original nearby turns -> one grounded rerank.
 No embedding-space change or new identity assertions. Exact matching is separate.
 """
+from speaker_identity import view as identity_view, FIELDS as IDENTITY_FIELDS, supported as identity_supported
 import copy,hashlib,json,time,os,re
 from dataclasses import asdict
 from collections import defaultdict
@@ -9,7 +10,7 @@ from contextual_search import source_filter
 from grounded_validation import VERSION,SYSTEM,validate_grounded,candidate_id
 from semantic_passage_evidence import ValidationUnavailable
 from transcript_search_contract import CONFIG,normalize,valid_interval,GROUNDED_STRATEGY_VERSION
-FIELDS=['video_id','text','speaker','transcript_speaker','diarization_speaker','start_time','end_time','timestamp_unit','video_title','youtube_url','language','video_created_at']
+FIELDS=IDENTITY_FIELDS+['video_id','text','speaker','transcript_speaker','diarization_speaker','start_time','end_time','timestamp_unit','video_title','youtube_url','language','video_created_at']
 def diverse(rows,limit,key="retrieval_score"):
     groups=defaultdict(list)
     for row in sorted(rows,key=lambda r:-r.get(key,r['score'])):groups[row['video_id']].append(row)
@@ -41,7 +42,7 @@ def coherent_passage(focus, neighbors):
         index=center+direction
         while 0<=index<len(ordered)and len(turns)<32:
             row=ordered[index]
-            if (row.get('speaker')!=focus.get('speaker')or(row.get('transcript_speaker')or row.get('diarization_speaker'))!=label
+            if ((row.get('speaker')!=focus.get('speaker') or row.get('source_identity_group')!=focus.get('source_identity_group'))or(row.get('transcript_speaker')or row.get('diarization_speaker'))!=label
                     or not str(row.get('text')or'').strip()):break
             gap=turns[0]['start_time']-row['end_time']if direction<0 else row['start_time']-turns[-1]['end_time']
             proposed=sorted([*turns,row],key=lambda r:r['start_time'])
@@ -138,10 +139,10 @@ class GroundedSearch:
             points,next_offset=self.base.client.scroll(collection_name=self.base.collection,scroll_filter=window,
                 limit=500,with_payload=FIELDS,with_vectors=False,timeout=6);context_reads+=1
             if next_offset is not None:warnings.append('context_window_truncated')
-            neighbors=[{'id':str(p.id),**(p.payload or{})}for p in points];batch=[]
+            neighbors=[{'id':str(p.id),**identity_view(p.payload or{})}for p in points];batch=[]
             for row in focus:
                 passage=coherent_passage(row,neighbors)
-                passage['speaker_identity_status']='named_source_label_match'if named_constraint else 'unverified_source_label'
+                passage['speaker_identity_status']='supported_identity'if identity_supported(passage) else 'unverified_source_label'
                 passage['context_speaker_continuity']='anonymous_label'if row.get('transcript_speaker')or row.get('diarization_speaker')else 'unverified'
                 passage['segment_ids']=list(map(str,passage.get('segment_ids')or[row['id']]))
                 passage_key=candidate_id(passage)
@@ -206,5 +207,5 @@ def summary_search(engine,request):
     total=engine.base.client.count(collection_name=engine.base.collection,count_filter=source_filter(request,ids or [-1]),exact=True,timeout=8).count
     bounded=total>result['ranking']['candidates_retrieved'] or result['ranking']['candidates_retrieved']>metadata['candidate_count']
     status='partial'if bounded or metadata['status']=='partial'else 'completed'if result['results']else 'no_matches'
-    result.update(search_mode='simple',filter_type='summary',search_contract={'authority':'python_contract_v1','representation':VERSION,'contract':'summary','status':status,'exhaustive':not bounded and metadata['status']!='partial','counts':{'matching_videos':result['unique_videos'],'displayed_passages':result['returned'],'matched_transcript_occurrences':None},'summary_candidate_videos':len(ids),'summary_candidate_point_count':total,'scope':'authorized_summary_candidates_bounded_semantic_passages','passage_validation':metadata})
+    result.update(search_mode='simple',filter_type='summary',search_contract={'authority':'python_contract_v1','representation':VERSION,'contract':'summary','status':status,'exhaustive':not bounded and metadata['status']!='partial','partial_reasons':(['bounded_semantic_evaluation']if bounded else[])+metadata.get('partial_reasons',[]),'counts':{'matching_videos':result['unique_videos'],'displayed_passages':result['returned'],'matched_transcript_occurrences':None},'summary_candidate_videos':len(ids),'summary_candidate_point_count':total,'scope':'authorized_summary_candidates_bounded_semantic_passages','passage_validation':metadata})
     return result

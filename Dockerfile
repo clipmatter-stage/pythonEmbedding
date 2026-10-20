@@ -33,7 +33,7 @@ COPY transcript_search_contract.py .
 COPY exact_search_cursor.py exact_lexical.py grounded_validation.py grounded_search.py search_observability.py .
 COPY grounded_title_search.py .
 COPY callback_transport.py .
-COPY index_operations.py .
+COPY index_operations.py speaker_identity.py .
 COPY index_recovery_contract.py .
 COPY search_contract_v1.json .
 COPY backfill_transcript_contract.py .

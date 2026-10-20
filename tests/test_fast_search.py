@@ -34,7 +34,7 @@ class FastSearchTest(unittest.TestCase):
     def put(self, identity, text, vector, **changes):
         payload = dict(video_id=identity, text=text, speaker="Alice", start_time=1, end_time=3,
                        processing_status="completed", approval_status="approved", is_archived=False,
-                       video_title="Speech", language="ur")
+                       video_title="Speech", language="ur",identity_version="speaker_identity_v2",identity_status="verified",identity_source="manual",identity_key="fixture",identity_review={"review_id":"fixture","reviewer_id":"fixture","reviewed_at":"2026-10-20","evidence_sha256":"a"*64})
         self.client.upsert("source", [models.PointStruct(id=identity, vector=vector, payload={**payload, **changes})])
 
     def test_dense_is_one_query_embedding_without_reranker_or_validator(self):

@@ -36,6 +36,7 @@ from contextual_search import (
 from fast_search import FastSemanticSearch, SPARSE_NAME, with_sparse_vectors
 from index_recovery_contract import lexical, valid_vector
 from semantic_query_decomposition import decompose_semantic_query
+from speaker_identity import view as identity_view, SearchIdentityClient, FIELDS as IDENTITY_FIELDS, speaker_search
 from transcript_search_contract import contract_search, search_session_binding, indexed_text_fields, valid_interval
 from semantic_passage_evidence import (
     validate_passages, ValidationUnavailable, validation_error_detail,
@@ -552,6 +553,7 @@ class SearchRequest(BaseModel):
     query_decomposition_mode: Optional[str] = Field(default=None, pattern="^(off|shadow|on)$")
 
 class SuggestRequest(BaseModel):
+    allowed_video_ids: Optional[List[int]] = Field(default=None,max_length=10000)
     query: str = Field(..., min_length=2, max_length=200)
     type: str = Field(default="both", pattern="^(speaker|title|both)$")
     limit: int = Field(default=10, ge=1, le=50)
@@ -1256,7 +1258,7 @@ def get_contextual_search(pipeline_override: Optional[str] = None) -> Contextual
         return {**intent, "query_decomposition": decomposition}
 
     def speaker_values(speaker):
-        alias = detect_person_alias(speaker)
+        alias = _ALIAS_LOOKUP.get(speaker.lower().strip())
         return PERSON_ALIASES[alias]["speaker_variants"] if alias else []
 
     def validate(query, candidates, speaker):
@@ -1312,13 +1314,13 @@ def get_contextual_search(pipeline_override: Optional[str] = None) -> Contextual
             try:return revision(redis_conn)
             except CursorError as error:raise HTTPException(error.status,detail={'code':error.code,'message':error.message,'retryable':True}) from error
             except Exception as error:raise HTTPException(503,detail={'code':'search_session_unavailable','message':'Search revision cache is temporarily unavailable. Please retry.','retryable':True}) from error
-        base=FastSemanticSearch(qdrant_client,SEGMENTS_COLLECTION,lambda text:get_semantic_query_embedding(text,8),analyze,
+        base=FastSemanticSearch(SearchIdentityClient(qdrant_client),SEGMENTS_COLLECTION,lambda text:get_semantic_query_embedding(text,8),analyze,
             lambda query,value:fuzzy_match_speaker(query,value,threshold=75),
             lambda query,value:fuzzy_match_text(query,value,threshold=75),speaker_values=speaker_values,
             speaker_index_types={key:value.data_type for key,value in source_info.payload_schema.items()},
             sparse_enabled=SPARSE_NAME in (source_info.config.params.sparse_vectors or {}))
         model=os.getenv("SEARCH_JUDGE_MODEL",OPENAI_TEXT_MODEL)
-        return GroundedSearch(base,provider_judge(openai_client,model),model,current_revision,read_shared_cache,write_shared_cache,(OPENAI_EMBEDDING_MODEL,EMBEDDING_DIMENSION),
+        return GroundedSearch(base,provider_judge(openai_client,model,os.getenv('GROUNDING_CITATION_MODE','span_id')),model,current_revision,read_shared_cache,write_shared_cache,(OPENAI_EMBEDDING_MODEL,EMBEDDING_DIMENSION),
             title_intent=grounded_title_intent,title_indexed=str(getattr(source_info.payload_schema.get('video_title'),'data_type','')) in {'text','PayloadSchemaType.TEXT'})
 
     if pipeline == "fast":
@@ -1327,7 +1329,7 @@ def get_contextual_search(pipeline_override: Optional[str] = None) -> Contextual
         from dataclasses import replace
         small_settings = replace(settings, candidate_limit=min(settings.candidate_limit, 20), context_seconds=0)
         return FastSemanticSearch(
-            qdrant_client, SEGMENTS_COLLECTION, lambda text: get_semantic_query_embedding(text, 8), analyze,
+            SearchIdentityClient(qdrant_client), SEGMENTS_COLLECTION, lambda text: get_semantic_query_embedding(text, 8), analyze,
             lambda query, value: fuzzy_match_speaker(query, value, threshold=75),
             lambda query, value: fuzzy_match_text(query, value, threshold=75),
             speaker_values=speaker_values,
@@ -1338,7 +1340,7 @@ def get_contextual_search(pipeline_override: Optional[str] = None) -> Contextual
         )
 
     return ContextualSearch(
-        qdrant_client, SEGMENTS_COLLECTION, lambda text: get_semantic_query_embedding(text, 8), analyze,
+        SearchIdentityClient(qdrant_client), SEGMENTS_COLLECTION, lambda text: get_semantic_query_embedding(text, 8), analyze,
         lambda query, value: fuzzy_match_speaker(query, value, threshold=75),
         lambda query, value: fuzzy_match_text(query, value, threshold=75),
         QdrantReranker(qdrant_client, settings),
@@ -2268,6 +2270,7 @@ def process_video_task(data_dict: dict):
             texts_to_embed.append(enriched_text)
             segment_metadata.append({
                 'idx': segment_index,
+                'identity_fields': {k:segment[k]for k in IDENTITY_FIELDS if k in segment},
                 'speaker': speaker,
                 'transcript_speaker': segment.get('transcript_speaker'),
                 'diarization_speaker': diarization_speaker,
@@ -2354,6 +2357,8 @@ def process_video_task(data_dict: dict):
                 "language": language,
                 "segment_index": metadata['idx'],
                 "speaker": metadata['speaker'],
+                **metadata['identity_fields'],
+                "embedding_input_contract":"transcript_context_text_only_v1",
                 "diarization_speaker": metadata['diarization_speaker'],
                 "match_type": metadata['match_type'],
                 "start_time": metadata['start_time'],
@@ -2587,6 +2592,10 @@ def search_engine(request):
 
 @app.post("/search")
 async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)):
+    if data.search_mode=='simple' and data.filter_type=='speaker':
+        try:return await asyncio.to_thread(speaker_search,qdrant_client,SEGMENTS_COLLECTION,data,fuzzy_match_speaker)
+        except ValueError as error:raise HTTPException(422,detail=str(error))
+
     if data.search_mode=='simple' and data.filter_type=='summary' and search_pipeline(data)=="grounded":
         from grounded_search import summary_search
         try:return await asyncio.to_thread(lambda:summary_search(search_engine(data),data))
@@ -3947,7 +3956,7 @@ async def get_video_segments(video_id: int, limit: int = 100, offset: int = 0, a
             "segments": [
                 {
                     "segment_index": (p.payload or {}).get("segment_index"),
-                    "speaker": (p.payload or {}).get("speaker"),
+                    "speaker": identity_view(p.payload or {}).get("speaker"),
                     "start_time": (p.payload or {}).get("start_time"),
                     "end_time": (p.payload or {}).get("end_time"),
                     "duration": (p.payload or {}).get("duration"),
@@ -3971,6 +3980,7 @@ async def suggest(data: SuggestRequest, authorized: bool = Depends(verify_api_ke
       - type: "speaker" or "title" (default: both)
       - limit: max suggestions (default: 10)
     """
+    if data.allowed_video_ids is None:raise HTTPException(422,detail={'code':'search_scope_required','message':'Server-authorized video scope required'})
     query = data.query.strip()
     suggest_type = data.type
     limit = data.limit
@@ -3987,9 +3997,10 @@ async def suggest(data: SuggestRequest, authorized: bool = Depends(verify_api_ke
         while scanned < max_scan and (len(speakers) < limit or len(titles) < limit):
             points, next_offset = qdrant_client.scroll(
                 collection_name=SEGMENTS_COLLECTION,
+                scroll_filter=Filter(must=[FieldCondition(key='video_id',match=MatchAny(any=data.allowed_video_ids or[-1])),FieldCondition(key='processing_status',match=MatchValue(value='completed')),FieldCondition(key='approval_status',match=MatchValue(value='approved')),FieldCondition(key='is_archived',match=MatchValue(value=False))]),
                 limit=1000,
                 offset=offset,
-                with_payload=["speaker", "video_title", "video_id"],
+                with_payload=["speaker", "video_title", "video_id", "processing_status", "approval_status", "is_archived", *IDENTITY_FIELDS],
                 with_vectors=False
             )
 
@@ -3998,12 +4009,13 @@ async def suggest(data: SuggestRequest, authorized: bool = Depends(verify_api_ke
 
             for p in points:
                 scanned += 1
-                payload = p.payload or {}
+                payload = identity_view(p.payload or {})
+                if payload.get('processing_status')!='completed' or payload.get('approval_status')!='approved' or payload.get('is_archived')is not False:continue
 
                 # Collect speaker suggestions
                 if suggest_type in ["speaker", "both"]:
                     speaker = payload.get("speaker", "")
-                    if speaker and speaker not in speakers:
+                    if speaker and speaker!='Unknown Speaker' and speaker not in speakers:
                         if fuzzy_match_speaker(query, speaker, threshold=60):
                             score = fuzz.ratio(query.lower(), speaker.lower())
                             speakers[speaker] = score

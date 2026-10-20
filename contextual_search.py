@@ -10,6 +10,7 @@ from collections import defaultdict
 from itertools import zip_longest
 from dataclasses import dataclass
 from datetime import date
+from speaker_identity import matches_identity
 import hashlib
 import json
 import logging
@@ -331,6 +332,7 @@ def source_passage(focus: dict, neighbors: list[dict], seconds: float) -> dict:
         return {}
     same = [row for row in neighbors if row.get("id") is not None and valid_interval(row)
             and row.get("video_id") == focus.get("video_id") and row.get("speaker") == speaker
+            and row.get("source_identity_group")==focus.get("source_identity_group")
             and (row.get("transcript_speaker") or row.get("diarization_speaker")) == label
             and str(row.get("text") or "").strip() and str(row["id"]) != str(focus["id"])]
     before = [row for row in same if 0 <= focus["start_time"] - row["end_time"] <= min(1, seconds)]
@@ -482,7 +484,7 @@ class ContextualSearch:
                 payload = point.payload or {}
                 if not str(payload.get("text") or "").strip() or not valid_interval(payload):
                     continue
-                if speaker and not self.speaker_matches(speaker, f"{payload.get('speaker', '')} {payload.get('diarization_speaker', '')}"):
+                if speaker and not matches_identity(speaker,payload):
                     continue
                 if request.title and not self.title_matches(request.title, payload.get("video_title", "")):
                     continue
@@ -523,7 +525,7 @@ class ContextualSearch:
                     payload = point.payload or {}
                     if not str(payload.get("text") or "").strip() or not valid_interval(payload):
                         continue
-                    if speaker and not self.speaker_matches(speaker, f"{payload.get('speaker', '')} {payload.get('diarization_speaker', '')}"):
+                    if speaker and not matches_identity(speaker,payload):
                         continue
                     if request.title and not self.title_matches(request.title, payload.get("video_title", "")):
                         continue

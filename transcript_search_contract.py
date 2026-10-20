@@ -65,7 +65,7 @@ def valid_interval(row):
             and math.isfinite(a) and math.isfinite(b) and 0<=a<b)
 
 def transcript_results(rows,query,contract='normalized'):
-    hits=[dict(r) for r in rows if valid_interval(r) and match_spans(r.get('text',''),query,contract)]
+    hits=[__import__('speaker_identity').view(r) for r in rows if valid_interval(r) and match_spans(r.get('text',''),query,contract)]
     sources={str(r['id']):dict(r) for r in hits}
     results=consolidate_candidates(hits)
     for r in results:
@@ -79,6 +79,7 @@ def search_session_binding(request):
     fields=['query','words','word','search_mode','filter_type','transcript_contract','video_id','speaker','title','language','time_range','filter_year','filter_month','filter_date','query_decomposition_mode','summary_candidates','min_score','allowed_video_ids','authorization_scope','scope_revision','index_revision','verify_relevance']
     data={key:getattr(request,key,None) for key in fields}
     data.update(rules_version=VERSION,build=os.getenv('RAILWAY_GIT_COMMIT_SHA','development'),pipeline=os.getenv('SEARCH_PIPELINE','fast'),judge_model=os.getenv('SEARCH_JUDGE_MODEL',os.getenv('OPENAI_TEXT_MODEL','gpt-6-luna')))
+    data.update(identity_version='speaker_identity_v2',citation_mode=os.getenv('GROUNDING_CITATION_MODE','span_id'))
     data.update(embedding_contract=[os.getenv('OPENAI_EMBEDDING_MODEL','text-embedding-3-large'),os.getenv('EMBEDDING_DIMENSION','3072')],candidate_limit=os.getenv('FAST_SEARCH_CANDIDATE_LIMIT','100'),minimum_dense_score=os.getenv('SEARCH_MIN_DENSE_SCORE','0'))
     if data['pipeline']=='grounded'or data.get('verify_relevance'):
         data['grounding_strategy']=[GROUNDED_STRATEGY_VERSION,os.getenv('GROUNDING_INITIAL_CANDIDATES','12'),os.getenv('GROUNDING_MAX_CANDIDATES','24')]
@@ -100,7 +101,7 @@ def contract_search(request,reader,collection,models,embed,judge,*,use_normalize
         if coverage==covered:
             should=[models.FieldCondition(key='transcript_normalized_v1',match=models.MatchText(text=value)) for value in query_variants(query,contract)]
             scan_filter=models.Filter(must=conditions,should=should);normalized_index_used=True
-    fields=['video_id','video_title','speaker','diarization_speaker','transcript_speaker','start_time','end_time','timestamp_unit','text','youtube_url','language','video_created_at','search_contract_version']
+    fields=__import__('speaker_identity').FIELDS+['video_id','video_title','speaker','diarization_speaker','transcript_speaker','start_time','end_time','timestamp_unit','text','youtube_url','language','video_created_at','search_contract_version']
     summaries=['video_summary','video_summary_english','video_summary_urdu','summary_en','summary_ur']
     if kind=='summary':fields+=summaries
     rows=[];offset=None;scanned=0;exhaustive=False;summary_candidates=getattr(request,'summary_candidates',None)

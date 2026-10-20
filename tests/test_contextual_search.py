@@ -59,7 +59,7 @@ class ContextualSearchTest(unittest.TestCase):
         self.client.close()
 
     def put(self, identity, text, title="Speech", vector=None, **overrides):
-        payload = dict(text=text, video_id=identity, speaker="Alice", start_time=10,
+        payload = dict(identity_version="speaker_identity_v2",identity_status="verified",identity_source="manual",identity_key="fixture",identity_review={"review_id":"fixture","reviewer_id":"fixture","reviewed_at":"2026-10-20","evidence_sha256":"a"*64},text=text, video_id=identity, speaker="Alice", start_time=10,
                        end_time=20, video_title=title, language="ur",
                        processing_status="completed", approval_status="approved",
                        is_archived=False)

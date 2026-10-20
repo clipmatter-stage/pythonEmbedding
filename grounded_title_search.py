@@ -4,7 +4,8 @@ from qdrant_client import models
 from contextual_search import source_filter
 from transcript_search_contract import normalize
 
-TITLE_FIELDS=['video_id','video_title','youtube_url','language','video_created_at','speaker','diarization_speaker','start_time','end_time']
+from speaker_identity import FIELDS as IDENTITY_FIELDS, matches_identity
+TITLE_FIELDS=IDENTITY_FIELDS+['video_id','video_title','youtube_url','language','video_created_at','speaker','diarization_speaker','start_time','end_time']
 
 
 def title_candidates(base, request, queries, video_ids=None, indexed=False):
@@ -25,7 +26,7 @@ def title_candidates(base, request, queries, video_ids=None, indexed=False):
         for point in points:
             row=point.payload or{};identity=row.get('video_id');title=row.get('video_title')or''
             if identity is None or not title:continue
-            if request.speaker and not base.speaker_matches(request.speaker,f"{row.get('speaker','')} {row.get('diarization_speaker','')}"):continue
+            if request.speaker and not matches_identity(request.speaker,row):continue
             if request.title and not base.title_matches(request.title,title):continue
             if title not in scores:
                 normalized=normalize(title.replace('_',' '));tokens=set(normalized.split())

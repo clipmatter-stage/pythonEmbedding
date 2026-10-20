@@ -5,6 +5,7 @@ indices. Qdrant supplies IDF and rank fusion; no local model download is needed.
 This is lexical TF-IDF, not a learned multilingual embedding or BM25 model.
 """
 from collections import Counter, defaultdict
+from speaker_identity import view as identity_view, FIELDS as IDENTITY_FIELDS, matches_identity
 from dataclasses import dataclass
 import hashlib
 import math
@@ -124,10 +125,10 @@ class FastSemanticSearch:
         retrieved = time.perf_counter()
         results = []
         for point in points:
-            row = point.payload or {}
+            row = identity_view(point.payload or {})
             if not str(row.get("text") or "").strip() or not valid_interval(row):
                 continue
-            if speaker and not self.speaker_matches(speaker, f"{row.get('speaker', '')} {row.get('diarization_speaker', '')}"):
+            if speaker and not matches_identity(speaker,row):
                 continue
             if request.title and not self.title_matches(request.title, row.get("video_title", "")):
                 continue
