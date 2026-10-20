@@ -91,7 +91,14 @@ def speaker_search(client,collection,request,matches):
     if not speaker:raise ValueError('Speaker name required; Unknown Speaker is a distinct filter')
     unknown=speaker.casefold()in {'unknown','unknown speaker'}
     filters=source_filter(request)
-    if not unknown:filters.must.extend([models.FieldCondition(key='identity_version',match=models.MatchValue(value=VERSION)),models.FieldCondition(key='identity_status',match=models.MatchAny(any=['accepted','verified']))])
+    # Strict-mode Qdrant rejects filtering on fields without payload indexes.
+    # Preserve the bounded eligible scan until both derived identity indexes
+    # exist; supported() still decides every returned identity below.
+    indexed=False
+    if not unknown and hasattr(client,'get_collection'):
+        schema=client.get_collection(collection_name=collection).payload_schema or {}
+        indexed=all(k in schema for k in ('identity_version','identity_status'))
+    if indexed:filters.must.extend([models.FieldCondition(key='identity_version',match=models.MatchValue(value=VERSION)),models.FieldCondition(key='identity_status',match=models.MatchAny(any=['accepted','verified']))])
     offset=None;rows=[];scanned=0;limit=min(request.max_scanned,50000);next_offset=None
     while scanned<limit and len(rows)<request.top_k:
         points,next_offset=client.scroll(collection_name=collection,scroll_filter=filters,offset=offset,limit=min(200,limit-scanned),with_payload=True,with_vectors=False,timeout=10)
