@@ -48,7 +48,9 @@ def provider_judge(client,model,citation_mode='quote'):
 
         arguments={'model':model,'messages':[{'role':'system','content':system},{'role':'user','content':json.dumps({'query':query,'passages':docs},ensure_ascii=False)}],'max_completion_tokens':2200,'response_format':{'type':'json_schema','json_schema':{'name':'grounded_passages','strict':True,'schema':schema([x['candidate_id']for x in docs])}},'timeout':timeout}
         if citation_mode=='span_id':arguments['response_format']['json_schema']['schema']['properties']['judgments']['items']['properties']['quotes']['items']['enum']=[i for choices in citations.values()for i in choices]
-        if model.startswith(('gpt-6','gpt-5','o')):arguments['reasoning_effort']='none'
+        if model.startswith(('gpt-6','gpt-5','o')):
+            arguments['reasoning_effort']='none'
+            if model in {'gpt-6-luna','gpt-6-sol'}:arguments['temperature']=0
         else:arguments['temperature']=0
         t=time.monotonic();response=client.with_options(max_retries=0).chat.completions.create(**arguments);choice=response.choices[0]
         if choice.finish_reason!='stop' or getattr(choice.message,'refusal',None):raise ValidationUnavailable('Incomplete provider response')

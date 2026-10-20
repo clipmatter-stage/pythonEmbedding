@@ -77,6 +77,16 @@ class SearchTests(unittest.TestCase):
   rows=[{'id':str(i),'video_id':1,'speaker':'Unknown','text':str(i),'start_time':i,'end_time':i+1}for i in range(1,4)]
   result=coherent_passage(rows[1],rows)
   self.assertEqual(['2'],result['segment_ids'])
+ def test_adjacent_indexed_unknown_turns_supply_context_without_identity_claim(self):
+  from grounded_search import coherent_passage
+  rows=[{'id':str(i),'segment_index':i,'video_id':1,'speaker':'Unknown Speaker','source_identity_group':'same-source-group','text':str(i),'start_time':i*15,'end_time':(i+1)*15}for i in range(1,4)]
+  result=coherent_passage(rows[1],rows)
+  self.assertEqual(['1','2','3'],result['segment_ids']);self.assertEqual('Unknown Speaker',result['speaker'])
+  self.assertEqual([1,2,3],[r['segment_index']for r in result['source_utterances']])
+  rows[0]['segment_index']=99
+  self.assertNotIn('1',coherent_passage(rows[1],rows)['segment_ids'])
+  rows[0]['segment_index']=1;rows[2]['source_identity_group']='different-source-group'
+  self.assertNotIn('3',coherent_passage(rows[1],rows)['segment_ids'])
  def test_context_does_not_bridge_long_gaps(self):
   from grounded_search import coherent_passage
   rows=[{'id':str(i),'video_id':1,'speaker':'Alice','text':str(i),'start_time':i*10,'end_time':i*10+1}for i in range(1,4)]

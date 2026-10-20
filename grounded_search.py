@@ -10,7 +10,7 @@ from contextual_search import source_filter
 from grounded_validation import VERSION,SYSTEM,validate_grounded,candidate_id
 from semantic_passage_evidence import ValidationUnavailable
 from transcript_search_contract import CONFIG,normalize,valid_interval,GROUNDED_STRATEGY_VERSION
-FIELDS=IDENTITY_FIELDS+['video_id','text','speaker','transcript_speaker','diarization_speaker','start_time','end_time','timestamp_unit','video_title','youtube_url','language','video_created_at']
+FIELDS=IDENTITY_FIELDS+['video_id','segment_index','text','speaker','transcript_speaker','diarization_speaker','start_time','end_time','timestamp_unit','video_title','youtube_url','language','video_created_at']
 def diverse(rows,limit,key="retrieval_score"):
     groups=defaultdict(list)
     for row in sorted(rows,key=lambda r:-r.get(key,r['score'])):groups[row['video_id']].append(row)
@@ -30,28 +30,33 @@ def semantic_gloss(query):
     return query if not extras else query+' ('+'; '.join(dict.fromkeys(extras))+')'
 
 def coherent_passage(focus, neighbors):
-    """Extend only adjacent original turns with the same source speaker label."""
+    """Retain original turns; temporal context never establishes an identity."""
     from contextual_search import timestamp_url
     current=focus.copy()
     ordered=sorted([focus,*[r for r in neighbors if str(r['id'])!=str(focus['id'])
                     and r.get('video_id')==focus.get('video_id')and valid_interval(r)]],key=lambda r:(r['start_time'],r['end_time']))
     center=next(i for i,r in enumerate(ordered)if str(r['id'])==str(focus['id']))
     turns=[focus];label=focus.get('transcript_speaker')or focus.get('diarization_speaker')
-    directions=()if str(focus.get('speaker')or'').casefold()in{'','unknown','unknown speaker'}and not label else (-1,1)
+    anonymous_unknown=str(focus.get('speaker')or'').casefold()in{'','unknown','unknown speaker'}and not label
+    indexed_sequence=anonymous_unknown and type(focus.get('segment_index'))is int
+    directions=()if anonymous_unknown and not indexed_sequence else (-1,1)
     for direction in directions:
         index=center+direction
         while 0<=index<len(ordered)and len(turns)<32:
             row=ordered[index]
             if ((row.get('speaker')!=focus.get('speaker') or row.get('source_identity_group')!=focus.get('source_identity_group'))or(row.get('transcript_speaker')or row.get('diarization_speaker'))!=label
                     or not str(row.get('text')or'').strip()):break
+            if indexed_sequence:
+                edge=turns[0]if direction<0 else turns[-1]
+                if type(row.get('segment_index'))is not int or row['segment_index']!=edge['segment_index']+direction:break
             gap=turns[0]['start_time']-row['end_time']if direction<0 else row['start_time']-turns[-1]['end_time']
             proposed=sorted([*turns,row],key=lambda r:r['start_time'])
-            if (not 0<=gap<=1 or proposed[-1]['end_time']-proposed[0]['start_time']>40
+            if (not 0<=gap<=1 or proposed[-1]['end_time']-proposed[0]['start_time']>60
                     or sum(len(r['text'])+1 for r in proposed)>2400):break
             turns=proposed;index+=direction
     current.update(text=' '.join(r['text'].strip()for r in turns),start_time=turns[0]['start_time'],
                    end_time=turns[-1]['end_time'],segment_ids=[str(r['id'])for r in turns],
-                   source_utterances=[{k:r.get(k)for k in ['id','text','start_time','end_time','speaker']}for r in turns])
+                   source_utterances=[{k:r.get(k)for k in ['id','segment_index','text','start_time','end_time','speaker','transcript_speaker','diarization_speaker']}for r in turns])
     current.update(duration=current['end_time']-current['start_time'],match_count=len(turns),
                    youtube_url_timestamped=timestamp_url(current.get('youtube_url',''),current['start_time']))
     return current
