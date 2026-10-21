@@ -1991,7 +1991,7 @@ from exact_search_cursor import RevisionedClient, register_exact_search
 qdrant_client = RevisionedClient(qdrant_client, redis_conn)
 register_exact_search(app, qdrant_client, redis_conn, SEGMENTS_COLLECTION, models, verify_api_key, API_KEY)
 from index_operations import register_index_operations
-register_index_operations(app, qdrant_client, SEGMENTS_COLLECTION, redis_conn, API_KEY)
+register_index_operations(app, qdrant_client, SEGMENTS_COLLECTION, redis_conn, API_KEY, queue=task_queue)
 
 def create_segments_collection():
     try:
