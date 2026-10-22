@@ -10,7 +10,7 @@ from qdrant_client import models
 from contextual_search import source_filter
 from grounded_validation import VERSION,SYSTEM,validate_grounded,candidate_id
 from semantic_passage_evidence import ValidationUnavailable
-from transcript_search_contract import CONFIG,normalize,valid_interval,GROUNDED_STRATEGY_VERSION
+from transcript_search_contract import CONFIG,normalize,valid_interval,GROUNDED_STRATEGY_VERSION,semantic_query_text
 FIELDS=IDENTITY_FIELDS+['video_id','segment_index','text','speaker','transcript_speaker','diarization_speaker','start_time','end_time','timestamp_unit','video_title','youtube_url','language','video_created_at']
 def diverse(rows,limit,key="retrieval_score"):
     groups=defaultdict(list)
@@ -104,7 +104,7 @@ class GroundedSearch:
         if cached is not None:
             if self.revision()!=epoch:raise ValidationUnavailable('Search index changed',reason='search_index_changed')
             result=copy.deepcopy(cached);meta=result['metadata']['passage_validation'];meta['cache_hit']=True;meta['cached_provider_calls']=meta['provider_calls'];meta['provider_calls']=0;meta['provider_usage']=[];result['ranking']['embedding_usage']=[];result['ranking']['timings']['total_seconds']=round(time.monotonic()-started,3);return result
-        original=' '.join([request.query or '',request.word or '',*(request.words or [])]).strip()
+        original=semantic_query_text(request)
         from grounded_title_search import title_candidates,merge_title_candidates
         from grounded_summary_search import summary_candidates,merge_summary_candidates
         title_rows=[];title_metadata={'matching_videos':0,'elapsed_seconds':0,'warnings':[],'exhaustive':True}

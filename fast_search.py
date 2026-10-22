@@ -18,7 +18,7 @@ import unicodedata
 
 from qdrant_client import models
 from contextual_search import SearchInputError, source_filter, timestamp_url
-from transcript_search_contract import valid_interval
+from transcript_search_contract import valid_interval, semantic_query_text
 
 SPARSE_NAME = "lexical_tf_v1"
 
@@ -86,7 +86,7 @@ class FastSemanticSearch:
 
     def search(self, request, video_ids=None):
         started = time.perf_counter()
-        query = " ".join([request.query or "", request.word or "", *(request.words or [])]).strip()
+        query = semantic_query_text(request)
         if not query:
             raise SearchInputError("A non-empty query or words is required for semantic search")
         intent = self.understand(query)

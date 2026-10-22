@@ -11,7 +11,24 @@ import unicodedata
 from semantic_passage_evidence import consolidate_candidates, validate_passages, RetrievalBudgetReached
 CONFIG=json.loads(pathlib.Path(__file__).with_name('search_contract_v1.json').read_text())
 VERSION=CONFIG['version']
-GROUNDED_STRATEGY_VERSION='speaker_scoped_title_summary_transcript_v5_multilingual_grouped'
+GROUNDED_STRATEGY_VERSION='speaker_scoped_title_summary_transcript_v6_query_inputs'
+
+def semantic_query_text(request):
+    """Combine legacy input fields without repeating query-derived keywords.
+
+    Preserve repetitions inside a supplied phrase and retain genuinely new
+    qualifiers, including negations. Compare complete whitespace tokens so a
+    word such as 'gas' is not swallowed by 'gasoline'.
+    """
+    parts=[];tokens=[]
+    for value in [request.query or '',request.word or '',*(request.words or [])]:
+        text=' '.join(value.split())
+        if not text:continue
+        wanted=unicodedata.normalize('NFKC',text).casefold().split()
+        if any(tokens[i:i+len(wanted)]==wanted for i in range(len(tokens)-len(wanted)+1)):
+            continue
+        parts.append(text);tokens.extend(wanted)
+    return ' '.join(parts)
 
 def normalized_with_spans(text):
     chars=[];spans=[]

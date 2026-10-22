@@ -17,6 +17,20 @@ def request(**changes):
 
 
 class FastSearchTest(unittest.TestCase):
+    def test_legacy_keywords_do_not_duplicate_semantic_query(self):
+        from transcript_search_contract import semantic_query_text
+        self.assertEqual('namaz ki talqeen',semantic_query_text(request(
+            query='namaz ki talqeen',word='namaz ki talqeen',words=['Namaz','ki','talqeen'])))
+        self.assertEqual('نماز کی تلقین',semantic_query_text(request(
+            query='نماز کی تلقین',words=['نماز','کی','تلقین'])))
+
+    def test_query_composition_preserves_new_terms_negation_and_phrase_repetitions(self):
+        from transcript_search_contract import semantic_query_text
+        self.assertEqual('gasoline gas not expensive',semantic_query_text(request(
+            query='gasoline',word='gas',words=['not','expensive'])))
+        self.assertEqual('very very expensive',semantic_query_text(request(query='very very expensive')))
+        self.assertEqual('prayer guidance',semantic_query_text(request(query='',words=['prayer','guidance'])))
+
     def setUp(self):
         self.client = QdrantClient(":memory:")
         self.client.create_collection("source", vectors_config=models.VectorParams(size=2, distance=models.Distance.COSINE))

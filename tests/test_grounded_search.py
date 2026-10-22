@@ -26,6 +26,16 @@ class SearchTests(unittest.TestCase):
   q=request(query='fees',allowed_video_ids=[1],authorization_scope='one',scope_revision='a');first=self.engine.search(q);n=self.calls;second=self.engine.search(q);self.assertEqual(n,self.calls);self.assertTrue(second['metadata']['passage_validation']['cache_hit']);self.assertEqual({1},{r['video_id']for r in first['results']});self.assertEqual({1},{r['video_id']for r in first['ranking']['candidate_trace']});self.epoch='b';self.engine.search(q);self.assertGreater(self.calls,n)
  def test_genuine_no_match_returns_no_unverified_dense_fallback(self):
   self.put(1,'Generic education and elections');r=self.engine.search(request(query='Minecraft'));self.assertEqual([],r['results']);self.assertEqual('no_matches',r['metadata']['passage_validation']['status'])
+
+ def test_legacy_query_words_are_not_repeated_for_retrieval_or_judgment(self):
+  self.put(1,'Generic source text')
+  retrieved=[];judged=[];understand=self.base.understand;judge=self.engine.judge
+  self.base.understand=lambda query:(retrieved.append(query)or understand(query))
+  self.engine.judge=lambda query,rows,timeout:(judged.append(query)or judge(query,rows,timeout))
+  result=self.engine.search(request(query='namaz ki talqeen',words=['namaz','ki','talqeen']))
+  self.assertEqual(['namaz ki talqeen'],retrieved)
+  self.assertTrue(judged);self.assertEqual({'namaz ki talqeen'},set(judged))
+  self.assertEqual('namaz ki talqeen',result['metadata']['passage_validation']['original_query'])
  def test_summary_uses_all_supplied_candidates_and_requires_original_evidence(self):
   from grounded_search import summary_search
   self.put(1,'University tuition costs 100000 rupees. Families cannot afford it',video=80)
