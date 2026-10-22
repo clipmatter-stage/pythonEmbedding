@@ -4,6 +4,7 @@ No embedding-space change or new identity assertions. Exact matching is separate
 from speaker_identity import view as identity_view, FIELDS as IDENTITY_FIELDS, supported as identity_supported
 import copy,hashlib,json,time,os,re
 from dataclasses import asdict
+from concurrent.futures import ThreadPoolExecutor
 from collections import defaultdict
 from qdrant_client import models
 from contextual_search import source_filter
@@ -72,40 +73,50 @@ def ranked_diverse(rows,limit):
     return selected[:limit]
 
 class GroundedSearch:
-    def __init__(self,base,judge,model,revision,read_cache,write_cache,embedding_contract,title_intent=None,title_indexed=False):
-        self.title_intent=title_intent;self.title_indexed=title_indexed
+    def __init__(self,base,judge,model,revision,read_cache,write_cache,embedding_contract,title_intent=None,title_indexed=False,summary_indexed_fields=()):
+        self.title_intent=title_intent;self.title_indexed=title_indexed;self.summary_indexed_fields=tuple(summary_indexed_fields)
         self.base=base;self.base.payload_fields=FIELDS;self.judge=judge;self.model=model;self.revision=revision;self.read_cache=read_cache;self.write_cache=write_cache;self.embedding_contract=embedding_contract
     def search(self,request,video_ids=None):
         started=time.monotonic();epoch=self.revision();initial=int(os.getenv('GROUNDING_INITIAL_CANDIDATES','12'));maximum=int(os.getenv('GROUNDING_MAX_CANDIDATES','24'))
         if not 1<=initial<=maximum<=32:raise ValueError('Grounding limits must satisfy 1 <= initial <= maximum <= 32')
         params=request.model_dump()if hasattr(request,'model_dump')else vars(request).copy()
         for k in ['cursor','exact_cursor','search_session_id','batch_size']:params.pop(k,None)
-        cache_key='grounded:'+hashlib.sha256(json.dumps([GROUNDED_STRATEGY_VERSION,initial,maximum,VERSION,hashlib.sha256(SYSTEM.encode()).hexdigest(),os.getenv('RAILWAY_GIT_COMMIT_SHA','development'),asdict(self.base.settings),self.base.sparse_enabled,self.model,self.embedding_contract,epoch,params,video_ids],sort_keys=True,ensure_ascii=False,default=str).encode()).hexdigest()
+        cache_key='grounded:'+hashlib.sha256(json.dumps([GROUNDED_STRATEGY_VERSION,self.title_indexed,self.summary_indexed_fields,initial,maximum,VERSION,hashlib.sha256(SYSTEM.encode()).hexdigest(),os.getenv('RAILWAY_GIT_COMMIT_SHA','development'),asdict(self.base.settings),self.base.sparse_enabled,self.model,self.embedding_contract,epoch,params,video_ids],sort_keys=True,ensure_ascii=False,default=str).encode()).hexdigest()
         cached=self.read_cache(cache_key)
         if cached is not None:
             if self.revision()!=epoch:raise ValidationUnavailable('Search index changed',reason='search_index_changed')
             result=copy.deepcopy(cached);meta=result['metadata']['passage_validation'];meta['cache_hit']=True;meta['cached_provider_calls']=meta['provider_calls'];meta['provider_calls']=0;meta['provider_usage']=[];result['ranking']['embedding_usage']=[];result['ranking']['timings']['total_seconds']=round(time.monotonic()-started,3);return result
         original=' '.join([request.query or '',request.word or '',*(request.words or [])]).strip()
         from grounded_title_search import title_candidates,merge_title_candidates
+        from grounded_summary_search import summary_candidates,merge_summary_candidates
         title_rows=[];title_metadata={'matching_videos':0,'elapsed_seconds':0,'warnings':[],'exhaustive':True}
+        summary_rows=[];summary_metadata={'matching_videos':0,'elapsed_seconds':0,'warnings':[],'exhaustive':True}
         title_plan=self.title_intent(original)if self.title_intent else {'queries':[original],'person_only':False}
-        if getattr(request,'search_mode','semantic')=='semantic'and not getattr(request,'filter_type',None):
-            try:title_rows,title_metadata=title_candidates(self.base,request,title_plan['queries'],video_ids,self.title_indexed)
-            except Exception:
-                title_metadata.update(exhaustive=False,warnings=['title_retrieval_unavailable'])
-        if title_plan.get('person_only')and getattr(request,'search_mode','semantic')=='semantic'and not getattr(request,'filter_type',None):
+        metadata_enabled=getattr(request,'search_mode','semantic')=='semantic'and not getattr(request,'filter_type',None)
+        # Both payload-only lookups have their own bounded deadline and run in
+        # parallel so summary discovery does not add a second serial scan.
+        if metadata_enabled:
+            with ThreadPoolExecutor(max_workers=2)as executor:
+                title_future=executor.submit(title_candidates,self.base,request,title_plan['queries'],video_ids,self.title_indexed)
+                summary_future=executor.submit(summary_candidates,self.base,request,title_plan['queries'],video_ids,self.summary_indexed_fields)
+                try:title_rows,title_metadata=title_future.result()
+                except Exception:title_metadata.update(exhaustive=False,warnings=['title_retrieval_unavailable'])
+                try:summary_rows,summary_metadata=summary_future.result()
+                except Exception:summary_metadata.update(exhaustive=False,warnings=['summary_retrieval_unavailable'])
+        if title_plan.get('person_only')and metadata_enabled:
             if self.revision()!=epoch:raise ValidationUnavailable('Search index changed',reason='search_index_changed')
             _,metadata=validate_grounded(original,[],self.judge)
-            metadata.update(status='not_applicable',reason='name_only_title_lookup',exhaustive=False)
+            metadata.update(status='not_applicable',reason='name_only_metadata_lookup',exhaustive=False)
+            combined=merge_summary_candidates(title_rows,summary_rows,request.top_k)
             result={'query':original,'words':request.words,'speaker_filter':request.speaker,'search_mode':'semantic',
-                'results':title_rows[:request.top_k],'returned':min(request.top_k,len(title_rows)),
-                'unique_videos':min(request.top_k,len(title_rows)),
-                'metadata':{'passage_validation':metadata,'title_retrieval':title_metadata},
-                'ranking':{'engine':'grounded_title_lookup','score_type':'title_lexical_match',
-                    'evidence_verified':False,'candidate_sources':['video_title'],
-                    'candidates_retrieved':len(title_rows),'embedding_usage':[],'index_revision':epoch,
-                    'timings':{'title_seconds':title_metadata['elapsed_seconds'],'total_seconds':round(time.monotonic()-started,3)}}}
-            if title_metadata['exhaustive']:self.write_cache(cache_key,result,300)
+                'results':combined,'returned':len(combined),
+                'unique_videos':len(combined),
+                'metadata':{'passage_validation':metadata,'title_retrieval':title_metadata,'summary_retrieval':summary_metadata},
+                'ranking':{'engine':'grounded_metadata_lookup'if summary_rows else 'grounded_title_lookup','score_type':'metadata_lexical_match',
+                    'evidence_verified':False,'candidate_sources':['video_title','video_summary'],
+                    'candidates_retrieved':len({r['video_id']for r in [*title_rows,*summary_rows]}),'embedding_usage':[],'index_revision':epoch,
+                    'timings':{'title_seconds':title_metadata['elapsed_seconds'],'summary_seconds':summary_metadata['elapsed_seconds'],'total_seconds':round(time.monotonic()-started,3)}}}
+            if title_metadata['exhaustive']and summary_metadata['exhaustive']:self.write_cache(cache_key,result,300)
             return result
         changes={'query':semantic_gloss(original),'word':None,'words':[],'top_k':self.base.settings.candidate_limit}
         expanded=request.model_copy(update=changes)if hasattr(request,'model_copy')else __import__('types').SimpleNamespace(**{**vars(request),**changes})
@@ -163,7 +174,7 @@ class GroundedSearch:
                 passed,stage=validate_grounded(judging_query,batch,self.judge,batch_size=6,max_calls=min(3,calls_left),
                     deadline_seconds=max(.1,deadline-time.monotonic()),concurrency=2)
             except ValidationUnavailable:
-                if not accepted and not title_rows:raise
+                if not accepted and not title_rows and not summary_rows:raise
                 warnings.append('expansion_validation_unavailable');break
             accepted.extend(r for r in passed if r['score']>=request.min_score);stages.append(stage)
             validation_seconds+=stage['elapsed_seconds']
@@ -191,16 +202,20 @@ class GroundedSearch:
         final=defaultdict(list)
         for row in sorted(accepted,key=lambda r:-r['score']):final[row['video_id']].append(row)
         result={**response,'query':original,'results':[r for group in final.values()for r in group],'returned':len(accepted),'unique_videos':len(final),'metadata':{'passage_validation':metadata},'ranking':{**response['ranking'],'engine':'grounded_contextual','score_type':'grounded_relevance','evidence_verified':True,'candidate_trace':trace,'candidate_scope':'bounded_dense_or_hybrid_pool','context_reads':context_reads,'embedding_usage':embedding_usage,'model':self.model,'rules_version':VERSION,'index_revision':epoch,'timings':{'retrieval_seconds':round(retrieved-semantic_started,3),'context_seconds':round(context_seconds,3),'validation_seconds':round(validation_seconds,3),'total_seconds':round(time.monotonic()-started,3)}}}
-        merged=merge_title_candidates(result['results'],title_rows,request.top_k)
+        merged=merge_title_candidates(result['results'],title_rows,len(result['results'])+len(title_rows))
+        merged=merge_summary_candidates(merged,summary_rows,request.top_k)
         result.update(results=merged,returned=len(merged),unique_videos=len({r['video_id']for r in merged}))
         result['metadata']['title_retrieval']=title_metadata
-        result['ranking'].update(candidate_sources=['video_title','transcript'],
+        result['metadata']['summary_retrieval']=summary_metadata
+        result['ranking'].update(candidate_sources=['video_title','video_summary','transcript']if metadata_enabled else ['transcript'],
             evidence_verified=bool(merged)and all(r['transcript_verified']for r in merged),
             transcript_verified_passages=sum(r['transcript_verified']for r in merged),
-            title_only_videos=sum(r.get('is_video_only',False)for r in merged))
+            title_only_videos=sum(bool(r.get('is_video_only')and r.get('title_evidence'))for r in merged),
+            summary_only_videos=sum(bool(r.get('is_video_only')and r.get('summary_evidence'))for r in merged))
         if any(r.get('is_video_only')for r in merged):result['ranking']['score_type']='mixed_source_relevance'
         result['ranking']['timings']['title_seconds']=title_metadata['elapsed_seconds']
-        if metadata['status']in{'completed','no_matches'}and title_metadata['exhaustive']:self.write_cache(cache_key,result,300)
+        result['ranking']['timings']['summary_seconds']=summary_metadata['elapsed_seconds']
+        if metadata['status']in{'completed','no_matches'}and title_metadata['exhaustive']and summary_metadata['exhaustive']:self.write_cache(cache_key,result,300)
         return result
 
 def summary_search(engine,request):

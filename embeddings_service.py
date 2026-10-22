@@ -1307,6 +1307,7 @@ def get_contextual_search(pipeline_override: Optional[str] = None) -> Contextual
         return results, metadata
 
     if pipeline == "grounded":
+        from grounded_summary_search import SUMMARY_FIELDS
         from grounded_search import GroundedSearch
         from grounded_validation import provider_judge
         from exact_search_cursor import revision,CursorError
@@ -1321,7 +1322,8 @@ def get_contextual_search(pipeline_override: Optional[str] = None) -> Contextual
             sparse_enabled=SPARSE_NAME in (source_info.config.params.sparse_vectors or {}))
         model=os.getenv("SEARCH_JUDGE_MODEL",OPENAI_TEXT_MODEL)
         return GroundedSearch(base,provider_judge(openai_client,model,os.getenv('GROUNDING_CITATION_MODE','span_id')),model,current_revision,read_shared_cache,write_shared_cache,(OPENAI_EMBEDDING_MODEL,EMBEDDING_DIMENSION),
-            title_intent=grounded_title_intent,title_indexed=str(getattr(source_info.payload_schema.get('video_title'),'data_type','')) in {'text','PayloadSchemaType.TEXT'})
+            title_intent=grounded_title_intent,title_indexed=str(getattr(source_info.payload_schema.get('video_title'),'data_type','')) in {'text','PayloadSchemaType.TEXT'},
+            summary_indexed_fields=[field for field in SUMMARY_FIELDS if str(getattr(source_info.payload_schema.get(field),'data_type',''))in{'text','PayloadSchemaType.TEXT'}])
 
     if pipeline == "fast":
         rerank = os.getenv("SEARCH_RERANKING", "false").lower() == "true"
@@ -3659,6 +3661,7 @@ async def search_incremental(data: IncrementalSearchRequest, authorized: bool = 
                 "search_contract": query_params.get("search_contract"),
                 "passage_validation": query_params.get("passage_validation"),
                 "title_retrieval": query_params.get("title_retrieval"),
+                "summary_retrieval": query_params.get("summary_retrieval"),
                 "lexical_backstop_requested": bool(query_params.get("lexical_backstop_requested", False)),
                 "lexical_backstop_applied": bool(query_params.get("lexical_backstop_applied", False)),
                 "lexical_backstop_reason": query_params.get("lexical_backstop_reason"),
@@ -3763,6 +3766,7 @@ async def search_incremental(data: IncrementalSearchRequest, authorized: bool = 
         "search_contract": delegated.get("search_contract"),
         "passage_validation": delegated.get("metadata", {}).get("passage_validation"),
         "title_retrieval": delegated.get("metadata", {}).get("title_retrieval"),
+        "summary_retrieval": delegated.get("metadata", {}).get("summary_retrieval"),
         "ranking": delegated.get("ranking"),
     }
     shared_available = await asyncio.to_thread(
@@ -3822,6 +3826,7 @@ async def search_incremental(data: IncrementalSearchRequest, authorized: bool = 
             "search_contract": delegated.get("search_contract"),
             "passage_validation": delegated.get("metadata", {}).get("passage_validation"),
             "title_retrieval": delegated.get("metadata", {}).get("title_retrieval"),
+            "summary_retrieval": delegated.get("metadata", {}).get("summary_retrieval"),
         }
     }
 

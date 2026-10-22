@@ -371,3 +371,41 @@ Speaker names require `speaker_identity_v2` provenance: reviewed manual evidence
 `/operations/patch-speaker-identities` accepts guarded explicit identity metadata only (1–50 IDs), supports dry run and guarded rollback, and never writes vectors/text/timestamps. Legacy producer provenance blocks assigning a different named person; negative/Unknown quarantine keeps the raw legacy prediction as audit data. Source/database changes use the paired Laravel private checkpoint workflow.
 
 `GROUNDING_CITATION_MODE=span_id` is the Phase 5 default adapter: the model selects source span IDs, which are resolved to original excerpts. `quote` restores the earlier adapter; both retain complete-intent validation and affected-only retries. Cache bindings include citation/identity versions. Completion-based scheduling retains at most two calls and the existing bounded budgets.
+
+## Summary candidates in grounded AI search
+
+Grounded AI search now includes stored summaries alongside titles and transcript
+passages. It checks `video_summary`, `video_summary_english`,
+`video_summary_urdu`, `summary_en`, and `summary_ur` using normalized lexical
+matching and the same explicit person-alias expansion as title retrieval.
+Complete query terms must match within one summary field; unrelated fields
+cannot supply separate pieces of a compound request. This does not create
+summary embeddings or change the document embedding space.
+
+Title and summary discovery run in parallel. Summary retrieval uses available
+Qdrant text indexes, then checks unindexed legacy fields through a scoped scan,
+sharing a budget of 10,000 source-point reads and approximately three seconds.
+Each Qdrant request also has a transport timeout; this is not a hard HTTP latency
+guarantee. `metadata.summary_retrieval` reports indexed/searched fields, scanned
+points, matching videos, warnings and whether the lookup exhausted its scope.
+Missing or bounded coverage must not be interpreted as collection-wide absence.
+Existing eligibility, authorized video IDs, language/date/time and explicit
+speaker/title constraints apply to this source too. No index backfill or extra
+account is required; availability depends on summaries already stored in Qdrant.
+
+Summary-only matches are video-only results with empty transcript text,
+`evidence_source=summary`, `transcript_verified=false`, matched summary fields
+and bounded excerpts with original character offsets. They do not invent spoken
+quotes, timestamps, or speaker identities. Videos found in multiple sources are
+merged; verified transcript passages retain their evidence and receive matching
+title/summary metadata. Verified passages stay before metadata-only videos.
+Pure-name queries such as `HNR` now search both titles and summaries without a
+model call. Continuation pages retain summary coverage metadata, and the cache
+and cursor strategy version changes so older title/transcript sessions cannot
+be reused under the new behavior.
+
+The separate **Search in Summary** category retains its existing behavior:
+summary candidate videos must still supply supporting transcript evidence.
+Laravel application code is unchanged for this handoff. Apply the instructions
+in the Laravel project’s `SUMMARY_SEARCH_INTEGRATION.md` to label summary-only
+hits correctly and preserve all matched fields before rolling out the UI.

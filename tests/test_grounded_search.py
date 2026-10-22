@@ -136,3 +136,55 @@ class SearchTests(unittest.TestCase):
   self.put(1,'Other',video_title='Education fees');self.engine.title_indexed=True
   result=self.engine.search(request(query='Education fees'))
   self.assertEqual(1,result['returned']);self.assertEqual('indexed_lexical',result['metadata']['title_retrieval']['method'])
+
+ def test_ai_summary_only_match_is_not_spoken_evidence(self):
+  self.put(301,'Unrelated transcript',video=301,video_summary_english='University tuition costs are expensive.')
+  result=self.engine.search(request(query='tuition costs'))
+  self.assertEqual(1,result['returned']);row=result['results'][0]
+  self.assertEqual('summary',row['evidence_source']);self.assertTrue(row['is_video_only'])
+  self.assertFalse(row['transcript_verified']);self.assertEqual('',row['text'])
+  self.assertNotIn('passage_evidence',row);self.assertNotIn('start_time',row)
+  self.assertEqual(['video_summary_english'],row['matched_summary_fields'])
+  self.assertTrue(row['summary_evidence'][0]['excerpts'])
+  self.assertIn('video_summary',result['ranking']['candidate_sources'])
+ def test_ai_all_three_sources_merge_without_duplicate_video(self):
+  self.put(302,'University tuition costs 100000 rupees. Families cannot afford it',video=302,
+           video_title='Education fees',video_summary='Education fees are unaffordable.')
+  result=self.engine.search(request(query='Education fees'))
+  self.assertEqual(1,result['returned']);row=result['results'][0]
+  self.assertEqual('title_and_summary_and_transcript',row['evidence_source'])
+  self.assertTrue(row['transcript_verified']);self.assertTrue(row['passage_evidence'])
+  self.assertEqual({'text','video_title','video_summary'},set(row['matched_fields']))
+ def test_ai_summary_scope_eligibility_and_repeated_segments(self):
+  for i in range(303,307):
+   self.put(i,'Other',video=i,video_summary_urdu='تعلیم کے اخراجات',approval_status='pending'if i==305 else 'approved',is_archived=i==306)
+  self.put(307,'Other',video=303,start=10,end=15,video_summary_urdu='تعلیم کے اخراجات')
+  result=self.engine.search(request(query='تعلیم',allowed_video_ids=[303,305,306]))
+  self.assertEqual([303],[r['video_id']for r in result['results']])
+  self.assertEqual(1,len(result['results'][0]['summary_evidence']))
+ def test_ai_name_alias_in_summary_needs_no_model_and_keeps_topic(self):
+  self.put(308,'Other',video=308,video_summary='Hafiz Naeem Rehman discusses education.')
+  self.engine.title_intent=lambda q:{'queries':['HNR','Hafiz Naeem Rehman'],'person_only':True}
+  def unavailable(*args):raise AssertionError('No model for pure-name lookup')
+  self.base.embed=unavailable;self.engine.judge=unavailable
+  result=self.engine.search(request(query='HNR'))
+  self.assertEqual([308],[r['video_id']for r in result['results']])
+  self.assertEqual(0,result['metadata']['passage_validation']['provider_calls'])
+ def test_ai_summary_partial_index_keeps_legacy_field_fallback(self):
+  from grounded_summary_search import summary_candidates
+  self.c.create_payload_index('source','video_summary_english',models.TextIndexParams(type='text',tokenizer='word',lowercase=True))
+  self.put(309,'Other',video=309,video_summary_english='Education matters.')
+  self.put(310,'Other',video=310,summary_ur='Education matters.')
+  rows,metadata=summary_candidates(self.base,request(query='education'),['education'],indexed_fields=['video_summary_english'])
+  self.assertEqual({309,310},{r['video_id']for r in rows})
+  self.assertTrue(metadata['exhaustive']);self.assertIn('summary_ur',metadata['searched_fields'])
+ def test_ai_summary_does_not_drop_terms_or_borrow_across_fields(self):
+  self.put(311,'Other',video=311,video_summary='Education',video_summary_english='fees')
+  result=self.engine.search(request(query='education fees'))
+  self.assertEqual([],result['results'])
+ def test_ai_separate_summary_category_still_requires_transcript_evidence(self):
+  from grounded_search import summary_search
+  self.put(312,'Unrelated transcript',video=312,video_summary='Education fees')
+  q=request(query='education fees',search_mode='simple',filter_type='summary',summary_candidates=[{'video_id':312,'matched_summary_fields':['video_summary']}])
+  result=summary_search(self.engine,q)
+  self.assertEqual([],result['results'])

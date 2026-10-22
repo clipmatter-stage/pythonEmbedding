@@ -446,6 +446,20 @@ class SearchApiTest(unittest.TestCase):
             self.assertNotEqual(first["results"][0]["video_id"],second["results"][0]["video_id"])
             self.assertEqual(first["metadata"]["title_retrieval"],second["metadata"]["title_retrieval"])
 
+    def test_grounded_ai_summary_pagination_preserves_source_metadata(self):
+        for identity in (9190,9191):
+            self.put(identity,"Unrelated",video_id=identity,video_summary_english="Hafiz Naeem Rehman discusses education.")
+        request=self.api.IncrementalSearchRequest(query="HNR",batch_size=1,allowed_video_ids=[9190,9191])
+        with patch.dict(os.environ,{"SEARCH_PIPELINE":"grounded"}),patch.object(self.api,"get_semantic_query_embedding",side_effect=AssertionError("No embedding for name lookup")):
+            first=asyncio.run(self.api.search_incremental(request,True))
+            self.assertEqual(2,first["metadata"]["summary_retrieval"]["matching_videos"])
+            self.assertEqual("summary",first["results"][0]["evidence_source"])
+            continuation=request.model_copy(update={"cursor":first["cursor"]["next"],"search_session_id":first["search_session_id"]})
+            second=asyncio.run(self.api.search_incremental(continuation,True))
+            self.assertNotEqual(first["results"][0]["video_id"],second["results"][0]["video_id"])
+            self.assertFalse(second["results"][0]["transcript_verified"])
+            self.assertEqual(first["metadata"]["summary_retrieval"],second["metadata"]["summary_retrieval"])
+
     def test_grounded_title_alias_expansion_is_exact_and_preserves_topic(self):
         plan=self.api.grounded_title_intent("HNR")
         self.assertTrue(plan["person_only"])
