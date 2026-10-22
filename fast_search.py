@@ -193,7 +193,12 @@ class FastSemanticSearch:
                 # different passages of the SAME relevant video. Point-only
                 # fusion would discard those independent retrieval votes.
                 points = sorted(merged.values(), key=lambda p:(
-                    -video_ranks[(p.payload or {}).get('video_id')],-ranks[str(p.id)],str(p.id)))
+                    -video_ranks[(p.payload or {}).get('video_id')],
+                    -any(source['kind']=='keyword' for source in provenance[str(p.id)]),
+                    -ranks[str(p.id)],str(p.id)))
+                # A video's multilingual votes establish its rank, not proof
+                # that an arbitrary passage from it matches. Prefer its actual
+                # keyword anchor over a semantic-only turn from another topic.
                 for point in points: point.score = video_ranks[(point.payload or {}).get('video_id')]
                 # One best passage per video before admitting second passages.
                 buckets = defaultdict(list)

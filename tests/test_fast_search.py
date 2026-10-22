@@ -181,6 +181,26 @@ class FastSearchTest(unittest.TestCase):
         self.assertEqual(592,result['results'][0]['video_id'])
         self.assertTrue(result['results'][0]['retrieval_lanes'])
 
+    def test_video_votes_cannot_replace_keyword_passage_with_unrelated_turn(self):
+        from types import SimpleNamespace as NS
+        def hit(point,text):
+            return NS(id=point,score=.9,payload={'video_id':592,'text':text,
+                'start_time':point,'end_time':point+10,'processing_status':'completed',
+                'approval_status':'approved','is_archived':False})
+        political=hit(5921,'Discussion of foreign policy and political meetings')
+        prayer=hit(5922,'نوجوانوں کو نماز پڑھنے کی تلقین کی')
+        # Three dense lanes vote for the political turn; the keyword lane
+        # retrieves the real prayer passage. A one-slot pool must keep that anchor.
+        lanes=[NS(groups=[NS(id=592,hits=[political])])for _ in range(3)]
+        lanes.append(NS(groups=[NS(id=592,hits=[prayer])]))
+        self.service.diversify_candidates=True;self.service.lexical_indexed=True
+        self.service.settings=FastSearchSettings(candidate_limit=1)
+        self.service.retrieval_expander=lambda q:{'queries':['نماز کی تلقین','encouraging prayer'], 'retrieval_terms':['نماز']}
+        with patch.object(self.client,'query_points_groups',side_effect=lanes):
+            result=self.service.search(request(query='namaz ki talqeen'))
+        self.assertEqual([5922],[r['id']for r in result['results']])
+        self.assertEqual(prayer.payload['text'],result['results'][0]['text'])
+
     def test_service_keeps_every_legacy_route(self):
         root = Path(__file__).resolve().parents[1]
         def routes(filename):
