@@ -1,6 +1,7 @@
 """One authenticated callback transport for both API/worker entry points.
 Credentials never enter logs, results, URLs, or canary jobs.
 """
+
 import base64,json,hashlib,hmac,os,time,urllib.parse,inspect
 import requests
 
