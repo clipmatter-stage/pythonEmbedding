@@ -62,15 +62,33 @@ def coherent_passage(focus, neighbors):
                    youtube_url_timestamped=timestamp_url(current.get('youtube_url',''),current['start_time']))
     return current
 
+def contextual_candidate(focus, neighbors, named=()):
+    """Recover a full nearby original turn without joining different speakers.
+
+    A replacement has its own point ID, source label, times and quotations.
+    Named-speaker constraints still apply to that source turn independently.
+    """
+    passage=coherent_passage(focus,neighbors)
+    if len(passage['text'].split())>=8 or passage['end_time']-passage['start_time']>6:
+        return passage
+    options=[]
+    for row in neighbors:
+        if (str(row.get('id'))==str(focus['id'])or row.get('video_id')!=focus.get('video_id')
+                or not valid_interval(row)or len(str(row.get('text')or'').split())<8):continue
+        if named and normalize(row.get('speaker',''))not in named:continue
+        gap=max(0,focus['start_time']-row['end_time'],row['start_time']-focus['end_time'])
+        if gap>20:continue
+        options.append((gap,abs(row['start_time']-focus['start_time']),str(row['id']),row))
+    if not options:return passage
+    recovered=coherent_passage(min(options,key=lambda item:item[:3])[3],neighbors)
+    recovered['context_retrieval_anchor']={'point_id':str(focus['id']),
+        'selection':'nearby_original_turn','retrieval_score':focus.get('retrieval_score',focus.get('score'))}
+    return recovered
+
 def ranked_diverse(rows,limit):
-    # Keep strong hits within the best video as well as alternative videos.
+    # Give each retrieved video one verification slot before second passages.
     if limit<=0:return []
-    ranked=sorted(rows,key=lambda r:-r.get('retrieval_score',r['score']))
-    selected=ranked[:max(1,limit//2)];seen={str(r['id'])for r in selected}
-    for row in diverse(rows,len(rows)):
-        if str(row['id'])not in seen:selected.append(row);seen.add(str(row['id']))
-        if len(selected)>=limit:break
-    return selected[:limit]
+    return diverse(rows,limit)
 
 class GroundedSearch:
     def __init__(self,base,judge,model,revision,read_cache,write_cache,embedding_contract,title_intent=None,title_indexed=False,summary_indexed_fields=()):
@@ -157,7 +175,10 @@ class GroundedSearch:
             if next_offset is not None:warnings.append('context_window_truncated')
             neighbors=[{'id':str(p.id),**identity_view(p.payload or{})}for p in points];batch=[]
             for row in focus:
-                passage=coherent_passage(row,neighbors)
+                passage=contextual_candidate(row,neighbors,named)
+                if str(passage['id'])!=str(row['id']):
+                    trace.append({'point_id':str(passage['id']),'video_id':passage['video_id'],
+                        'stage':'nearby_original_turn','anchor_point_id':str(row['id']),'selected_for_context':True})
                 passage['speaker_identity_status']='supported_identity'if identity_supported(passage) else 'unverified_source_label'
                 passage['context_speaker_continuity']='anonymous_label'if row.get('transcript_speaker')or row.get('diarization_speaker')else 'unverified'
                 passage['segment_ids']=list(map(str,passage.get('segment_ids')or[row['id']]))
@@ -195,7 +216,7 @@ class GroundedSearch:
                         speaker_constraint=speaker,speaker_identity_authority='source_metadata_only',
                         initial_candidate_limit=initial,maximum_candidate_limit=maximum,
                         retrieval_candidates=len(response['results']),selected_candidates=len(rows),
-                        has_unchecked_candidates=len(checked_ids)<len(pool),exhaustive=False)
+                        has_unchecked_candidates=bool({str(r['id'])for r in pool}-checked_ids),exhaustive=False)
         if self.revision()!=epoch:raise ValidationUnavailable('Search index changed',reason='search_index_changed')
         accepted=[r for r in accepted if r['score']>=request.min_score];accepted=diverse(accepted,request.top_k,key="score")
         # Grouping occurs AFTER diversity/output selection, so one video cannot consume the output budget.

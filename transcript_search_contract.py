@@ -11,7 +11,7 @@ import unicodedata
 from semantic_passage_evidence import consolidate_candidates, validate_passages, RetrievalBudgetReached
 CONFIG=json.loads(pathlib.Path(__file__).with_name('search_contract_v1.json').read_text())
 VERSION=CONFIG['version']
-GROUNDED_STRATEGY_VERSION='speaker_scoped_title_summary_transcript_v3'
+GROUNDED_STRATEGY_VERSION='speaker_scoped_title_summary_transcript_v5_multilingual_grouped'
 
 def normalized_with_spans(text):
     chars=[];spans=[]

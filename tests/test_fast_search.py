@@ -93,6 +93,80 @@ class FastSearchTest(unittest.TestCase):
         self.assertEqual(lexical_vector("عربي كتاب"), lexical_vector("عربی کتاب"))
         self.assertEqual([], lexical_vector("!!!").indices)
 
+    def test_grouped_retrieval_recovers_video_crowded_out_by_one_video(self):
+        for i in range(10, 120):
+            self.put(i, 'Repeated passage', [1., 0.], video_id=1)
+        self.put(592, 'نماز پڑھنے کی تلقین کی', [.9, .1], video_id=592)
+        self.service.settings = FastSearchSettings(candidate_limit=10)
+        self.assertNotIn(592, {r['video_id'] for r in self.service.search(request())['results']})
+        self.service.diversify_candidates = True
+        result = self.service.search(request())
+        self.assertIn(592, {r['video_id'] for r in result['results']})
+        self.assertLessEqual(sum(r['video_id']==1 for r in result['results']), 2)
+
+    def test_multilingual_dense_lane_recovers_urdu_source_and_records_embeddings(self):
+        from search_observability import capture_embeddings, record
+        self.service.retrieval_expander = lambda q: {'queries':['نماز کی تلقین','encouraging prayer','namaz ki talqeen']}
+        self.service.diversify_candidates = True
+        def embedding(text):
+            record({'query':text})
+            return [-1., 0.] if text=='نماز کی تلقین' else [1., 0.]
+        self.service.embed = embedding
+        with capture_embeddings() as events:
+            result = self.service.search(request(query='namaz ki talqeen'))
+        self.assertIn(2, {r['id'] for r in result['results']})
+        self.assertEqual(3, len(events))
+        self.assertEqual('rrf', result['results'][0]['score_type'])
+        self.assertEqual('qdrant_grouped', result['ranking']['video_diversity'])
+
+    def test_indexed_keyword_lane_recovers_hit_without_sparse_or_matching_dense(self):
+        self.client.create_payload_index('source','text',models.TextIndexParams(type='text',tokenizer='word',lowercase=True))
+        self.service.lexical_indexed = True
+        self.service.diversify_candidates = True
+        self.service.retrieval_expander = lambda q: {'queries':[], 'retrieval_terms':['نماز']}
+        response = self.service.search(request(query='namaz ki talqeen'))
+        self.assertIn(2, {r['id'] for r in response['results']})
+        self.assertEqual('indexed_text',response['ranking']['keyword_retrieval'])
+        self.assertEqual([],self.service.search(request(query='namaz ki talqeen'),[999])['results'])
+        self.client.set_payload('source',{'approval_status':'pending'},points=[2])
+        self.assertNotIn(2,{r['id'] for r in self.service.search(request(query='namaz ki talqeen'))['results']})
+
+    def test_failed_optional_translation_embedding_preserves_original_retrieval(self):
+        self.service.retrieval_expander = lambda q: {'queries':['translation']}
+        def embed(text):
+            if text=='translation':raise TimeoutError('optional translation failed')
+            return [1.,0.]
+        self.service.embed=embed
+        result=self.service.search(request())
+        self.assertEqual([1],[r['id']for r in result['results']])
+        self.assertIn('translated_embedding_unavailable',result['ranking']['retrieval_warnings'])
+
+    def test_grouped_sparse_lane_keeps_multilingual_terms_and_authorized_scope(self):
+        backfill(self.client,'source',apply=True)
+        self.service.sparse_enabled=True;self.service.diversify_candidates=True
+        self.service.retrieval_expander=lambda q:{'queries':['نماز کی تلقین']}
+        self.service.embed=lambda q:[1.,0.]
+        result=self.service.search(request(query='namaz ki talqeen'),[2])
+        self.assertEqual([2],[r['id']for r in result['results']])
+        self.assertEqual('sparse',result['ranking']['keyword_retrieval'])
+
+    def test_video_fusion_combines_votes_for_different_passages_of_same_video(self):
+        from types import SimpleNamespace as NS
+        def hit(point,video):
+            return NS(id=point,score=.9,payload={'video_id':video,'text':'Original source text',
+                'start_time':10,'end_time':20,'processing_status':'completed',
+                'approval_status':'approved','is_archived':False})
+        lanes=[]
+        for index in range(3):
+            lanes.append(NS(groups=[NS(id=100+index,hits=[hit(100+index,100+index)]),
+                NS(id=592,hits=[hit(5920+index,592)]),NS(id=1,hits=[hit(1,1)])]))
+        self.service.diversify_candidates=True
+        self.service.retrieval_expander=lambda q:{'queries':['نماز کی تلقین','encouraging prayer']}
+        with patch.object(self.client,'query_points_groups',side_effect=lanes):
+            result=self.service.search(request(query='namaz ki talqeen'))
+        self.assertEqual(592,result['results'][0]['video_id'])
+        self.assertTrue(result['results'][0]['retrieval_lanes'])
+
     def test_service_keeps_every_legacy_route(self):
         root = Path(__file__).resolve().parents[1]
         def routes(filename):

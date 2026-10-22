@@ -34,6 +34,30 @@ class SearchTests(unittest.TestCase):
  def test_diversity_selection_occurs_before_final_grouping(self):
   rows=[{'id':str(i),'video_id':1 if i<20 else 2,'score':1-i/100,'retrieval_score':1-i/100}for i in range(21)];self.assertEqual({1,2},{r['video_id']for r in diverse(rows,2)})
 
+ def test_namaz_ki_talqeen_video_592_reaches_verification_across_all_videos(self):
+  # Synthetic source fixture: this tests retrieval/verification integration,
+  # not an assertion about the current live transcript contents of video 592.
+  for i in range(1,111):self.put(i,'Unrelated election discussion',video=1,start=i*100,end=i*100+10)
+  text='ہم نے نوجوانوں کو نماز پڑھنے کی تلقین کی اور مسجد جانے کی دعوت دی'
+  self.put(592,text,video=592,start=1000,end=1015)
+  self.c.update_vectors('source',[models.PointVectors(id=592,vector=[-1.,0.])])
+  self.base.diversify_candidates=True;self.base.lexical_indexed=True
+  self.base.retrieval_expander=lambda q:{'queries':['نماز کی تلقین','encouraging people to pray'],'retrieval_terms':['نماز']}
+  self.base.embed=lambda q:[-1.,0.]if q=='نماز کی تلقین'else[1.,0.]
+  seen=[]
+  def judge(query,rows,timeout):
+   self.assertEqual('namaz ki talqeen',query);out=[]
+   for row in rows:
+    seen.append(row['video_id']);yes=row['text']==text
+    out.append({'candidate_id':candidate_id(row),'score':.9 if yes else .1,'relevant':yes,'complete':yes,'roles_supported':yes,'relationship_supported':yes,'quotes':['نوجوانوں کو نماز پڑھنے کی تلقین کی']if yes else [],'reason':'relevant'if yes else 'related_only'})
+   return {'judgments':out}
+  self.engine.judge=judge
+  result=self.engine.search(request(query='namaz ki talqeen'))
+  self.assertIn(592,seen);self.assertEqual([592],[r['video_id']for r in result['results']])
+  self.assertTrue(result['results'][0]['transcript_verified'])
+  self.c.set_payload('source',{'approval_status':'pending'},points=[592]);self.epoch='changed'
+  self.assertEqual([],self.engine.search(request(query='namaz ki talqeen'))['results'])
+
  def test_named_speaker_is_separate_from_action_evidence(self):
   self.base.understand=lambda q:{'semantic_query':'young people should pray','query_type':'speaker_search','extracted_speaker':'Hafiz Naeem Ur Rehman','query_decomposition':{'decomposed':True,'topic':'young people should pray'}}
   self.base.speaker_values=lambda q:['Hafiz Naeem Rehman']
@@ -188,3 +212,33 @@ class SearchTests(unittest.TestCase):
   q=request(query='education fees',search_mode='simple',filter_type='summary',summary_candidates=[{'video_id':312,'matched_summary_fields':['video_summary']}])
   result=summary_search(self.engine,q)
   self.assertEqual([],result['results'])
+
+ def test_short_fragment_recovers_separate_complete_turn_without_inventing_identity(self):
+  from grounded_search import contextual_candidate
+  focus={'id':'focus','video_id':920,'text':'نماز ادا کریں','speaker':'Unknown Speaker','source_identity_group':'one','start_time':983.9,'end_time':986.0}
+  neighbor={'id':'complete','video_id':920,'text':'ہم نے بچوں کو مسجد میں نماز باجماعت پڑھنے کی تلقین کی','speaker':'Unknown Speaker','source_identity_group':'two','start_time':986.0,'end_time':1001.3}
+  result=contextual_candidate(focus,[focus,neighbor])
+  self.assertEqual('complete',result['id']);self.assertEqual(['complete'],result['segment_ids'])
+  self.assertEqual(neighbor['text'],result['text']);self.assertEqual(986.0,result['start_time'])
+  self.assertEqual('focus',result['context_retrieval_anchor']['point_id'])
+  self.assertEqual('Unknown Speaker',result['speaker'])
+ def test_short_fragment_does_not_recover_other_named_actor_or_distant_turn(self):
+  from grounded_search import contextual_candidate
+  from transcript_search_contract import normalize
+  focus={'id':'focus','video_id':1,'text':'Pray regularly','speaker':'Hafiz Naeem','start_time':10,'end_time':12}
+  other={'id':'other','video_id':1,'text':'Children should perform prayers regularly every day at home','speaker':'Another person','start_time':12,'end_time':18}
+  self.assertEqual('focus',contextual_candidate(focus,[focus,other],{normalize('Hafiz Naeem')})['id'])
+  far={**other,'start_time':40,'end_time':50}
+  self.assertEqual('focus',contextual_candidate(focus,[focus,far])['id'])
+ def test_short_fragment_recovery_respects_eligibility_and_uses_real_quote(self):
+  self.put(801,'Brief fragment',video=777,start=10,end=12,speaker='A')
+  self.put(802,'University tuition costs 100000 rupees. Families cannot afford it',video=777,start=12,end=20,speaker='B')
+  self.c.update_vectors('source',[models.PointVectors(id=802,vector=[-1.,0.])])
+  self.base.settings=FastSearchSettings(candidate_limit=100,minimum_dense_score=.7)
+  result=self.engine.search(request(query='education fees',allowed_video_ids=[777]))
+  self.assertEqual(1,result['returned']);row=result['results'][0]
+  self.assertEqual('802',str(row['id']));self.assertEqual(['802'],row['segment_ids'])
+  self.assertTrue(row['passage_evidence']);self.assertEqual('801',row['context_retrieval_anchor']['point_id'])
+  self.assertTrue(any(t['stage']=='nearby_original_turn'for t in result['ranking']['candidate_trace']))
+  self.c.set_payload('source',{'approval_status':'pending'},points=[802]);self.epoch='next'
+  self.assertEqual([],self.engine.search(request(query='education fees',allowed_video_ids=[777]))['results'])

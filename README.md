@@ -41,8 +41,27 @@ Summary search keeps its existing evidence requirements and can still be slow.
 
 ## Grounded contextual verification (optional)
 
-`SEARCH_PIPELINE=grounded` retrieves the existing compatible dense/sparse candidate
-pool, selects diverse videos before output truncation, and expands nearby original
+`SEARCH_PIPELINE=grounded` uses a cached, four-second-budget translation plan to
+retrieve the original query and faithful Urdu, Roman Urdu and English equivalents
+(at most four cached query embeddings, requested concurrently). It combines dense
+retrieval with the existing sparse keyword index, or an indexed `text` keyword
+lane when sparse vectors are unavailable. If neither keyword index is available,
+the response reports `keyword_index_unavailable`; it does not claim hybrid coverage.
+Qdrant groups each retrieval lane by video before truncation, retaining at most
+two passages per video per lane. Rank fusion combines votes at video level,
+including when different languages retrieve different passages of the same
+video, and verification
+gives each candidate video a turn before checking second passages. This improves
+bounded candidate coverage; it does not establish exhaustive archive recall.
+
+This adds a cached query-planning call and up to three extra query embeddings on
+a cold query. No new environment variables, vector migration, speaker repair or
+model download are required. Fast mode retains its existing retrieval behavior.
+Translation failures retain original-query retrieval with an explicit warning.
+The verifier still receives the original intent and applies the same evidence,
+role, relationship, quotation, eligibility and authorization checks.
+
+Grounded search expands nearby original
 turns only within the same source speaker label and a bounded time window. One
 stable-ID structured judge both ranks and checks the complete query intent with
 quotes mapped back to original transcript evidence. Only affected missing or

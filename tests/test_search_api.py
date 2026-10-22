@@ -106,6 +106,24 @@ class SearchApiTest(unittest.TestCase):
         self.api.passage_validation_cache.clear()
         self.api.get_contextual_search.cache_clear()
 
+    def test_grounded_multilingual_plan_is_cached_and_never_changes_judging_query(self):
+        calls=[]
+        def handler(request):
+            payload=json.loads(request.content);calls.append(payload)
+            content={'semantic_query':'encouraging prayer','detected_language':'roman_urdu',
+                'query_type':'general','retrieval_queries':['نماز کی تلقین','namaz ki talqeen','encouraging prayer'],
+                'retrieval_terms':['نماز','talqeen','prayer']}
+            return httpx.Response(200,json={'id':'fixture','object':'chat.completion','created':0,'model':'fixture',
+                'choices':[{'index':0,'finish_reason':'stop','message':{'role':'assistant','content':json.dumps(content)}}]})
+        client=OpenAI(api_key='test',http_client=httpx.Client(transport=httpx.MockTransport(handler)))
+        with patch.object(self.api,'openai_client',client):
+            first=self.api.grounded_retrieval_plan('namaz ki talqeen')
+            second=self.api.grounded_retrieval_plan('namaz ki talqeen')
+        self.assertEqual(first,second);self.assertEqual(1,len(calls))
+        self.assertEqual(['نماز کی تلقین','namaz ki talqeen','encouraging prayer'],first['queries'])
+        self.assertNotIn('semantic_query',first)
+        self.assertIn('COMPLETE INPUT',calls[0]['messages'][0]['content'])
+
     def put(self, identity, text, video_id=9000, **extra):
         self.database.upsert(self.api.SEGMENTS_COLLECTION, [models.PointStruct(
             id=identity, vector=[1.0, 0.0], payload={
