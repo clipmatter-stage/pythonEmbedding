@@ -1,0 +1,139 @@
+{
+  "runs": [
+    {
+      "repeat": 0,
+      "seconds": 29.26,
+      "videos": [
+        920,
+        859,
+        592,
+        589,
+        1105
+      ],
+      "validation_status": "completed",
+      "video_592_verdict": [
+        {
+          "candidate_id": "p_56bc5d905ab077ec48cdced1",
+          "point_id": "e3da037a-0ac0-5717-bcb3-f3938ae77f61",
+          "video_id": 592,
+          "stage": "validation",
+          "score": 0.91,
+          "reason": "relevant",
+          "accepted": true
+        }
+      ],
+      "warnings": [
+        "legacy_min_score_not_applied_to_retrieval_scores"
+      ],
+      "provider_calls": 4
+    },
+    {
+      "repeat": 1,
+      "seconds": 19.44,
+      "videos": [
+        920,
+        39,
+        592,
+        589,
+        1105
+      ],
+      "validation_status": "completed",
+      "video_592_verdict": [
+        {
+          "candidate_id": "p_56bc5d905ab077ec48cdced1",
+          "point_id": "e3da037a-0ac0-5717-bcb3-f3938ae77f61",
+          "video_id": 592,
+          "stage": "validation",
+          "score": 0.88,
+          "reason": "relevant",
+          "accepted": true
+        }
+      ],
+      "warnings": [
+        "legacy_min_score_not_applied_to_retrieval_scores"
+      ],
+      "provider_calls": 4
+    },
+    {
+      "repeat": 2,
+      "seconds": 19.43,
+      "videos": [
+        920,
+        859,
+        589,
+        592,
+        1105,
+        39
+      ],
+      "validation_status": "completed",
+      "video_592_verdict": [
+        {
+          "candidate_id": "p_56bc5d905ab077ec48cdced1",
+          "point_id": "e3da037a-0ac0-5717-bcb3-f3938ae77f61",
+          "video_id": 592,
+          "stage": "validation",
+          "score": 0.86,
+          "reason": "relevant",
+          "accepted": true
+        }
+      ],
+      "warnings": [
+        "legacy_min_score_not_applied_to_retrieval_scores"
+      ],
+      "provider_calls": 4
+    },
+    {
+      "repeat": 3,
+      "seconds": 17.6,
+      "videos": [
+        920,
+        592,
+        589,
+        1105
+      ],
+      "validation_status": "completed",
+      "video_592_verdict": [
+        {
+          "candidate_id": "p_56bc5d905ab077ec48cdced1",
+          "point_id": "e3da037a-0ac0-5717-bcb3-f3938ae77f61",
+          "video_id": 592,
+          "stage": "validation",
+          "score": 0.91,
+          "reason": "relevant",
+          "accepted": true
+        }
+      ],
+      "warnings": [
+        "legacy_min_score_not_applied_to_retrieval_scores"
+      ],
+      "provider_calls": 4
+    },
+    {
+      "repeat": 4,
+      "seconds": 13.69,
+      "videos": [
+        592,
+        1105
+      ],
+      "validation_status": "completed",
+      "video_592_verdict": [
+        {
+          "candidate_id": "p_56bc5d905ab077ec48cdced1",
+          "point_id": "e3da037a-0ac0-5717-bcb3-f3938ae77f61",
+          "video_id": 592,
+          "stage": "validation",
+          "score": 0.91,
+          "reason": "relevant",
+          "accepted": true
+        }
+      ],
+      "warnings": [
+        "legacy_min_score_not_applied_to_retrieval_scores"
+      ],
+      "provider_calls": 4
+    }
+  ],
+  "passed": 5,
+  "total": 5,
+  "response_cache_used": false
+}

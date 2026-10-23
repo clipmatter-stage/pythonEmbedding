@@ -1,0 +1,91 @@
+{
+  "deployment": "19232944-82b3-47f7-85b6-a461d79e0740",
+  "runs": [
+    {
+      "repeat": 0,
+      "http_status": 200,
+      "seconds": 28.29,
+      "videos": [
+        920,
+        592,
+        1105,
+        589
+      ],
+      "rules": "grounded_passage_v4_cached_query_reasoning",
+      "validation_status": "completed",
+      "provider_calls": 4,
+      "judgment_cache_hits": 0,
+      "video_592_verdict": [
+        {
+          "candidate_id": "p_56bc5d905ab077ec48cdced1",
+          "point_id": "e3da037a-0ac0-5717-bcb3-f3938ae77f61",
+          "video_id": 592,
+          "stage": "validation",
+          "score": 0.91,
+          "reason": "relevant",
+          "accepted": true,
+          "judgment_cache_hit": false
+        }
+      ],
+      "error": null
+    },
+    {
+      "repeat": 1,
+      "http_status": 200,
+      "seconds": 7.97,
+      "videos": [
+        920,
+        592,
+        1105,
+        589
+      ],
+      "rules": "grounded_passage_v4_cached_query_reasoning",
+      "validation_status": "completed",
+      "provider_calls": 0,
+      "judgment_cache_hits": 24,
+      "video_592_verdict": [
+        {
+          "candidate_id": "p_56bc5d905ab077ec48cdced1",
+          "point_id": "e3da037a-0ac0-5717-bcb3-f3938ae77f61",
+          "video_id": 592,
+          "stage": "validation",
+          "score": 0.91,
+          "reason": "relevant",
+          "accepted": true,
+          "judgment_cache_hit": true
+        }
+      ],
+      "error": null
+    },
+    {
+      "repeat": 2,
+      "http_status": 200,
+      "seconds": 10.04,
+      "videos": [
+        920,
+        592,
+        1105,
+        589
+      ],
+      "rules": "grounded_passage_v4_cached_query_reasoning",
+      "validation_status": "completed",
+      "provider_calls": 0,
+      "judgment_cache_hits": 24,
+      "video_592_verdict": [
+        {
+          "candidate_id": "p_56bc5d905ab077ec48cdced1",
+          "point_id": "e3da037a-0ac0-5717-bcb3-f3938ae77f61",
+          "video_id": 592,
+          "stage": "validation",
+          "score": 0.91,
+          "reason": "relevant",
+          "accepted": true,
+          "judgment_cache_hit": true
+        }
+      ],
+      "error": null
+    }
+  ],
+  "passed": 3,
+  "total": 3
+}

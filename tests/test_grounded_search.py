@@ -24,8 +24,50 @@ class SearchTests(unittest.TestCase):
  def test_scope_and_index_revision_bind_cached_verification(self):
   self.put(1,'University tuition costs 100000 rupees. Families cannot afford it',video=1);self.put(2,'University tuition costs 100000 rupees. Families cannot afford it',video=2)
   q=request(query='fees',allowed_video_ids=[1],authorization_scope='one',scope_revision='a');first=self.engine.search(q);n=self.calls;second=self.engine.search(q);self.assertEqual(n,self.calls);self.assertTrue(second['metadata']['passage_validation']['cache_hit']);self.assertEqual({1},{r['video_id']for r in first['results']});self.assertEqual({1},{r['video_id']for r in first['ranking']['candidate_trace']});self.epoch='b';self.engine.search(q);self.assertGreater(self.calls,n)
+
+ def test_individual_judgments_reused_without_full_response_cache(self):
+  self.put(1,'University tuition costs 100000 rupees. Families cannot afford it',video=592)
+  self.engine.read_cache=lambda key:self.cache.get(key)if key.startswith('grounded_judgment:')else None
+  first=self.engine.search(request(query='fees'));calls=self.calls
+  second=self.engine.search(request(query='fees'))
+  self.assertEqual(calls,self.calls);self.assertEqual([592],[r['video_id']for r in second['results']])
+  self.assertEqual(0,second['metadata']['passage_validation']['provider_calls'])
+  self.assertEqual(1,second['metadata']['passage_validation']['judgment_cache_hits'])
+  self.engine.model='different-model';self.engine.search(request(query='fees'));self.assertGreater(self.calls,calls)
+  calls=self.calls;self.engine.search(request(query='unaffordable education'));self.assertGreater(self.calls,calls)
+  self.c.set_payload('source',{'text':'Unrelated political discussion'},points=[1])
+  self.assertEqual([],self.engine.search(request(query='fees'))['results'])
+  self.c.set_payload('source',{'approval_status':'pending'},points=[1]);calls=self.calls
+  self.assertEqual([],self.engine.search(request(query='fees'))['results']);self.assertEqual(calls,self.calls)
+
+ def test_full_response_and_judgments_bind_model_request_settings(self):
+  self.put(1,'University tuition costs 100000 rupees. Families cannot afford it')
+  def judge(query,rows,timeout):return self.judge(query,rows,timeout)
+  judge.cache_contract=('fixture-model','span_id','none');self.engine.judge=judge
+  self.engine.search(request(query='fees'));calls=self.calls
+  self.engine.search(request(query='fees'));self.assertEqual(calls,self.calls)
+  judge.cache_contract=('fixture-model','span_id','low')
+  self.engine.search(request(query='fees'));self.assertGreater(self.calls,calls)
  def test_genuine_no_match_returns_no_unverified_dense_fallback(self):
   self.put(1,'Generic education and elections');r=self.engine.search(request(query='Minecraft'));self.assertEqual([],r['results']);self.assertEqual('no_matches',r['metadata']['passage_validation']['status'])
+
+ def test_expansion_failure_cannot_be_cached_as_completed_no_match(self):
+  from semantic_passage_evidence import ValidationUnavailable,validation_error_detail
+  self.put(1,'Unrelated election discussion')
+  self.base.retrieval_expander=lambda q:{'queries':[],'warnings':['multilingual_expansion_unavailable']}
+  with self.assertRaises(ValidationUnavailable)as failure:
+   self.engine.search(request(query='namaz ki talqeen'))
+  self.assertEqual('query_expansion_unavailable',failure.exception.reason)
+  self.assertTrue(validation_error_detail(failure.exception)['retryable'])
+  self.assertFalse(self.cache)
+
+ def test_expansion_failure_preserves_verified_matches_as_uncached_partial(self):
+  self.put(1,'University tuition costs 100000 rupees. Families cannot afford it')
+  self.base.retrieval_expander=lambda q:{'queries':[],'warnings':['multilingual_expansion_unavailable']}
+  result=self.engine.search(request(query='education fees'))
+  self.assertEqual(1,result['returned']);self.assertTrue(result['results'][0]['transcript_verified'])
+  self.assertEqual('partial',result['metadata']['passage_validation']['status'])
+  self.assertTrue(result['metadata']['passage_validation']['retryable']);self.assertFalse(self.cache)
 
  def test_legacy_query_words_are_not_repeated_for_retrieval_or_judgment(self):
   self.put(1,'Generic source text')

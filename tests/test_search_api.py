@@ -118,11 +118,34 @@ class SearchApiTest(unittest.TestCase):
         client=OpenAI(api_key='test',http_client=httpx.Client(transport=httpx.MockTransport(handler)))
         with patch.object(self.api,'openai_client',client):
             first=self.api.grounded_retrieval_plan('namaz ki talqeen')
+            # Simulate a cold second replica: only Redis retains the plan.
+            self.api.embedding_cache.clear()
             second=self.api.grounded_retrieval_plan('namaz ki talqeen')
         self.assertEqual(first,second);self.assertEqual(1,len(calls))
         self.assertEqual(['نماز کی تلقین','namaz ki talqeen','encouraging prayer'],first['queries'])
         self.assertNotIn('semantic_query',first)
         self.assertIn('COMPLETE INPUT',calls[0]['messages'][0]['content'])
+
+    def test_failed_query_plan_is_not_cached_and_later_success_is_shared(self):
+        good={'understanding_status':'enabled','retrieval_queries':['نماز کی تلقین','encouragement to pray'],
+              'retrieval_terms':['نماز','prayer']}
+        with patch.object(self.api,'understand_query',side_effect=[{'understanding_status':'fallback'},good]) as understand:
+            failed=self.api.grounded_retrieval_plan('namaz ki talqeen')
+            self.assertEqual(['multilingual_expansion_unavailable'],failed['warnings'])
+            self.assertFalse(self.shared_cache.values)
+            recovered=self.api.grounded_retrieval_plan('namaz ki talqeen')
+            again=self.api.grounded_retrieval_plan('namaz ki talqeen')
+        self.assertEqual(2,understand.call_count)
+        self.assertEqual(recovered,again);self.assertFalse(recovered['warnings'])
+        with patch.object(self.api,'OPENAI_TEXT_MODEL','different-model'),patch.object(
+                self.api,'understand_query',return_value={'understanding_status':'fallback'}):
+            self.assertTrue(self.api.grounded_retrieval_plan('namaz ki talqeen')['warnings'])
+
+    def test_query_plan_timeout_recovers_peer_replica_success(self):
+        plan={'queries':['نماز کی تلقین','encouragement to pray'],'retrieval_terms':['نماز'],'warnings':[]}
+        with patch.object(self.api,'read_shared_cache',side_effect=[None,plan]),patch.object(
+                self.api,'understand_query',return_value={'understanding_status':'fallback'}):
+            self.assertEqual(plan,self.api.grounded_retrieval_plan('namaz ki talqeen'))
 
     def put(self, identity, text, video_id=9000, **extra):
         self.database.upsert(self.api.SEGMENTS_COLLECTION, [models.PointStruct(

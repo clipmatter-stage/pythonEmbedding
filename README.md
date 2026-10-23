@@ -41,7 +41,7 @@ Summary search keeps its existing evidence requirements and can still be slow.
 
 ## Grounded contextual verification (optional)
 
-`SEARCH_PIPELINE=grounded` uses a cached, four-second-budget translation plan to
+`SEARCH_PIPELINE=grounded` uses a cached, six-second-budget translation plan to
 retrieve the original query and faithful Urdu, Roman Urdu and English equivalents
 (at most four cached query embeddings, requested concurrently). It combines dense
 retrieval with the existing sparse keyword index, or an indexed `text` keyword
@@ -58,6 +58,10 @@ This adds a cached query-planning call and up to three extra query embeddings on
 a cold query. No new environment variables, vector migration, speaker repair or
 model download are required. Fast mode retains its existing retrieval behavior.
 Translation failures retain original-query retrieval with an explicit warning.
+Successful query-only plans are shared across replicas in Redis for 24 hours,
+bound to the query, model and planner version. A translation or translated-embedding
+failure cannot be cached as a completed no-match: verified matches may still be
+returned as partial results, while an empty response becomes a retryable error.
 The verifier still receives the original intent and applies the same evidence,
 role, relationship, quotation, eligibility and authorization checks.
 
@@ -76,6 +80,22 @@ embedding model/dimension change or reranking-weight download is required. The
 old `SEARCH_RERANKING`/`SEARCH_VALIDATE_RESULTS` flags govern `fast` mode, not this
 grounded path. `SEARCH_PIPELINE=grounded` can still make checking mandatory for
 an entire deployment. Set `verified` for the older independently checked MaxSim path.
+
+Grounded verification uses low reasoning effort on supported reasoning models.
+General action queries do not acquire an invented actor or recipient; explicit
+actors, audiences, negation and direction still require source support. Exact
+quotations and all existing acceptance checks remain mandatory. Changing these
+rules invalidates old grounded judgments and search sessions. The explicit
+read-only evaluation in `tests/eval_grounded_roles.py` compares repeated judgments
+against synthetic controls and the previously authorized live video-592 passage;
+it is not run by ordinary unit tests and requires production/provider credentials.
+Validated individual judgments are shared in Redis for 15 minutes, independently
+of title/summary scan completion. Keys bind the query, exact source passage,
+speaker labels, index revision, model, citation mode, reasoning effort and rule
+versions. Retrieval and eligibility filters run before lookup, and cached
+judgments must pass the same score, role and original-quotation checks again.
+Cache outages fall back to judging; invalid judgments and failed expansion are
+not cached. The response reports `judgment_cache_hits` and actual provider calls.
 
 Summary candidate selection remains in Laravel with shared multilingual rules.
 The full authorized candidate registry (up to 10,000 videos) enters a single

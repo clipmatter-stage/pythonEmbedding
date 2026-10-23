@@ -1,0 +1,453 @@
+{
+  "model": "gpt-6-luna",
+  "rules_version": "grounded_passage_v3_query_reasoning",
+  "system_sha256": "2a69db6ced6e9494bb2a80e542dfa9c5a7b52c21bf4ba9843d406e86c37dfc84",
+  "live_reference_id": "p_56bc5d905ab077ec48cdced1",
+  "live_reference_text_sha256": "e6115702e7d4bdfd4313a49e0dff888b3a12efce8fd93389c6e056b741555d25",
+  "rounds": 5,
+  "arms": {
+    "deployed_baseline": {
+      "counts": {
+        "true_positive": 22,
+        "true_negative": 30,
+        "website_live_positive": 2,
+        "website_live_missed": 3
+      },
+      "runs": [
+        {
+          "query": "namaz ki talqeen",
+          "repeat": 0,
+          "status": "completed",
+          "mismatches": [],
+          "live_592": {
+            "candidate_id": "p_56bc5d905ab077ec48cdced1",
+            "point_id": "e3da037a-0ac0-5717-bcb3-f3938ae77f61",
+            "video_id": 592,
+            "stage": "validation",
+            "score": 0.9,
+            "reason": "relevant",
+            "accepted": true
+          },
+          "provider_calls": 2,
+          "seconds": 4.532
+        },
+        {
+          "query": "namaz ki talqeen",
+          "repeat": 1,
+          "status": "completed",
+          "mismatches": [],
+          "live_592": {
+            "candidate_id": "p_56bc5d905ab077ec48cdced1",
+            "point_id": "e3da037a-0ac0-5717-bcb3-f3938ae77f61",
+            "video_id": 592,
+            "stage": "validation",
+            "score": 0.91,
+            "reason": "relevant",
+            "accepted": true
+          },
+          "provider_calls": 2,
+          "seconds": 3.794
+        },
+        {
+          "query": "namaz ki talqeen",
+          "repeat": 2,
+          "status": "completed",
+          "mismatches": [],
+          "live_592": {
+            "candidate_id": "p_56bc5d905ab077ec48cdced1",
+            "point_id": "e3da037a-0ac0-5717-bcb3-f3938ae77f61",
+            "video_id": 592,
+            "stage": "validation",
+            "score": 0.9,
+            "reason": "relevant",
+            "accepted": true
+          },
+          "provider_calls": 3,
+          "seconds": 6.102
+        },
+        {
+          "query": "namaz ki talqeen",
+          "repeat": 3,
+          "status": "completed",
+          "mismatches": [],
+          "live_592": {
+            "candidate_id": "p_56bc5d905ab077ec48cdced1",
+            "point_id": "e3da037a-0ac0-5717-bcb3-f3938ae77f61",
+            "video_id": 592,
+            "stage": "validation",
+            "score": 0.9,
+            "reason": "relevant",
+            "accepted": true
+          },
+          "provider_calls": 2,
+          "seconds": 4.468
+        },
+        {
+          "query": "namaz ki talqeen",
+          "repeat": 4,
+          "status": "completed",
+          "mismatches": [],
+          "live_592": {
+            "candidate_id": "p_56bc5d905ab077ec48cdced1",
+            "point_id": "e3da037a-0ac0-5717-bcb3-f3938ae77f61",
+            "video_id": 592,
+            "stage": "validation",
+            "score": 0.91,
+            "reason": "relevant",
+            "accepted": true
+          },
+          "provider_calls": 2,
+          "seconds": 3.961
+        },
+        {
+          "query": "parents encouraging children to pray",
+          "repeat": 0,
+          "status": "completed",
+          "mismatches": [],
+          "live_592": null,
+          "provider_calls": 1,
+          "seconds": 2.866
+        },
+        {
+          "query": "young people being encouraged to pray",
+          "repeat": 0,
+          "status": "no_matches",
+          "mismatches": [],
+          "live_592": null,
+          "provider_calls": 1,
+          "seconds": 2.01
+        },
+        {
+          "query": "students and high education fees",
+          "repeat": 0,
+          "status": "completed",
+          "mismatches": [],
+          "live_592": null,
+          "provider_calls": 1,
+          "seconds": 1.837
+        },
+        {
+          "query": "namaz ki talqeen",
+          "batch": "frozen_website",
+          "repeat": 0,
+          "live_592_accepted": true,
+          "status": "completed",
+          "provider_calls": 1,
+          "live_592": [
+            {
+              "candidate_id": "p_56bc5d905ab077ec48cdced1",
+              "point_id": "e3da037a-0ac0-5717-bcb3-f3938ae77f61",
+              "video_id": 592,
+              "stage": "validation",
+              "score": 0.95,
+              "reason": "relevant",
+              "accepted": true
+            }
+          ],
+          "seconds": 3.591
+        },
+        {
+          "query": "namaz ki talqeen",
+          "batch": "frozen_website",
+          "repeat": 1,
+          "live_592_accepted": false,
+          "status": "no_matches",
+          "provider_calls": 1,
+          "live_592": [
+            {
+              "candidate_id": "p_56bc5d905ab077ec48cdced1",
+              "point_id": "e3da037a-0ac0-5717-bcb3-f3938ae77f61",
+              "video_id": 592,
+              "stage": "validation",
+              "score": 0.55,
+              "reason": "role_mismatch",
+              "accepted": false
+            }
+          ],
+          "seconds": 3.66
+        },
+        {
+          "query": "namaz ki talqeen",
+          "batch": "frozen_website",
+          "repeat": 2,
+          "live_592_accepted": false,
+          "status": "no_matches",
+          "provider_calls": 1,
+          "live_592": [
+            {
+              "candidate_id": "p_56bc5d905ab077ec48cdced1",
+              "point_id": "e3da037a-0ac0-5717-bcb3-f3938ae77f61",
+              "video_id": 592,
+              "stage": "validation",
+              "score": 0.62,
+              "reason": "role_mismatch",
+              "accepted": false
+            }
+          ],
+          "seconds": 3.61
+        },
+        {
+          "query": "namaz ki talqeen",
+          "batch": "frozen_website",
+          "repeat": 3,
+          "live_592_accepted": false,
+          "status": "no_matches",
+          "provider_calls": 1,
+          "live_592": [
+            {
+              "candidate_id": "p_56bc5d905ab077ec48cdced1",
+              "point_id": "e3da037a-0ac0-5717-bcb3-f3938ae77f61",
+              "video_id": 592,
+              "stage": "validation",
+              "score": 0.6,
+              "reason": "role_mismatch",
+              "accepted": false
+            }
+          ],
+          "seconds": 3.686
+        },
+        {
+          "query": "namaz ki talqeen",
+          "batch": "frozen_website",
+          "repeat": 4,
+          "live_592_accepted": true,
+          "status": "completed",
+          "provider_calls": 1,
+          "live_592": [
+            {
+              "candidate_id": "p_56bc5d905ab077ec48cdced1",
+              "point_id": "e3da037a-0ac0-5717-bcb3-f3938ae77f61",
+              "video_id": 592,
+              "stage": "validation",
+              "score": 0.91,
+              "reason": "relevant",
+              "accepted": true
+            }
+          ],
+          "seconds": 2.594
+        }
+      ]
+    },
+    "updated": {
+      "counts": {
+        "true_positive": 22,
+        "true_negative": 30,
+        "website_live_positive": 5
+      },
+      "runs": [
+        {
+          "query": "namaz ki talqeen",
+          "repeat": 0,
+          "status": "completed",
+          "mismatches": [],
+          "live_592": {
+            "candidate_id": "p_56bc5d905ab077ec48cdced1",
+            "point_id": "e3da037a-0ac0-5717-bcb3-f3938ae77f61",
+            "video_id": 592,
+            "stage": "validation",
+            "score": 0.9,
+            "reason": "relevant",
+            "accepted": true
+          },
+          "provider_calls": 2,
+          "seconds": 6.033
+        },
+        {
+          "query": "namaz ki talqeen",
+          "repeat": 1,
+          "status": "completed",
+          "mismatches": [],
+          "live_592": {
+            "candidate_id": "p_56bc5d905ab077ec48cdced1",
+            "point_id": "e3da037a-0ac0-5717-bcb3-f3938ae77f61",
+            "video_id": 592,
+            "stage": "validation",
+            "score": 0.9,
+            "reason": "relevant",
+            "accepted": true
+          },
+          "provider_calls": 2,
+          "seconds": 5.675
+        },
+        {
+          "query": "namaz ki talqeen",
+          "repeat": 2,
+          "status": "completed",
+          "mismatches": [],
+          "live_592": {
+            "candidate_id": "p_56bc5d905ab077ec48cdced1",
+            "point_id": "e3da037a-0ac0-5717-bcb3-f3938ae77f61",
+            "video_id": 592,
+            "stage": "validation",
+            "score": 0.94,
+            "reason": "relevant",
+            "accepted": true
+          },
+          "provider_calls": 2,
+          "seconds": 4.856
+        },
+        {
+          "query": "namaz ki talqeen",
+          "repeat": 3,
+          "status": "completed",
+          "mismatches": [],
+          "live_592": {
+            "candidate_id": "p_56bc5d905ab077ec48cdced1",
+            "point_id": "e3da037a-0ac0-5717-bcb3-f3938ae77f61",
+            "video_id": 592,
+            "stage": "validation",
+            "score": 0.86,
+            "reason": "relevant",
+            "accepted": true
+          },
+          "provider_calls": 2,
+          "seconds": 5.614
+        },
+        {
+          "query": "namaz ki talqeen",
+          "repeat": 4,
+          "status": "completed",
+          "mismatches": [],
+          "live_592": {
+            "candidate_id": "p_56bc5d905ab077ec48cdced1",
+            "point_id": "e3da037a-0ac0-5717-bcb3-f3938ae77f61",
+            "video_id": 592,
+            "stage": "validation",
+            "score": 0.92,
+            "reason": "relevant",
+            "accepted": true
+          },
+          "provider_calls": 2,
+          "seconds": 4.551
+        },
+        {
+          "query": "parents encouraging children to pray",
+          "repeat": 0,
+          "status": "completed",
+          "mismatches": [],
+          "live_592": null,
+          "provider_calls": 1,
+          "seconds": 3.298
+        },
+        {
+          "query": "young people being encouraged to pray",
+          "repeat": 0,
+          "status": "no_matches",
+          "mismatches": [],
+          "live_592": null,
+          "provider_calls": 1,
+          "seconds": 2.822
+        },
+        {
+          "query": "students and high education fees",
+          "repeat": 0,
+          "status": "completed",
+          "mismatches": [],
+          "live_592": null,
+          "provider_calls": 1,
+          "seconds": 2.849
+        },
+        {
+          "query": "namaz ki talqeen",
+          "batch": "frozen_website",
+          "repeat": 0,
+          "live_592_accepted": true,
+          "status": "completed",
+          "provider_calls": 1,
+          "live_592": [
+            {
+              "candidate_id": "p_56bc5d905ab077ec48cdced1",
+              "point_id": "e3da037a-0ac0-5717-bcb3-f3938ae77f61",
+              "video_id": 592,
+              "stage": "validation",
+              "score": 0.94,
+              "reason": "relevant",
+              "accepted": true
+            }
+          ],
+          "seconds": 5.996
+        },
+        {
+          "query": "namaz ki talqeen",
+          "batch": "frozen_website",
+          "repeat": 1,
+          "live_592_accepted": true,
+          "status": "completed",
+          "provider_calls": 1,
+          "live_592": [
+            {
+              "candidate_id": "p_56bc5d905ab077ec48cdced1",
+              "point_id": "e3da037a-0ac0-5717-bcb3-f3938ae77f61",
+              "video_id": 592,
+              "stage": "validation",
+              "score": 0.95,
+              "reason": "relevant",
+              "accepted": true
+            }
+          ],
+          "seconds": 6.159
+        },
+        {
+          "query": "namaz ki talqeen",
+          "batch": "frozen_website",
+          "repeat": 2,
+          "live_592_accepted": true,
+          "status": "completed",
+          "provider_calls": 1,
+          "live_592": [
+            {
+              "candidate_id": "p_56bc5d905ab077ec48cdced1",
+              "point_id": "e3da037a-0ac0-5717-bcb3-f3938ae77f61",
+              "video_id": 592,
+              "stage": "validation",
+              "score": 0.99,
+              "reason": "relevant",
+              "accepted": true
+            }
+          ],
+          "seconds": 6.423
+        },
+        {
+          "query": "namaz ki talqeen",
+          "batch": "frozen_website",
+          "repeat": 3,
+          "live_592_accepted": true,
+          "status": "completed",
+          "provider_calls": 1,
+          "live_592": [
+            {
+              "candidate_id": "p_56bc5d905ab077ec48cdced1",
+              "point_id": "e3da037a-0ac0-5717-bcb3-f3938ae77f61",
+              "video_id": 592,
+              "stage": "validation",
+              "score": 0.82,
+              "reason": "relevant",
+              "accepted": true
+            }
+          ],
+          "seconds": 3.547
+        },
+        {
+          "query": "namaz ki talqeen",
+          "batch": "frozen_website",
+          "repeat": 4,
+          "live_592_accepted": true,
+          "status": "completed",
+          "provider_calls": 1,
+          "live_592": [
+            {
+              "candidate_id": "p_56bc5d905ab077ec48cdced1",
+              "point_id": "e3da037a-0ac0-5717-bcb3-f3938ae77f61",
+              "video_id": 592,
+              "stage": "validation",
+              "score": 0.94,
+              "reason": "relevant",
+              "accepted": true
+            }
+          ],
+          "seconds": 6.758
+        }
+      ]
+    }
+  }
+}

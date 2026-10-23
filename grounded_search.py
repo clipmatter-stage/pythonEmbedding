@@ -99,7 +99,7 @@ class GroundedSearch:
         if not 1<=initial<=maximum<=32:raise ValueError('Grounding limits must satisfy 1 <= initial <= maximum <= 32')
         params=request.model_dump()if hasattr(request,'model_dump')else vars(request).copy()
         for k in ['cursor','exact_cursor','search_session_id','batch_size']:params.pop(k,None)
-        cache_key='grounded:'+hashlib.sha256(json.dumps([GROUNDED_STRATEGY_VERSION,self.title_indexed,self.summary_indexed_fields,initial,maximum,VERSION,hashlib.sha256(SYSTEM.encode()).hexdigest(),os.getenv('RAILWAY_GIT_COMMIT_SHA','development'),asdict(self.base.settings),self.base.sparse_enabled,self.model,self.embedding_contract,epoch,params,video_ids],sort_keys=True,ensure_ascii=False,default=str).encode()).hexdigest()
+        cache_key='grounded:'+hashlib.sha256(json.dumps([GROUNDED_STRATEGY_VERSION,self.title_indexed,self.summary_indexed_fields,initial,maximum,VERSION,hashlib.sha256(SYSTEM.encode()).hexdigest(),os.getenv('RAILWAY_GIT_COMMIT_SHA','development'),asdict(self.base.settings),self.base.sparse_enabled,self.model,getattr(self.judge,'cache_contract',None),self.embedding_contract,epoch,params,video_ids],sort_keys=True,ensure_ascii=False,default=str).encode()).hexdigest()
         cached=self.read_cache(cache_key)
         if cached is not None:
             if self.revision()!=epoch:raise ValidationUnavailable('Search index changed',reason='search_index_changed')
@@ -159,7 +159,18 @@ class GroundedSearch:
                 'retrieval_score':r.get('retrieval_score',r['score']),
                 'selected_for_context':str(r['id'])in{str(x['id'])for x in rows}}for r in response['results']]
         filters=source_filter(request,video_ids)
-        contexts=[];warnings=[];context_reads=0;accepted=[];stages=[];seen=set()
+        contexts=[];warnings=[w for w in response.get('ranking',{}).get('retrieval_warnings',[])
+            if w in {'multilingual_expansion_unavailable','translated_embedding_unavailable'}]
+        context_reads=0;accepted=[];stages=[];seen=set()
+        def judgment_key(query,row):
+            value=[VERSION,hashlib.sha256(SYSTEM.encode()).hexdigest(),GROUNDED_STRATEGY_VERSION,
+                self.model,getattr(self.judge,'cache_contract',None),epoch,query,candidate_id(row),
+                row.get('speaker'),row.get('transcript_speaker'),row.get('diarization_speaker')]
+            return 'grounded_judgment:'+hashlib.sha256(json.dumps(value,ensure_ascii=False,default=str).encode()).hexdigest()
+        # Cache entries are considered only for freshly retrieved, eligible
+        # passages, and are checked again by the same quote/role validator.
+        read_judgment=None if warnings else lambda q,row:self.read_cache(judgment_key(q,row))
+        write_judgment=None if warnings else lambda q,row,j:self.write_cache(judgment_key(q,row),j,900)
         context_seconds=validation_seconds=0.;deadline=time.monotonic()+25
         for offset in range(0,len(rows),initial):
             calls_left=6-sum(m['provider_calls']for m in stages)
@@ -193,7 +204,8 @@ class GroundedSearch:
             contexts.extend(batch)
             try:
                 passed,stage=validate_grounded(judging_query,batch,self.judge,batch_size=6,max_calls=min(3,calls_left),
-                    deadline_seconds=max(.1,deadline-time.monotonic()),concurrency=2)
+                    deadline_seconds=max(.1,deadline-time.monotonic()),concurrency=2,
+                    read_judgment=read_judgment,write_judgment=write_judgment)
             except ValidationUnavailable:
                 if not accepted and not title_rows and not summary_rows:raise
                 warnings.append('expansion_validation_unavailable');break
@@ -204,7 +216,7 @@ class GroundedSearch:
             _,metadata=validate_grounded(judging_query,[],self.judge)
         else:
             metadata=copy.deepcopy(stages[0])
-            for key in ['candidate_count','evaluated_count','provider_calls','unresolved_count','elapsed_seconds']:
+            for key in ['candidate_count','evaluated_count','provider_calls','unresolved_count','elapsed_seconds','judgment_cache_hits']:
                 metadata[key]=sum(m[key]for m in stages)
             for key in ['trace','provider_usage','failure_reasons','retried_errors']:
                 metadata[key]=[x for m in stages for x in m[key]]
@@ -225,6 +237,8 @@ class GroundedSearch:
         result={**response,'query':original,'results':[r for group in final.values()for r in group],'returned':len(accepted),'unique_videos':len(final),'metadata':{'passage_validation':metadata},'ranking':{**response['ranking'],'engine':'grounded_contextual','score_type':'grounded_relevance','evidence_verified':True,'candidate_trace':trace,'candidate_scope':'bounded_dense_or_hybrid_pool','context_reads':context_reads,'embedding_usage':embedding_usage,'model':self.model,'rules_version':VERSION,'index_revision':epoch,'timings':{'retrieval_seconds':round(retrieved-semantic_started,3),'context_seconds':round(context_seconds,3),'validation_seconds':round(validation_seconds,3),'total_seconds':round(time.monotonic()-started,3)}}}
         merged=merge_title_candidates(result['results'],title_rows,len(result['results'])+len(title_rows))
         merged=merge_summary_candidates(merged,summary_rows,request.top_k)
+        if not merged and any(w in {'multilingual_expansion_unavailable','translated_embedding_unavailable'}for w in warnings):
+            raise ValidationUnavailable('Query expansion unavailable',reason='query_expansion_unavailable')
         result.update(results=merged,returned=len(merged),unique_videos=len({r['video_id']for r in merged}))
         result['metadata']['title_retrieval']=title_metadata
         result['metadata']['summary_retrieval']=summary_metadata

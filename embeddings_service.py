@@ -1037,7 +1037,7 @@ topic terms in retrieval_terms (up to four total); omit function words and speak
             max_completion_tokens=500 if multilingual_retrieval else 300,
             reasoning_effort="none",
             response_format={"type": "json_object"},
-            timeout=4.0 if multilingual_retrieval else 8.0
+            timeout=6.0 if multilingual_retrieval else 8.0
         )
 
         result = json_module.loads(response.choices[0].message.content.strip())
@@ -1233,12 +1233,30 @@ def grounded_title_intent(query):
 
 
 def grounded_retrieval_plan(query):
-    """Cached translations supply candidates only; the judge receives the original query."""
+    """Share successful query-only plans across replicas; never cache failures."""
+    key = 'grounded_plan:v1:' + hashlib.sha256(json_module.dumps(
+        [OPENAI_TEXT_MODEL, query.strip()], ensure_ascii=False).encode()).hexdigest()
+    def usable(plan):
+        return (isinstance(plan, dict) and not plan.get('warnings')
+                and isinstance(plan.get('queries'), list) and 1 <= len(plan['queries']) <= 3
+                and all(isinstance(value, str) and 0 < len(value.strip()) <= 2000 for value in plan['queries'])
+                and isinstance(plan.get('retrieval_terms'), list)
+                and all(isinstance(value, str) and 1 < len(value.strip()) <= 100 for value in plan['retrieval_terms'])
+                and len(plan['retrieval_terms']) <= 4)
+    shared = read_shared_cache(key)
+    if usable(shared):
+        return shared
     intent = understand_query(query, multilingual_retrieval=True)
-    return {'queries': intent.get('retrieval_queries', []),
-            'retrieval_terms': intent.get('retrieval_terms', []),
-            'warnings': [] if intent.get('understanding_status') == 'enabled'
-                        else ['multilingual_expansion_unavailable']}
+    plan = {'queries': intent.get('retrieval_queries', []),
+            'retrieval_terms': intent.get('retrieval_terms', []), 'warnings': []}
+    if intent.get('understanding_status') == 'enabled' and usable(plan):
+        write_shared_cache(key, plan, 86400)
+        return plan
+    # Another replica may have completed a plan while this request timed out.
+    shared = read_shared_cache(key)
+    if usable(shared):
+        return shared
+    return {'queries': [], 'retrieval_terms': [], 'warnings': ['multilingual_expansion_unavailable']}
 
 
 @lru_cache(maxsize=3)

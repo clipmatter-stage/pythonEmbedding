@@ -1,0 +1,20 @@
+{
+  "description": "Synthetic, explicitly labeled grounding cases. Live video 592 is loaded separately by the read-only evaluation script, never hardcoded as an automatic production match.",
+  "cases": [
+    {"id": "direct_guidance", "query": "namaz ki talqeen", "text": "ہم نے نوجوانوں کو نماز پڑھنے کی تلقین کی اور کہا کہ روزانہ نماز ادا کریں۔", "relevant": true},
+    {"id": "teach_others", "query": "namaz ki talqeen", "text": "کارکنان کو ہدایت دی گئی کہ دوسرے لوگوں کی تربیت کریں، ان کو نماز پڑھنا سکھائیں اور ان کے ساتھ مسجد جائیں۔", "relevant": true},
+    {"id": "reported_guidance", "query": "namaz ki talqeen", "text": "The teacher encouraged the participants to offer their daily prayers regularly and explained how to start.", "relevant": true},
+    {"id": "praying_for_youth", "query": "namaz ki talqeen", "text": "We prayed for the young people's success and asked God to protect their families. We made no recommendation about their performing prayers.", "relevant": false},
+    {"id": "performance_only", "query": "namaz ki talqeen", "text": "نماز ختم ہونے کے بعد اجلاس شروع ہوا۔ شرکاء نے بجٹ پر گفتگو کی اور پھر گھر چلے گئے۔", "relevant": false},
+    {"id": "opposite_advice", "query": "namaz ki talqeen", "text": "He discouraged the participants from performing prayers and explicitly told them not to pray.", "relevant": false},
+    {"id": "unrelated_training", "query": "namaz ki talqeen", "text": "کارکنان کو کہا گیا کہ لوگوں کی تربیت کریں، انہیں انتخابی لٹریچر پڑھائیں اور ووٹ مانگیں۔", "relevant": false},
+    {"id": "political_distractor", "query": "namaz ki talqeen", "text": "The government discussed foreign policy, an international meeting and nominations for a peace prize.", "relevant": false},
+    {"id": "parents_to_children", "query": "parents encouraging children to pray", "text": "Parents told their children to offer their daily prayers regularly and taught them how to pray.", "relevant": true},
+    {"id": "reversed_roles", "query": "parents encouraging children to pray", "text": "The children urged their parents to pray regularly. The parents were the recipients of the advice.", "relevant": false},
+    {"id": "missing_requested_recipient", "query": "parents encouraging children to pray", "text": "The participants were encouraged to pray regularly. The passage gives no information about their ages, family relationships or who encouraged them.", "relevant": false},
+    {"id": "other_requested_recipient", "query": "young people being encouraged to pray", "text": "The speaker explicitly addressed only elderly residents over eighty and encouraged those elderly residents to pray regularly.", "relevant": false},
+    {"id": "general_advice_missing_youth", "query": "young people being encouraged to pray", "text": "An unnamed person of unspecified age was instructed to pray regularly. Nothing identifies that person's age group.", "relevant": false},
+    {"id": "education_positive_control", "query": "students and high education fees", "text": "University tuition costs 100000 rupees per semester and students' families cannot afford these fees.", "relevant": true},
+    {"id": "education_negative_control", "query": "students and high education fees", "text": "The university opened a library and students read books there. Nothing is said about fees or affordability.", "relevant": false}
+  ]
+}

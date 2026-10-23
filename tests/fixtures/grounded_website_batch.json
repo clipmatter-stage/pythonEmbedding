@@ -1,0 +1,12 @@
+{
+  "description": "Source IDs and passage hashes from a failed production request. No transcripts or credentials are stored. Evaluation re-fetches eligible source content and refuses changed passage hashes.",
+  "query": "namaz ki talqeen",
+  "sources": [
+    {"point_id": "1118ba9c-d2fa-56e7-9aa0-354b3946a3b6", "candidate_id": "p_14fe0a8b009d04b419101cec"},
+    {"point_id": "6303352c-5e8f-5414-a04c-a07392247541", "candidate_id": "p_be28baa8c3b5308b413e2ac3"},
+    {"point_id": "6b7607bd-a3c9-56d9-a73a-117902b67643", "candidate_id": "p_bcff9dfefba7de21135724b8"},
+    {"point_id": "e7213764-84c6-5352-8feb-0757258c8f7d", "candidate_id": "p_e40ab4f32aeeaf2f7874b982"},
+    {"point_id": "f117bf9d-f55d-57b3-8279-077a07783f76", "candidate_id": "p_5ef359e857cd8e5328909c27"},
+    {"point_id": "e3da037a-0ac0-5717-bcb3-f3938ae77f61", "candidate_id": "p_56bc5d905ab077ec48cdced1"}
+  ]
+}
