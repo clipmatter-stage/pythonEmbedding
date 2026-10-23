@@ -56,12 +56,24 @@ def patch_identity(client,collection,video_id,changes,*,rollback=False,dry_run=T
         before[str(p.id)]={'payload_sha256':payload_hash(payload),'fields':{k:payload[k]for k in FIELDS if k in payload}}
         updates.append((p.id,fields,delete,payload_hash(after)))
     if not dry_run:
-        for point_id,fields,delete,_ in updates:
-            if fields:client.set_payload(collection_name=collection,payload=fields,points=[point_id],wait=True,timeout=20)
-            if delete:client.delete_payload(collection_name=collection,keys=delete,points=[point_id],wait=True,timeout=20)
+        # Validate the entire request above before sending any writes. Batch the
+        # payload operations into one Qdrant round trip, preserving point order
+        # and explicit null deletion without replacing source payloads/vectors.
+        from qdrant_client import models
+        operations = []
+        for point_id, fields, delete, _ in updates:
+            if fields:
+                operations.append(models.SetPayloadOperation(
+                    set_payload=models.SetPayload(payload=fields, points=[point_id])))
+            if delete:
+                operations.append(models.DeletePayloadOperation(
+                    delete_payload=models.DeletePayload(keys=delete, points=[point_id])))
+        if operations:
+            client.batch_update_points(collection_name=collection,
+                update_operations=operations, wait=True, timeout=60)
         actual={str(p.id):p.payload for p in client.retrieve(collection_name=collection,ids=ids,with_payload=True,with_vectors=False,timeout=10)}
-        if any(payload_hash(actual[str(i)])!=h for i,_,_,h in updates):raise ValueError('Uncertain identity write; retain checkpoint and inspect')
-    return {'version':VERSION,'video_id':video_id,'dry_run':dry_run,'updated_points':len(updates),'verified':not dry_run,'vectors_written':0,'before':before,'after_hashes':{**{str(c['point_id']):c['post_payload_sha256']for c in changes if c.get('post_payload_sha256')},**{str(i):h for i,_,_,h in updates}}}
+        if any(str(i) not in actual or payload_hash(actual[str(i)])!=h for i,_,_,h in updates):raise ValueError('Uncertain identity write; retain checkpoint and inspect')
+    return {'version':VERSION,'write_strategy':'qdrant_payload_batch_v1','video_id':video_id,'dry_run':dry_run,'updated_points':len(updates),'verified':not dry_run,'vectors_written':0,'before':before,'after_hashes':{**{str(c['point_id']):c['post_payload_sha256']for c in changes if c.get('post_payload_sha256')},**{str(i):h for i,_,_,h in updates}}}
 
 def register(app,client,collection,redis,authorized):
     import asyncio
