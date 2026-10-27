@@ -101,6 +101,16 @@ class SearchTests(unittest.TestCase):
   self.assertTrue(result['metadata']['passage_validation']['cache_hit'])
   self.assertTrue(any(key.startswith('grounded:')for key in self.cache))
 
+ def test_numeric_manual_title_is_found_without_a_transcript_or_ai_call(self):
+  row={'id':'metadata:809','video_id':809,'video_title':'00029','text':'','score':1.,'is_video_only':True,'transcript_verified':False,'evidence_verified':False,'evidence_source':'manual_metadata','match_types':['manual_metadata_match']}
+  self.engine.metadata_search=lambda request:[row]
+  self.base.search=lambda *args:(_ for _ in ()).throw(AssertionError('Numeric title must not require transcript search'))
+  result=self.engine.search(request(query='00029'))
+  self.assertEqual([809],[r['video_id']for r in result['results']]);self.assertEqual(0,self.calls)
+  self.assertEqual('completed',result['metadata']['passage_validation']['status'])
+  second=self.engine.search(request(query='00029'))
+  self.assertTrue(second['metadata']['passage_validation']['cache_hit'])
+
  def test_equal_scores_have_a_stable_order(self):
   rows=[{'id':'b','video_id':2,'score':.9},{'id':'c','video_id':1,'score':.9},{'id':'a','video_id':1,'score':.9}]
   self.assertEqual(diverse(rows,3),diverse(list(reversed(rows)),3))
