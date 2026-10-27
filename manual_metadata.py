@@ -50,8 +50,8 @@ class ManualMetadata:
             document=row['document']
             output.append({'id':'metadata:'+str(row['id']),'video_id':row['video_id'],'video_title':document['title'],
                 'text':'','score':row['score'],'is_video_only':True,'transcript_verified':False,'evidence_verified':False,
-                'evidence_source':'manual_metadata','matched_fields':['video_title','manual_tags'],
-                'match_types':['tag_match','title_match'],'metadata_evidence':{'title':document['title'],'tags':document['tags'],'quotes':[q['quote']for q in row.get('evidence_spans',[])]},
+                'evidence_source':'manual_metadata','matched_fields':[],
+                'match_types':['manual_metadata_match'],'metadata_evidence':{'title':document['title'],'tags':document['tags'],'quotes':[q['quote']for q in row.get('evidence_spans',[])]},
                 'score_type':'verified_metadata_relevance'})
         return output
 
