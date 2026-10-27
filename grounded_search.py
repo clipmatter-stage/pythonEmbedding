@@ -11,10 +11,17 @@ from contextual_search import source_filter
 from grounded_validation import VERSION,SYSTEM,validate_grounded,candidate_id
 from semantic_passage_evidence import ValidationUnavailable
 from transcript_search_contract import CONFIG,normalize,valid_interval,GROUNDED_STRATEGY_VERSION,semantic_query_text
+# Cache only successful, revision-bound snapshots; transient partials remain retryable.
+SNAPSHOT_TTL=604800
+def stable_snapshot(metadata,title,summary):
+    return (metadata['status'] in {'completed','no_matches'}
+        and not (set(title.get('warnings',[])) - {'title_retrieval_bounded'})
+        and not (set(summary.get('warnings',[])) - {'summary_retrieval_bounded'}))
+
 FIELDS=IDENTITY_FIELDS+['video_id','segment_index','text','speaker','transcript_speaker','diarization_speaker','start_time','end_time','timestamp_unit','video_title','youtube_url','language','video_created_at']
 def diverse(rows,limit,key="retrieval_score"):
     groups=defaultdict(list)
-    for row in sorted(rows,key=lambda r:-r.get(key,r['score'])):groups[row['video_id']].append(row)
+    for row in sorted(rows,key=lambda r:(-r.get(key,r['score']),str(r['video_id']),str(r['id']))):groups[row['video_id']].append(row)
     out=[]
     for depth in range(max([len(x)for x in groups.values()]or[0])):
         for group in groups.values():
@@ -91,15 +98,23 @@ def ranked_diverse(rows,limit):
     return diverse(rows,limit)
 
 class GroundedSearch:
-    def __init__(self,base,judge,model,revision,read_cache,write_cache,embedding_contract,title_intent=None,title_indexed=False,summary_indexed_fields=()):
+    def __init__(self,base,judge,model,revision,read_cache,write_cache,embedding_contract,title_intent=None,title_indexed=False,summary_indexed_fields=(),snapshot_lock=None):
+        self.snapshot_lock=snapshot_lock
         self.title_intent=title_intent;self.title_indexed=title_indexed;self.summary_indexed_fields=tuple(summary_indexed_fields)
         self.base=base;self.base.payload_fields=FIELDS;self.judge=judge;self.model=model;self.revision=revision;self.read_cache=read_cache;self.write_cache=write_cache;self.embedding_contract=embedding_contract
     def search(self,request,video_ids=None):
+        if self.snapshot_lock is None:return self._search(request,video_ids)
+        params=request.model_dump()if hasattr(request,'model_dump')else vars(request).copy()
+        for key in ['cursor','exact_cursor','search_session_id','batch_size']:params.pop(key,None)
+        identity=hashlib.sha256(json.dumps([params,video_ids,self.model,self.revision()],sort_keys=True,default=str).encode()).hexdigest()
+        with self.snapshot_lock(identity):return self._search(request,video_ids)
+
+    def _search(self,request,video_ids=None):
         started=time.monotonic();epoch=self.revision();initial=int(os.getenv('GROUNDING_INITIAL_CANDIDATES','12'));maximum=int(os.getenv('GROUNDING_MAX_CANDIDATES','24'))
         if not 1<=initial<=maximum<=32:raise ValueError('Grounding limits must satisfy 1 <= initial <= maximum <= 32')
         params=request.model_dump()if hasattr(request,'model_dump')else vars(request).copy()
         for k in ['cursor','exact_cursor','search_session_id','batch_size']:params.pop(k,None)
-        cache_key='grounded:'+hashlib.sha256(json.dumps([GROUNDED_STRATEGY_VERSION,self.title_indexed,self.summary_indexed_fields,initial,maximum,VERSION,hashlib.sha256(SYSTEM.encode()).hexdigest(),os.getenv('RAILWAY_GIT_COMMIT_SHA','development'),asdict(self.base.settings),self.base.sparse_enabled,self.model,getattr(self.judge,'cache_contract',None),self.embedding_contract,epoch,params,video_ids],sort_keys=True,ensure_ascii=False,default=str).encode()).hexdigest()
+        cache_key='grounded:'+hashlib.sha256(json.dumps(['stable_snapshot_v1',GROUNDED_STRATEGY_VERSION,self.title_indexed,self.summary_indexed_fields,initial,maximum,VERSION,hashlib.sha256(SYSTEM.encode()).hexdigest(),os.getenv('RAILWAY_GIT_COMMIT_SHA','development'),asdict(self.base.settings),self.base.sparse_enabled,self.model,getattr(self.judge,'cache_contract',None),self.embedding_contract,epoch,params,video_ids],sort_keys=True,ensure_ascii=False,default=str).encode()).hexdigest()
         cached=self.read_cache(cache_key)
         if cached is not None:
             if self.revision()!=epoch:raise ValidationUnavailable('Search index changed',reason='search_index_changed')
@@ -134,7 +149,7 @@ class GroundedSearch:
                     'evidence_verified':False,'candidate_sources':['video_title','video_summary'],
                     'candidates_retrieved':len({r['video_id']for r in [*title_rows,*summary_rows]}),'embedding_usage':[],'index_revision':epoch,
                     'timings':{'title_seconds':title_metadata['elapsed_seconds'],'summary_seconds':summary_metadata['elapsed_seconds'],'total_seconds':round(time.monotonic()-started,3)}}}
-            if title_metadata['exhaustive']and summary_metadata['exhaustive']:self.write_cache(cache_key,result,300)
+            if stable_snapshot(metadata,title_metadata,summary_metadata):self.write_cache(cache_key,result,SNAPSHOT_TTL)
             return result
         changes={'query':semantic_gloss(original),'word':None,'words':[],'top_k':self.base.settings.candidate_limit}
         expanded=request.model_copy(update=changes)if hasattr(request,'model_copy')else __import__('types').SimpleNamespace(**{**vars(request),**changes})
@@ -170,8 +185,8 @@ class GroundedSearch:
         # Cache entries are considered only for freshly retrieved, eligible
         # passages, and are checked again by the same quote/role validator.
         read_judgment=None if warnings else lambda q,row:self.read_cache(judgment_key(q,row))
-        write_judgment=None if warnings else lambda q,row,j:self.write_cache(judgment_key(q,row),j,900)
-        context_seconds=validation_seconds=0.;deadline=time.monotonic()+25
+        write_judgment=None if warnings else lambda q,row,j:self.write_cache(judgment_key(q,row),j,SNAPSHOT_TTL)
+        context_seconds=validation_seconds=0.;deadline=time.monotonic()+60
         for offset in range(0,len(rows),initial):
             calls_left=6-sum(m['provider_calls']for m in stages)
             if calls_left<=0:warnings.append('validation_call_budget_reached');break
@@ -233,7 +248,7 @@ class GroundedSearch:
         accepted=[r for r in accepted if r['score']>=request.min_score];accepted=diverse(accepted,request.top_k,key="score")
         # Grouping occurs AFTER diversity/output selection, so one video cannot consume the output budget.
         final=defaultdict(list)
-        for row in sorted(accepted,key=lambda r:-r['score']):final[row['video_id']].append(row)
+        for row in sorted(accepted,key=lambda r:(-r['score'],str(r['video_id']),str(r['id']))):final[row['video_id']].append(row)
         result={**response,'query':original,'results':[r for group in final.values()for r in group],'returned':len(accepted),'unique_videos':len(final),'metadata':{'passage_validation':metadata},'ranking':{**response['ranking'],'engine':'grounded_contextual','score_type':'grounded_relevance','evidence_verified':True,'candidate_trace':trace,'candidate_scope':'bounded_dense_or_hybrid_pool','context_reads':context_reads,'embedding_usage':embedding_usage,'model':self.model,'rules_version':VERSION,'index_revision':epoch,'timings':{'retrieval_seconds':round(retrieved-semantic_started,3),'context_seconds':round(context_seconds,3),'validation_seconds':round(validation_seconds,3),'total_seconds':round(time.monotonic()-started,3)}}}
         merged=merge_title_candidates(result['results'],title_rows,len(result['results'])+len(title_rows))
         merged=merge_summary_candidates(merged,summary_rows,request.top_k)
@@ -250,7 +265,7 @@ class GroundedSearch:
         if any(r.get('is_video_only')for r in merged):result['ranking']['score_type']='mixed_source_relevance'
         result['ranking']['timings']['title_seconds']=title_metadata['elapsed_seconds']
         result['ranking']['timings']['summary_seconds']=summary_metadata['elapsed_seconds']
-        if metadata['status']in{'completed','no_matches'}and title_metadata['exhaustive']and summary_metadata['exhaustive']:self.write_cache(cache_key,result,300)
+        if stable_snapshot(metadata,title_metadata,summary_metadata):self.write_cache(cache_key,result,SNAPSHOT_TTL)
         return result
 
 def summary_search(engine,request):

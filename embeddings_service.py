@@ -1250,7 +1250,7 @@ def grounded_retrieval_plan(query):
     plan = {'queries': intent.get('retrieval_queries', []),
             'retrieval_terms': intent.get('retrieval_terms', []), 'warnings': []}
     if intent.get('understanding_status') == 'enabled' and usable(plan):
-        write_shared_cache(key, plan, 86400)
+        write_shared_cache(key, plan, 604800)
         return plan
     # Another replica may have completed a plan while this request timed out.
     shared = read_shared_cache(key)
@@ -1360,7 +1360,18 @@ def get_contextual_search(pipeline_override: Optional[str] = None) -> Contextual
             retrieval_expander=grounded_retrieval_plan, diversify_candidates=True,
             lexical_indexed=str(getattr(source_info.payload_schema.get('text'),'data_type','')) in {'text','PayloadSchemaType.TEXT'})
         model=os.getenv("SEARCH_JUDGE_MODEL",OPENAI_TEXT_MODEL)
-        return GroundedSearch(base,provider_judge(openai_client,model,os.getenv('GROUNDING_CITATION_MODE','span_id')),model,current_revision,read_shared_cache,write_shared_cache,(OPENAI_EMBEDDING_MODEL,EMBEDDING_DIMENSION),
+        def snapshot_write(key,value,ttl):
+            if not write_shared_cache(key,value,ttl):
+                raise ValidationUnavailable('Search snapshot could not be saved',reason='search_snapshot_unavailable')
+        from contextlib import contextmanager
+        @contextmanager
+        def snapshot_lock(identity):
+            from redis.exceptions import LockError
+            try:
+                with search_cache_redis.lock(f'{SHARED_CACHE_NAMESPACE}:snapshot-lock:{identity}',timeout=120,blocking_timeout=3):yield
+            except LockError as error:
+                raise ValidationUnavailable('This search is being prepared. Please retry.',reason='search_snapshot_busy') from error
+        return GroundedSearch(base,provider_judge(openai_client,model,os.getenv('GROUNDING_CITATION_MODE','span_id')),model,current_revision,lambda key:read_shared_cache(key,required=True),snapshot_write,(OPENAI_EMBEDDING_MODEL,EMBEDDING_DIMENSION),snapshot_lock=snapshot_lock,
             title_intent=grounded_title_intent,title_indexed=str(getattr(source_info.payload_schema.get('video_title'),'data_type','')) in {'text','PayloadSchemaType.TEXT'},
             summary_indexed_fields=[field for field in SUMMARY_FIELDS if str(getattr(source_info.payload_schema.get(field),'data_type',''))in{'text','PayloadSchemaType.TEXT'}])
 

@@ -25,6 +25,35 @@ class SearchTests(unittest.TestCase):
   self.put(1,'University tuition costs 100000 rupees. Families cannot afford it',video=1);self.put(2,'University tuition costs 100000 rupees. Families cannot afford it',video=2)
   q=request(query='fees',allowed_video_ids=[1],authorization_scope='one',scope_revision='a');first=self.engine.search(q);n=self.calls;second=self.engine.search(q);self.assertEqual(n,self.calls);self.assertTrue(second['metadata']['passage_validation']['cache_hit']);self.assertEqual({1},{r['video_id']for r in first['results']});self.assertEqual({1},{r['video_id']for r in first['ranking']['candidate_trace']});self.epoch='b';self.engine.search(q);self.assertGreater(self.calls,n)
 
+ def test_bounded_summary_scan_keeps_verified_snapshot_across_fresh_searches(self):
+  from unittest.mock import patch
+  self.put(1,'University tuition costs 100000 rupees. Families cannot afford it',video=592)
+  writes=[]
+  def write(key,value,ttl):
+   writes.append((key,ttl));self.cache[key]=value
+  self.engine.write_cache=write
+  metadata={'matching_videos':0,'elapsed_seconds':0,'warnings':['summary_retrieval_bounded'],'exhaustive':False}
+  with patch('grounded_summary_search.summary_candidates',return_value=([],metadata)):
+   first=self.engine.search(request(query='fees'));calls=self.calls
+   second=self.engine.search(request(query='fees'))
+   self.assertEqual(first['results'],second['results']);self.assertEqual(calls,self.calls)
+   self.assertTrue(second['metadata']['passage_validation']['cache_hit'])
+   self.assertFalse(second['metadata']['summary_retrieval']['exhaustive'])
+   self.assertTrue(any(key.startswith('grounded:')and ttl==604800 for key,ttl in writes))
+   self.epoch='changed-index';self.engine.search(request(query='fees'));self.assertGreater(self.calls,calls)
+
+ def test_metadata_provider_failure_cannot_freeze_a_snapshot(self):
+  from unittest.mock import patch
+  self.put(1,'University tuition costs 100000 rupees. Families cannot afford it')
+  metadata={'matching_videos':0,'elapsed_seconds':0,'warnings':['summary_retrieval_unavailable'],'exhaustive':False}
+  with patch('grounded_summary_search.summary_candidates',return_value=([],metadata)):
+   self.engine.search(request(query='fees'))
+  self.assertFalse(any(key.startswith('grounded:')for key in self.cache))
+
+ def test_equal_scores_have_a_stable_order(self):
+  rows=[{'id':'b','video_id':2,'score':.9},{'id':'c','video_id':1,'score':.9},{'id':'a','video_id':1,'score':.9}]
+  self.assertEqual(diverse(rows,3),diverse(list(reversed(rows)),3))
+
  def test_individual_judgments_reused_without_full_response_cache(self):
   self.put(1,'University tuition costs 100000 rupees. Families cannot afford it',video=592)
   self.engine.read_cache=lambda key:self.cache.get(key)if key.startswith('grounded_judgment:')else None
