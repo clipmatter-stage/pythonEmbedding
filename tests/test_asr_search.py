@@ -8,6 +8,12 @@ class AsrTests(unittest.TestCase):
   self.assertIn('مکت المکرمہ',retrieval_hints('Mecca',[]))
   self.assertNotIn('مکت المکرمہ',retrieval_hints('Medina agreement',['مدینہ']))
   self.assertLessEqual(len(retrieval_hints('Makkah',['a','b','c','d'])),4)
+ def test_reviewed_error_gets_a_bounded_validation_slot_not_automatic_acceptance(self):
+  from asr_search import reserve_candidates
+  rows=[{'id':str(i),'video_id':i,'text':'مکت المکرمہ میں معاہدہ','score':.01}for i in range(10)]
+  self.assertEqual(4,len(reserve_candidates('Makkah',rows)))
+  self.assertEqual([],reserve_candidates('Medina',rows))
+
  def test_contextual_interpretation_keeps_original_quote_and_timestamp(self):
   row={'id':'one','video_id':1087,'text':'مکت المکرمہ میں ہونے والے معاہدے پر بات ہوئی','start_time':31.,'end_time':46.,'score':.8}
   def judge(q,rows,t):return {'judgments':[{'candidate_id':candidate_id(row),'score':.9,'relevant':True,'complete':True,'roles_supported':True,'relationship_supported':True,'reason':'relevant','quotes':['مکت المکرمہ'],'asr_interpretation':'مکت المکرمہ likely refers to مکہ المکرمہ in this context.'}]}

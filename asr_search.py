@@ -9,3 +9,14 @@ def retrieval_hints(query,terms):
     for aliases,variants in PLACE_VARIANTS:
         if any(re.search(r'(?<!\w)'+re.escape(normalize(alias))+r'(?!\w)',wanted)for alias in aliases):extra.extend(variants)
     return list(dict.fromkeys([*extra,*terms]))[:4]
+
+def reserve_candidates(query,rows,limit=4):
+    """Give observed reviewed misspellings a bounded chance to be validated."""
+    wanted=normalize(query);variants=[]
+    for aliases,forms in PLACE_VARIANTS:
+        if any(re.search(r'(?<!\w)'+re.escape(normalize(alias))+r'(?!\w)',wanted)for alias in aliases):
+            canonical={normalize(alias)for alias in aliases}
+            variants.extend(form for form in forms if normalize(form)not in canonical)
+    found=[row for row in rows if any(normalize(form)in normalize(row.get('text',''))for form in variants)]
+    found.sort(key=lambda row:(-row.get('retrieval_score',row.get('score',0)),str(row['video_id']),str(row['id'])))
+    return found[:limit]

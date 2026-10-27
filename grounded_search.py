@@ -224,6 +224,10 @@ class GroundedSearch:
         rows=ranked_diverse(pool,initial)
         chosen={str(row['id'])for row in rows}
         rows+=ranked_diverse([row for row in pool if str(row['id'])not in chosen],maximum-len(rows))if len(rows)<maximum else []
+        from asr_search import reserve_candidates
+        reserved=reserve_candidates(original,pool)
+        reserved_ids={str(row['id'])for row in reserved}
+        rows=[*reserved,*[row for row in rows if str(row['id'])not in reserved_ids]][:maximum]
         trace=[{'point_id':str(r['id']),'video_id':r['video_id'],'stage':'candidate_retrieval',
                 'retrieval_score':r.get('retrieval_score',r['score']),
                 'selected_for_context':str(r['id'])in{str(x['id'])for x in rows}}for r in response['results']]
