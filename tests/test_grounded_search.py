@@ -39,7 +39,7 @@ class SearchTests(unittest.TestCase):
    self.assertEqual(first['results'],second['results']);self.assertEqual(calls,self.calls)
    self.assertTrue(second['metadata']['passage_validation']['cache_hit'])
    self.assertFalse(second['metadata']['summary_retrieval']['exhaustive'])
-   self.assertTrue(any(key.startswith('grounded:')and ttl==604800 for key,ttl in writes))
+   self.assertTrue(any(key.startswith('grounded:')and ttl is None for key,ttl in writes))
    self.epoch='changed-index';self.engine.search(request(query='fees'));self.assertGreater(self.calls,calls)
 
  def test_metadata_provider_failure_cannot_freeze_a_snapshot(self):
@@ -49,6 +49,41 @@ class SearchTests(unittest.TestCase):
   with patch('grounded_summary_search.summary_candidates',return_value=([],metadata)):
    self.engine.search(request(query='fees'))
   self.assertFalse(any(key.startswith('grounded:')for key in self.cache))
+
+ def test_verified_results_survive_loss_of_temporary_judgment_cache(self):
+  from search_snapshots import SearchSnapshots
+  snapshots=SearchSnapshots(self.c)
+  self.engine.read_cache=lambda key:snapshots.read(key)if key.startswith('grounded:')else self.cache.get(key)
+  self.engine.write_cache=lambda key,value,ttl:snapshots.write(key,value)if key.startswith('grounded:')else self.cache.update({key:value})
+  self.put(1,'University tuition costs 100000 rupees. Families cannot afford it',video=1169)
+  first=self.engine.search(request(query='fees'));calls=self.calls
+  self.cache.clear()
+  snapshots=SearchSnapshots(self.c)
+  second=self.engine.search(request(query='fees'))
+  self.assertEqual(calls,self.calls);self.assertEqual(first['results'],second['results'])
+  self.assertTrue(second['metadata']['passage_validation']['cache_hit'])
+
+ def test_unrelated_deployment_keeps_the_verified_snapshot(self):
+  from unittest.mock import patch
+  self.put(1,'University tuition costs 100000 rupees. Families cannot afford it')
+  with patch.dict('os.environ',{'RAILWAY_GIT_COMMIT_SHA':'deployment-one'}):
+   first=self.engine.search(request(query='fees'));calls=self.calls
+  with patch.dict('os.environ',{'RAILWAY_GIT_COMMIT_SHA':'deployment-two'}):
+   second=self.engine.search(request(query='fees'))
+  self.assertEqual(calls,self.calls);self.assertEqual(first['results'],second['results'])
+  self.assertTrue(second['metadata']['passage_validation']['cache_hit'])
+
+ def test_search_rules_and_access_scope_invalidate_saved_results(self):
+  from unittest.mock import patch
+  self.put(1,'University tuition costs 100000 rupees. Families cannot afford it',video=1)
+  with patch('grounded_search.search_rules_fingerprint',return_value='rules-one'):
+   self.engine.search(request(query='fees',allowed_video_ids=[1],authorization_scope='one'))
+  keys=set(self.cache)
+  with patch('grounded_search.search_rules_fingerprint',return_value='rules-two'):
+   self.engine.search(request(query='fees',allowed_video_ids=[1],authorization_scope='one'))
+   self.assertGreater(len(set(self.cache)-keys),0)
+   result=self.engine.search(request(query='fees',allowed_video_ids=[2],authorization_scope='two'))
+  self.assertEqual([],result['results'])
 
  def test_equal_scores_have_a_stable_order(self):
   rows=[{'id':'b','video_id':2,'score':.9},{'id':'c','video_id':1,'score':.9},{'id':'a','video_id':1,'score':.9}]

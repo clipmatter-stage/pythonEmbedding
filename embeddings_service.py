@@ -1360,9 +1360,22 @@ def get_contextual_search(pipeline_override: Optional[str] = None) -> Contextual
             retrieval_expander=grounded_retrieval_plan, diversify_candidates=True,
             lexical_indexed=str(getattr(source_info.payload_schema.get('text'),'data_type','')) in {'text','PayloadSchemaType.TEXT'})
         model=os.getenv("SEARCH_JUDGE_MODEL",OPENAI_TEXT_MODEL)
+        from search_snapshots import SearchSnapshots
+        # Snapshot writes are derived data, not mutations of transcript search points.
+        snapshots=SearchSnapshots(qdrant_client.client if isinstance(qdrant_client,RevisionedClient) else qdrant_client)
+        def snapshot_read(key):
+            if not key.startswith('grounded:'):return read_shared_cache(key,required=True)
+            try:return snapshots.read(key)
+            except Exception as error:
+                raise ValidationUnavailable('Verified search storage is unavailable',reason='search_snapshot_unavailable') from error
         def snapshot_write(key,value,ttl):
-            if not write_shared_cache(key,value,ttl):
-                raise ValidationUnavailable('Search snapshot could not be saved',reason='search_snapshot_unavailable')
+            if not key.startswith('grounded:'):
+                if not write_shared_cache(key,value,ttl):
+                    raise ValidationUnavailable('Search judgment could not be saved',reason='search_snapshot_unavailable')
+                return
+            try:snapshots.write(key,value)
+            except Exception as error:
+                raise ValidationUnavailable('Verified search could not be saved',reason='search_snapshot_unavailable') from error
         from contextlib import contextmanager
         @contextmanager
         def snapshot_lock(identity):
@@ -1371,7 +1384,7 @@ def get_contextual_search(pipeline_override: Optional[str] = None) -> Contextual
                 with search_cache_redis.lock(f'{SHARED_CACHE_NAMESPACE}:snapshot-lock:{identity}',timeout=120,blocking_timeout=3):yield
             except LockError as error:
                 raise ValidationUnavailable('This search is being prepared. Please retry.',reason='search_snapshot_busy') from error
-        return GroundedSearch(base,provider_judge(openai_client,model,os.getenv('GROUNDING_CITATION_MODE','span_id')),model,current_revision,lambda key:read_shared_cache(key,required=True),snapshot_write,(OPENAI_EMBEDDING_MODEL,EMBEDDING_DIMENSION),snapshot_lock=snapshot_lock,
+        return GroundedSearch(base,provider_judge(openai_client,model,os.getenv('GROUNDING_CITATION_MODE','span_id')),model,current_revision,snapshot_read,snapshot_write,(OPENAI_EMBEDDING_MODEL,EMBEDDING_DIMENSION,OPENAI_TEXT_MODEL),snapshot_lock=snapshot_lock,
             title_intent=grounded_title_intent,title_indexed=str(getattr(source_info.payload_schema.get('video_title'),'data_type','')) in {'text','PayloadSchemaType.TEXT'},
             summary_indexed_fields=[field for field in SUMMARY_FIELDS if str(getattr(source_info.payload_schema.get(field),'data_type',''))in{'text','PayloadSchemaType.TEXT'}])
 

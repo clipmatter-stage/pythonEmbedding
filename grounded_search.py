@@ -2,17 +2,41 @@
 No embedding-space change or new identity assertions. Exact matching is separate.
 """
 from speaker_identity import view as identity_view, FIELDS as IDENTITY_FIELDS, supported as identity_supported
-import copy,hashlib,json,time,os,re
+import ast,copy,hashlib,json,time,os,re
 from dataclasses import asdict
 from concurrent.futures import ThreadPoolExecutor
 from collections import defaultdict
+from functools import lru_cache
+from pathlib import Path
 from qdrant_client import models
 from contextual_search import source_filter
 from grounded_validation import VERSION,SYSTEM,validate_grounded,candidate_id
 from semantic_passage_evidence import ValidationUnavailable
 from transcript_search_contract import CONFIG,normalize,valid_interval,GROUNDED_STRATEGY_VERSION,semantic_query_text
 # Cache only successful, revision-bound snapshots; transient partials remain retryable.
-SNAPSHOT_TTL=604800
+SNAPSHOT_TTL=None  # Durable snapshots have no time-based expiry.
+JUDGMENT_TTL=604800
+
+@lru_cache(maxsize=1)
+def search_rules_fingerprint():
+    # Invalidate for search logic changes, independently of deployment commit IDs.
+    files=('grounded_search.py','grounded_validation.py','fast_search.py','contextual_search.py',
+           'grounded_title_search.py','grounded_summary_search.py','transcript_search_contract.py',
+           'search_contract_v1.json','semantic_query_decomposition.py','speaker_identity.py',
+           'semantic_passage_evidence.py','exact_lexical.py','embeddings_service.py')
+    digest=hashlib.sha256()
+    for name in files:
+        source=(Path(__file__).parent/name).read_bytes()
+        if name=='embeddings_service.py':
+            functions={'understand_query','grounded_retrieval_plan','grounded_title_intent',
+                       'get_contextual_search','search','search_incremental','search_pipeline','search_engine',
+                       'get_semantic_query_embedding'}
+            tree=ast.parse(source)
+            selected=[node for node in tree.body if isinstance(node,(ast.FunctionDef,ast.AsyncFunctionDef))and node.name in functions]
+            source=ast.dump(ast.Module(body=selected,type_ignores=[]),include_attributes=False).encode()
+        digest.update(name.encode());digest.update(source)
+    return digest.hexdigest()
+
 def stable_snapshot(metadata,title,summary):
     return (metadata['status'] in {'completed','no_matches'}
         and not (set(title.get('warnings',[])) - {'title_retrieval_bounded'})
@@ -114,7 +138,7 @@ class GroundedSearch:
         if not 1<=initial<=maximum<=32:raise ValueError('Grounding limits must satisfy 1 <= initial <= maximum <= 32')
         params=request.model_dump()if hasattr(request,'model_dump')else vars(request).copy()
         for k in ['cursor','exact_cursor','search_session_id','batch_size']:params.pop(k,None)
-        cache_key='grounded:'+hashlib.sha256(json.dumps(['stable_snapshot_v1',GROUNDED_STRATEGY_VERSION,self.title_indexed,self.summary_indexed_fields,initial,maximum,VERSION,hashlib.sha256(SYSTEM.encode()).hexdigest(),os.getenv('RAILWAY_GIT_COMMIT_SHA','development'),asdict(self.base.settings),self.base.sparse_enabled,self.model,getattr(self.judge,'cache_contract',None),self.embedding_contract,epoch,params,video_ids],sort_keys=True,ensure_ascii=False,default=str).encode()).hexdigest()
+        cache_key='grounded:'+hashlib.sha256(json.dumps(['persistent_snapshot_v1',GROUNDED_STRATEGY_VERSION,self.title_indexed,self.summary_indexed_fields,initial,maximum,VERSION,hashlib.sha256(SYSTEM.encode()).hexdigest(),search_rules_fingerprint(),asdict(self.base.settings),self.base.sparse_enabled,self.model,getattr(self.judge,'cache_contract',None),self.embedding_contract,epoch,params,video_ids],sort_keys=True,ensure_ascii=False,default=str).encode()).hexdigest()
         cached=self.read_cache(cache_key)
         if cached is not None:
             if self.revision()!=epoch:raise ValidationUnavailable('Search index changed',reason='search_index_changed')
@@ -185,7 +209,7 @@ class GroundedSearch:
         # Cache entries are considered only for freshly retrieved, eligible
         # passages, and are checked again by the same quote/role validator.
         read_judgment=None if warnings else lambda q,row:self.read_cache(judgment_key(q,row))
-        write_judgment=None if warnings else lambda q,row,j:self.write_cache(judgment_key(q,row),j,SNAPSHOT_TTL)
+        write_judgment=None if warnings else lambda q,row,j:self.write_cache(judgment_key(q,row),j,JUDGMENT_TTL)
         context_seconds=validation_seconds=0.;deadline=time.monotonic()+60
         for offset in range(0,len(rows),initial):
             calls_left=6-sum(m['provider_calls']for m in stages)
