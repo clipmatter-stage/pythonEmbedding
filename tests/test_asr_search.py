@@ -14,6 +14,12 @@ class AsrTests(unittest.TestCase):
   self.assertEqual(4,len(reserve_candidates('Makkah',rows)))
   self.assertEqual([],reserve_candidates('Medina',rows))
 
+ def test_canonicalization_does_not_remove_relationships_or_negations(self):
+  from asr_search import canonical_query
+  self.assertEqual('Makkah',canonical_query('makkah'))
+  self.assertEqual('Makkah is not Medina',canonical_query('Makkah is not Medina'))
+  self.assertEqual('makkah agreement with Iran',canonical_query('makkah agreement with Iran'))
+
  def test_contextual_interpretation_keeps_original_quote_and_timestamp(self):
   row={'id':'one','video_id':1087,'text':'مکت المکرمہ میں ہونے والے معاہدے پر بات ہوئی','start_time':31.,'end_time':46.,'score':.8}
   def judge(q,rows,t):return {'judgments':[{'candidate_id':candidate_id(row),'score':.9,'relevant':True,'complete':True,'roles_supported':True,'relationship_supported':True,'reason':'relevant','quotes':['مکت المکرمہ'],'asr_interpretation':'مکت المکرمہ likely refers to مکہ المکرمہ in this context.'}]}

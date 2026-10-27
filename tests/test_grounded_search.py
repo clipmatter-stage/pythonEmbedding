@@ -111,6 +111,17 @@ class SearchTests(unittest.TestCase):
   second=self.engine.search(request(query='00029'))
   self.assertTrue(second['metadata']['passage_validation']['cache_hit'])
 
+ def test_reviewed_place_capitalization_shares_a_single_verified_snapshot(self):
+  self.put(1,'University tuition costs 100000 rupees. Families cannot afford it',video=1087)
+  queries=[];judge=self.engine.judge
+  self.engine.judge=lambda query,rows,timeout:(queries.append(query)or judge(query,rows,timeout))
+  first=self.engine.search(request(query='Makkah'));calls=self.calls
+  for query in ['makkah','MAKKAH','Mecca','مکہ المکرمہ']:
+   result=self.engine.search(request(query=query))
+   self.assertEqual(first['results'],result['results']);self.assertEqual(query,result['query'])
+   self.assertTrue(result['metadata']['passage_validation']['cache_hit'])
+  self.assertEqual(calls,self.calls);self.assertEqual({'Makkah'},set(queries))
+
  def test_equal_scores_have_a_stable_order(self):
   rows=[{'id':'b','video_id':2,'score':.9},{'id':'c','video_id':1,'score':.9},{'id':'a','video_id':1,'score':.9}]
   self.assertEqual(diverse(rows,3),diverse(list(reversed(rows)),3))

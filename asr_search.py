@@ -20,3 +20,9 @@ def reserve_candidates(query,rows,limit=4):
     found=[row for row in rows if any(normalize(form)in normalize(row.get('text',''))for form in variants)]
     found.sort(key=lambda row:(-row.get('retrieval_score',row.get('score',0)),str(row['video_id']),str(row['id'])))
     return found[:limit]
+
+def canonical_query(query):
+    """Canonicalize only reviewed whole-entity queries, never arbitrary claims."""
+    value=normalize(query.strip())
+    if value in {normalize(alias)for alias in PLACE_VARIANTS[0][0]}:return 'Makkah'
+    return query

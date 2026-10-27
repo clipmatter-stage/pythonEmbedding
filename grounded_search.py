@@ -147,11 +147,22 @@ class GroundedSearch:
         self.title_intent=title_intent;self.title_indexed=title_indexed;self.summary_indexed_fields=tuple(summary_indexed_fields)
         self.base=base;self.base.payload_fields=FIELDS;self.judge=judge;self.model=model;self.revision=revision;self.read_cache=read_cache;self.write_cache=write_cache;self.embedding_contract=embedding_contract
     def search(self,request,video_ids=None):
-        if self.snapshot_lock is None:return self._search(request,video_ids)
-        params=request.model_dump()if hasattr(request,'model_dump')else vars(request).copy()
-        for key in ['cursor','exact_cursor','search_session_id','batch_size']:params.pop(key,None)
-        identity=hashlib.sha256(json.dumps([params,video_ids,self.model,self.revision()],sort_keys=True,default=str).encode()).hexdigest()
-        with self.snapshot_lock(identity):return self._search(request,video_ids)
+        from asr_search import canonical_query
+        original=semantic_query_text(request);canonical=canonical_query(original)
+        if canonical!=original:
+            changes={'query':canonical,'word':None,'words':[]}
+            request=request.model_copy(update=changes)if hasattr(request,'model_copy')else __import__('types').SimpleNamespace(**{**vars(request),**changes})
+        if self.snapshot_lock is None:result=self._search(request,video_ids)
+        else:
+            params=request.model_dump()if hasattr(request,'model_dump')else vars(request).copy()
+            for key in ['cursor','exact_cursor','search_session_id','batch_size']:params.pop(key,None)
+            identity=hashlib.sha256(json.dumps([params,video_ids,self.model,self.revision()],sort_keys=True,default=str).encode()).hexdigest()
+            with self.snapshot_lock(identity):result=self._search(request,video_ids)
+        result=copy.deepcopy(result);result['query']=original
+        validation=result.get('metadata',{}).get('passage_validation',{})
+        if 'original_query'in validation:validation['original_query']=original
+        if canonical!=original:validation['canonical_query']=canonical
+        return result
 
     def _search(self,request,video_ids=None):
         started=time.monotonic();epoch=self.revision();initial=int(os.getenv('GROUNDING_INITIAL_CANDIDATES','12'));maximum=int(os.getenv('GROUNDING_MAX_CANDIDATES','24'))
