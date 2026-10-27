@@ -2729,7 +2729,7 @@ async def search(data: SearchRequest, authorized: bool = Depends(verify_api_key)
             for w in _raw_q.split()
             if w.strip()
         )
-        if _is_numeric_query:
+        if _is_numeric_query and not data.verify_relevance:
             logger.info(f"[AUTO-ROUTE] Numeric query '{_raw_q}' detected — routing to simple text search (semantic embeddings don't represent numbers)")
             search_mode = "simple"
             filter_type = "text"
@@ -3788,7 +3788,7 @@ async def search_incremental(data: IncrementalSearchRequest, authorized: bool = 
     # response format with cache + cursor.
     initial_query_shape = classify_query_shape(query_text, search_mode=data.search_mode)
     query_word_count_incremental = int(initial_query_shape.get("token_count", 0))
-    _is_numeric_incremental = bool(initial_query_shape.get("is_numeric_query"))
+    _is_numeric_incremental = bool(initial_query_shape.get("is_numeric_query")) and not data.verify_relevance
     _is_short_semantic_incremental = bool(initial_query_shape.get("is_short_semantic_query"))
 
     # Delegate to the same contextual pipeline used by /search.

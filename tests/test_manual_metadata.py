@@ -19,6 +19,12 @@ class MetadataTests(unittest.TestCase):
   self.assertEqual('a'*64,self.index.index(self.doc));rows=self.index.search(self.request())
   self.assertEqual(1,len(rows));self.assertTrue(rows[0]['is_video_only']);self.assertFalse(rows[0]['transcript_verified'])
   self.assertEqual('manual_metadata',rows[0]['evidence_source']);self.assertNotIn('start_time',rows[0]);self.assertEqual('',rows[0]['text'])
+ def test_numeric_title_preserves_leading_zeroes_and_needs_no_ai_judgment(self):
+  self.index.index({**self.doc,'title':'00029'})
+  rows=self.index.search(self.request(query='00029'))
+  self.assertEqual([7],[row['video_id']for row in rows]);self.assertEqual(0,self.calls)
+  self.assertEqual([],self.index.search(self.request(query='29')))
+
  def test_access_and_content_revision_exclude_stale_or_private_metadata(self):
   self.index.index(self.doc)
   self.assertEqual([],self.index.search(self.request(allowed_video_ids=[8])))

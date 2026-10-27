@@ -36,13 +36,21 @@ class ManualMetadata:
         self.ensure();ids=[point_id(r['video_id'],r['fingerprint'])for r in entries]
         if len(self.client.retrieve(COLLECTION,ids=ids,with_payload=False))!=len(ids):
             raise ValidationUnavailable('Manual metadata index requires synchronization',reason='metadata_index_missing')
-        hits=self.client.query_points(COLLECTION,query=self.embed(request.query),query_filter=models.Filter(must=[models.HasIdCondition(has_id=ids)]),limit=min(24,len(ids)),with_payload=True,timeout=10).points
+        numeric=request.query.strip().isdigit()
+        if numeric:
+            from transcript_search_contract import normalize
+            wanted=normalize(request.query.strip())
+            records=self.client.retrieve(COLLECTION,ids=ids,with_payload=True,with_vectors=False)
+            hits=[record for record in records if wanted in [normalize(str(record.payload.get('title',''))),*[normalize(tag)for tag in record.payload.get('tags',[])]]]
+        else:
+            hits=self.client.query_points(COLLECTION,query=self.embed(request.query),query_filter=models.Filter(must=[models.HasIdCondition(has_id=ids)]),limit=min(24,len(ids)),with_payload=True,timeout=10).points
         candidates=[]
         for hit in hits:
             p=hit.payload or{}
             if p.get('model')!=self.model:raise ValidationUnavailable('Manual metadata needs reindexing for the configured model',reason='metadata_model_changed')
-            candidates.append({'id':str(hit.id),'video_id':p['video_id'],'text':p['text'],'score':float(hit.score),'start_time':0,'end_time':1,'speaker':'Unknown Speaker','document':p})
-        rows,meta=validate_grounded(request.query,candidates,self.judge,batch_size=8,max_calls=6,deadline_seconds=40)
+            candidates.append({'id':str(hit.id),'video_id':p['video_id'],'text':p['text'],'score':1.0 if numeric else float(hit.score),'start_time':0,'end_time':1,'speaker':'Unknown Speaker','document':p})
+        if numeric:rows,meta=candidates,{'status':'completed'}
+        else:rows,meta=validate_grounded(request.query,candidates,self.judge,batch_size=8,max_calls=6,deadline_seconds=40)
         if meta['status']=='partial':raise ValidationUnavailable('Title/tag evaluation is incomplete',reason='metadata_validation_incomplete')
         output=[]
         for row in rows:
