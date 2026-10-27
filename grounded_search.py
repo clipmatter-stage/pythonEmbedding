@@ -187,10 +187,11 @@ class GroundedSearch:
                 except Exception:title_metadata.update(exhaustive=False,warnings=['title_retrieval_unavailable'])
                 try:summary_rows,summary_metadata=summary_future.result()
                 except Exception:summary_metadata.update(exhaustive=False,warnings=['summary_retrieval_unavailable'])
-        if title_plan.get('person_only')and metadata_enabled:
+        numeric_metadata=original.strip().isdigit()and bool(metadata_rows)
+        if (title_plan.get('person_only')or numeric_metadata)and metadata_enabled:
             if self.revision()!=epoch:raise ValidationUnavailable('Search index changed',reason='search_index_changed')
             _,metadata=validate_grounded(original,[],self.judge)
-            metadata.update(status='not_applicable',reason='name_only_metadata_lookup',exhaustive=False)
+            metadata.update(status='completed'if numeric_metadata else 'not_applicable',reason='numeric_metadata_lookup'if numeric_metadata else 'name_only_metadata_lookup',exhaustive=False)
             combined=merge_summary_candidates(title_rows,summary_rows,request.top_k)
             result={'query':original,'words':request.words,'speaker_filter':request.speaker,'search_mode':'semantic',
                 'results':combined,'returned':len(combined),
@@ -275,7 +276,7 @@ class GroundedSearch:
                     deadline_seconds=max(.1,deadline-time.monotonic()),concurrency=2,
                     read_judgment=read_judgment,write_judgment=write_judgment)
             except ValidationUnavailable:
-                if not accepted and not title_rows and not summary_rows:raise
+                if not accepted and not title_rows and not summary_rows and not metadata_rows:raise
                 warnings.append('expansion_validation_unavailable');break
             accepted.extend(r for r in passed if r['score']>=request.min_score);stages.append(stage)
             validation_seconds+=stage['elapsed_seconds']
