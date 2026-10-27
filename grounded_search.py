@@ -33,7 +33,8 @@ def search_rules_fingerprint():
                        'get_semantic_query_embedding'}
             tree=ast.parse(source)
             selected=[node for node in tree.body if isinstance(node,(ast.FunctionDef,ast.AsyncFunctionDef))and node.name in functions]
-            source=ast.dump(ast.Module(body=selected,type_ignores=[]),include_attributes=False).encode()
+            # Source text is stable across the local and production Python versions.
+            source='\n'.join(ast.get_source_segment(source.decode(),node)for node in selected).encode()
         digest.update(name.encode());digest.update(source)
     return digest.hexdigest()
 
