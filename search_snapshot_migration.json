@@ -1,6 +1,7 @@
 {
-  "compatible_rules_fingerprint": "832b7637bb6bc9d6991a067ddbd24952791313d975a344bb272705f8209176dd",
+  "compatible_rules_fingerprint": "6741c94f3ae3aec6de6f8d1669f64400a5ea23ca006f33369d9fd706e37e0432",
   "legacy_deployments": [
     "8aede66847e30521ff8df7e5c0796292a08422f5"
-  ]
+  ],
+  "planner_model": "gpt-6-luna"
 }

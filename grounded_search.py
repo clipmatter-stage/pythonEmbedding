@@ -37,12 +37,13 @@ def search_rules_fingerprint():
         digest.update(name.encode());digest.update(source)
     return digest.hexdigest()
 
-def legacy_snapshot_commits():
+def legacy_snapshot_commits(engine):
     # A one-time migration is allowed only for the exact reviewed search rules.
     path=Path(__file__).parent/'search_snapshot_migration.json'
     if not path.exists():return []
     migration=json.loads(path.read_text())
     if migration.get('compatible_rules_fingerprint')!=search_rules_fingerprint():return []
+    if len(engine.embedding_contract)>2 and engine.embedding_contract[2]!=migration.get('planner_model'):return []
     return migration.get('legacy_deployments',[])
 
 def snapshot_key(engine,epoch,params,video_ids,initial,maximum,legacy_commit=None):
@@ -158,7 +159,7 @@ class GroundedSearch:
         cache_key=snapshot_key(self,epoch,params,video_ids,initial,maximum)
         cached=self.read_cache(cache_key)
         if cached is None:
-            for commit in legacy_snapshot_commits():
+            for commit in legacy_snapshot_commits(self):
                 previous=self.read_cache('legacy:'+snapshot_key(self,epoch,params,video_ids,initial,maximum,commit))
                 if previous is not None:
                     if self.revision()!=epoch:raise ValidationUnavailable('Search index changed',reason='search_index_changed')
