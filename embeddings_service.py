@@ -1033,6 +1033,9 @@ one in native Urdu script, one in Roman Urdu, one in English. Preserve names, ne
 relationships and every qualification. These are retrieval hints, never evidence. Do not remove
 an actor or change a requested action. Include essential native Urdu, Roman Urdu and English
 topic terms in retrieval_terms (up to four total); omit function words and speaker names.
+For a clearly identified place or topic, one retrieval term may be a plausible phonetic ASR
+misspelling of its native-script form. Never replace the input intent or invent a different
+entity. Such variants only retrieve candidates; they never establish that the passage matches.
 """ if multilingual_retrieval else "")},
                 {"role": "user", "content": f"Analyze this search query: {query}"}
             ],
@@ -1236,7 +1239,7 @@ def grounded_title_intent(query):
 
 def grounded_retrieval_plan(query):
     """Share successful query-only plans across replicas; never cache failures."""
-    key = 'grounded_plan:v1:' + hashlib.sha256(json_module.dumps(
+    key = 'grounded_plan:asr-v2:' + hashlib.sha256(json_module.dumps(
         [OPENAI_TEXT_MODEL, query.strip()], ensure_ascii=False).encode()).hexdigest()
     def usable(plan):
         return (isinstance(plan, dict) and not plan.get('warnings')
@@ -1249,8 +1252,9 @@ def grounded_retrieval_plan(query):
     if usable(shared):
         return shared
     intent = understand_query(query, multilingual_retrieval=True)
+    from asr_search import retrieval_hints
     plan = {'queries': intent.get('retrieval_queries', []),
-            'retrieval_terms': intent.get('retrieval_terms', []), 'warnings': []}
+            'retrieval_terms': retrieval_hints(query,intent.get('retrieval_terms', [])), 'warnings': []}
     if intent.get('understanding_status') == 'enabled' and usable(plan):
         write_shared_cache(key, plan, 604800)
         return plan
