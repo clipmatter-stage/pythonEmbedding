@@ -37,6 +37,23 @@ def search_rules_fingerprint():
         digest.update(name.encode());digest.update(source)
     return digest.hexdigest()
 
+def legacy_snapshot_commits():
+    # A one-time migration is allowed only for the exact reviewed search rules.
+    path=Path(__file__).parent/'search_snapshot_migration.json'
+    if not path.exists():return []
+    migration=json.loads(path.read_text())
+    if migration.get('compatible_rules_fingerprint')!=search_rules_fingerprint():return []
+    return migration.get('legacy_deployments',[])
+
+def snapshot_key(engine,epoch,params,video_ids,initial,maximum,legacy_commit=None):
+    contract=engine.embedding_contract[:2]if legacy_commit else engine.embedding_contract
+    parts=['stable_snapshot_v1'if legacy_commit else 'persistent_snapshot_v1',
+           GROUNDED_STRATEGY_VERSION,engine.title_indexed,engine.summary_indexed_fields,initial,maximum,
+           VERSION,hashlib.sha256(SYSTEM.encode()).hexdigest(),legacy_commit or search_rules_fingerprint(),
+           asdict(engine.base.settings),engine.base.sparse_enabled,engine.model,
+           getattr(engine.judge,'cache_contract',None),contract,epoch,params,video_ids]
+    return 'grounded:'+hashlib.sha256(json.dumps(parts,sort_keys=True,ensure_ascii=False,default=str).encode()).hexdigest()
+
 def stable_snapshot(metadata,title,summary):
     return (metadata['status'] in {'completed','no_matches'}
         and not (set(title.get('warnings',[])) - {'title_retrieval_bounded'})
@@ -138,8 +155,14 @@ class GroundedSearch:
         if not 1<=initial<=maximum<=32:raise ValueError('Grounding limits must satisfy 1 <= initial <= maximum <= 32')
         params=request.model_dump()if hasattr(request,'model_dump')else vars(request).copy()
         for k in ['cursor','exact_cursor','search_session_id','batch_size']:params.pop(k,None)
-        cache_key='grounded:'+hashlib.sha256(json.dumps(['persistent_snapshot_v1',GROUNDED_STRATEGY_VERSION,self.title_indexed,self.summary_indexed_fields,initial,maximum,VERSION,hashlib.sha256(SYSTEM.encode()).hexdigest(),search_rules_fingerprint(),asdict(self.base.settings),self.base.sparse_enabled,self.model,getattr(self.judge,'cache_contract',None),self.embedding_contract,epoch,params,video_ids],sort_keys=True,ensure_ascii=False,default=str).encode()).hexdigest()
+        cache_key=snapshot_key(self,epoch,params,video_ids,initial,maximum)
         cached=self.read_cache(cache_key)
+        if cached is None:
+            for commit in legacy_snapshot_commits():
+                previous=self.read_cache('legacy:'+snapshot_key(self,epoch,params,video_ids,initial,maximum,commit))
+                if previous is not None:
+                    if self.revision()!=epoch:raise ValidationUnavailable('Search index changed',reason='search_index_changed')
+                    self.write_cache(cache_key,previous,SNAPSHOT_TTL);cached=previous;break
         if cached is not None:
             if self.revision()!=epoch:raise ValidationUnavailable('Search index changed',reason='search_index_changed')
             result=copy.deepcopy(cached);meta=result['metadata']['passage_validation'];meta['cache_hit']=True;meta['cached_provider_calls']=meta['provider_calls'];meta['provider_calls']=0;meta['provider_usage']=[];result['ranking']['embedding_usage']=[];result['ranking']['timings']['total_seconds']=round(time.monotonic()-started,3);return result

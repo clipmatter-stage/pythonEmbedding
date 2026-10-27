@@ -85,6 +85,22 @@ class SearchTests(unittest.TestCase):
    result=self.engine.search(request(query='fees',allowed_video_ids=[2],authorization_scope='two'))
   self.assertEqual([],result['results'])
 
+ def test_migration_preserves_existing_verified_snapshot_without_ai_rejudgment(self):
+  from unittest.mock import patch
+  from grounded_search import snapshot_key
+  self.put(1,'University tuition costs 100000 rupees. Families cannot afford it',video=1169)
+  query=request(query='fees');previous=self.engine.search(query)
+  params=vars(query).copy()
+  for key in ['cursor','exact_cursor','search_session_id','batch_size']:params.pop(key,None)
+  legacy='legacy:'+snapshot_key(self.engine,self.epoch,params,None,12,24,'prior-release')
+  self.cache={legacy:previous};calls=self.calls
+  self.engine.read_cache=lambda key:self.cache.get(key)
+  with patch('grounded_search.legacy_snapshot_commits',return_value=['prior-release']):
+   result=self.engine.search(query)
+  self.assertEqual(calls,self.calls);self.assertEqual(previous['results'],result['results'])
+  self.assertTrue(result['metadata']['passage_validation']['cache_hit'])
+  self.assertTrue(any(key.startswith('grounded:')for key in self.cache))
+
  def test_equal_scores_have_a_stable_order(self):
   rows=[{'id':'b','video_id':2,'score':.9},{'id':'c','video_id':1,'score':.9},{'id':'a','video_id':1,'score':.9}]
   self.assertEqual(diverse(rows,3),diverse(list(reversed(rows)),3))

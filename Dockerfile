@@ -35,7 +35,7 @@ COPY grounded_title_search.py grounded_summary_search.py search_snapshots.py .
 COPY callback_transport.py .
 COPY index_operations.py speaker_identity.py .
 COPY index_recovery_contract.py .
-COPY search_contract_v1.json .
+COPY search_contract_v1.json search_snapshot_migration.json .
 COPY backfill_transcript_contract.py .
 RUN python -c "from transcript_search_contract import match_spans; assert match_spans('I.P.P.', 'IPP')"
 COPY migrate_to_3072.py .

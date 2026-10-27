@@ -1364,12 +1364,12 @@ def get_contextual_search(pipeline_override: Optional[str] = None) -> Contextual
         # Snapshot writes are derived data, not mutations of transcript search points.
         snapshots=SearchSnapshots(qdrant_client.client if isinstance(qdrant_client,RevisionedClient) else qdrant_client)
         def snapshot_read(key):
-            if not key.startswith('grounded:'):return read_shared_cache(key,required=True)
+            if not key.startswith(('grounded:','legacy:grounded:')):return read_shared_cache(key,required=True)
             try:return snapshots.read(key)
             except Exception as error:
                 raise ValidationUnavailable('Verified search storage is unavailable',reason='search_snapshot_unavailable') from error
         def snapshot_write(key,value,ttl):
-            if not key.startswith('grounded:'):
+            if not key.startswith(('grounded:','legacy:grounded:')):
                 if not write_shared_cache(key,value,ttl):
                     raise ValidationUnavailable('Search judgment could not be saved',reason='search_snapshot_unavailable')
                 return

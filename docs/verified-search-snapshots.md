@@ -21,3 +21,8 @@ rerunning AI and changing a previously verified answer.
 
 Storage persistence and backups follow the existing Qdrant deployment. Removing
 that collection intentionally resets verified search history.
+
+The weekly-cache migration preserves existing completed snapshots under their
+original scope-bound keys. The migration manifest allows reuse only with the
+exact reviewed search-rules fingerprint; future search-rule changes disable it.
+A migrated result is saved under the new durable key before being returned.
