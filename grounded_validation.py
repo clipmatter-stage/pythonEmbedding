@@ -38,7 +38,7 @@ def source_spans(text,max_chars=170):
         start=end
     return spans
 
-def provider_judge(client,model,citation_mode='quote',reasoning_effort='low'):
+def provider_judge(client,model,citation_mode='quote',reasoning_effort='low',source_kind='transcript'):
     if citation_mode not in {'quote','span_id'}:raise ValueError('Unknown grounding citation mode')
     if reasoning_effort not in {'none','low'}:raise ValueError('Unknown grounding reasoning effort')
     def judge(query,rows,timeout):
@@ -51,6 +51,7 @@ def provider_judge(client,model,citation_mode='quote',reasoning_effort='low'):
             else:docs.append({'candidate_id':key,'text':r['text'],'source_speaker_label':r.get('speaker','')})
         if citation_mode=='span_id':system=SYSTEM.replace('quotes must contain 1-3 short exact excerpts (at most 180 characters each)','quotes must contain 1-3 span_id strings selected from THIS candidate source_spans; each ID resolves to original source text. Read all spans as one passage, not disconnected evidence. Never invent or borrow another candidate ID')
 
+        if source_kind=='metadata':system=system.replace('transcript passage','video metadata record')+'\nThe supplied records contain only an administrator-provided video title and manual tags. Judge topic relevance using those fields only. Never infer spoken words, speaker identity, timestamps, or unlisted events.'
         arguments={'model':model,'messages':[{'role':'system','content':system},{'role':'user','content':json.dumps({'query':query,'passages':docs},ensure_ascii=False)}],'max_completion_tokens':2200,'response_format':{'type':'json_schema','json_schema':{'name':'grounded_passages','strict':True,'schema':schema([x['candidate_id']for x in docs])}},'timeout':timeout}
         if citation_mode=='span_id':arguments['response_format']['json_schema']['schema']['properties']['judgments']['items']['properties']['quotes']['items']['enum']=[i for choices in citations.values()for i in choices]
         if model.startswith(('gpt-6','gpt-5','o')):
@@ -67,7 +68,7 @@ def provider_judge(client,model,citation_mode='quote',reasoning_effort='low'):
 
         result['_usage']={'input_tokens':usage.prompt_tokens,'output_tokens':usage.completion_tokens,'total_tokens':usage.total_tokens,'model':model,'citation_mode':citation_mode,'reasoning_effort':arguments.get('reasoning_effort'), 'elapsed_seconds':round(time.monotonic()-t,3)}
         return result
-    judge.cache_contract=(model,citation_mode,reasoning_effort)
+    judge.cache_contract=(model,citation_mode,reasoning_effort,source_kind)
     return judge
 
 def grounded_quotes(text,quotes):

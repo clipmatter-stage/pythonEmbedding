@@ -528,6 +528,7 @@ class SearchRequest(BaseModel):
     scope_revision: Optional[str] = None
     index_revision: Optional[str] = None
 
+    metadata_registry: List[dict] = Field(default=[], max_length=10000)
     summary_candidates: Optional[List[dict]] = Field(default=None, max_length=10000)
     transcript_contract: str = Field(default="normalized", pattern="^(literal|normalized|alias)$")
     query: str = Field(default="", max_length=1000)
@@ -571,6 +572,7 @@ class IncrementalSearchRequest(BaseModel):
     scope_revision: Optional[str] = None
     index_revision: Optional[str] = None
 
+    metadata_registry: List[dict] = Field(default=[], max_length=10000)
     summary_candidates: Optional[List[dict]] = Field(default=None, max_length=10000)
     transcript_contract: str = Field(default="normalized", pattern="^(literal|normalized|alias)$")
     """Request model for incremental cursor-based search"""
@@ -1384,7 +1386,11 @@ def get_contextual_search(pipeline_override: Optional[str] = None) -> Contextual
                 with search_cache_redis.lock(f'{SHARED_CACHE_NAMESPACE}:snapshot-lock:{identity}',timeout=120,blocking_timeout=3):yield
             except LockError as error:
                 raise ValidationUnavailable('This search is being prepared. Please retry.',reason='search_snapshot_busy') from error
-        return GroundedSearch(base,provider_judge(openai_client,model,os.getenv('GROUNDING_CITATION_MODE','span_id')),model,current_revision,snapshot_read,snapshot_write,(OPENAI_EMBEDDING_MODEL,EMBEDDING_DIMENSION,OPENAI_TEXT_MODEL),snapshot_lock=snapshot_lock,
+        from manual_metadata import ManualMetadata
+        metadata_index=ManualMetadata(qdrant_client.client if isinstance(qdrant_client,RevisionedClient) else qdrant_client,
+            lambda text:get_semantic_query_embedding(text,8),EMBEDDING_DIMENSION,OPENAI_EMBEDDING_MODEL,
+            provider_judge(openai_client,model,os.getenv('GROUNDING_CITATION_MODE','span_id'),source_kind='metadata'))
+        return GroundedSearch(base,provider_judge(openai_client,model,os.getenv('GROUNDING_CITATION_MODE','span_id')),model,current_revision,snapshot_read,snapshot_write,(OPENAI_EMBEDDING_MODEL,EMBEDDING_DIMENSION,OPENAI_TEXT_MODEL),snapshot_lock=snapshot_lock,metadata_search=metadata_index.search,
             title_intent=grounded_title_intent,title_indexed=str(getattr(source_info.payload_schema.get('video_title'),'data_type','')) in {'text','PayloadSchemaType.TEXT'},
             summary_indexed_fields=[field for field in SUMMARY_FIELDS if str(getattr(source_info.payload_schema.get(field),'data_type',''))in{'text','PayloadSchemaType.TEXT'}])
 
@@ -2537,6 +2543,20 @@ def process_video_task(data_dict: dict):
             except Exception as we:
                 logger.error(f"[WORKER] Webhook error notification failed: {str(we)}")
         raise
+
+class ManualMetadataDocument(BaseModel):
+    video_id: int = Field(gt=0)
+    title: str = Field(max_length=2000)
+    tags: List[str] = Field(min_length=1,max_length=100)
+    fingerprint: str = Field(pattern=r'^[a-f0-9]{64}$')
+
+@app.post('/metadata/index')
+async def index_manual_metadata(data:ManualMetadataDocument,authorized:bool=Depends(verify_api_key)):
+    from manual_metadata import ManualMetadata
+    if any(not tag.strip()or len(tag)>50 for tag in data.tags):raise HTTPException(422,'Invalid manual tags')
+    service=ManualMetadata(qdrant_client.client,lambda text:get_semantic_query_embedding(text,20),EMBEDDING_DIMENSION,OPENAI_EMBEDDING_MODEL,None)
+    fingerprint=await asyncio.to_thread(service.index,data.model_dump())
+    return {'status':'completed','fingerprint':fingerprint}
 
 @app.post("/embed-video", status_code=202)
 async def embed_video(data: EmbedVideoRequest, authorized: bool = Depends(verify_api_key)):
@@ -3793,6 +3813,7 @@ async def search_incremental(data: IncrementalSearchRequest, authorized: bool = 
         transcript_contract=data.transcript_contract,
         verify_relevance=data.verify_relevance,
         summary_candidates=data.summary_candidates,
+        metadata_registry=data.metadata_registry,
         allowed_video_ids=data.allowed_video_ids,authorization_scope=data.authorization_scope,scope_revision=data.scope_revision,index_revision=getattr(data,"index_revision",None),
         top_k=delegate_top_k,
         video_id=data.video_id,

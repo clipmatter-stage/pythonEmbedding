@@ -93,7 +93,7 @@ def transcript_results(rows,query,contract='normalized'):
     return results
 
 def search_session_binding(request):
-    fields=['query','words','word','search_mode','filter_type','transcript_contract','video_id','speaker','title','language','time_range','filter_year','filter_month','filter_date','query_decomposition_mode','summary_candidates','min_score','allowed_video_ids','authorization_scope','scope_revision','index_revision','verify_relevance']
+    fields=['query','words','word','search_mode','filter_type','transcript_contract','video_id','speaker','title','language','time_range','filter_year','filter_month','filter_date','query_decomposition_mode','metadata_registry','summary_candidates','min_score','allowed_video_ids','authorization_scope','scope_revision','index_revision','verify_relevance']
     data={key:getattr(request,key,None) for key in fields}
     data.update(rules_version=VERSION,build=os.getenv('RAILWAY_GIT_COMMIT_SHA','development'),pipeline=os.getenv('SEARCH_PIPELINE','fast'),judge_model=os.getenv('SEARCH_JUDGE_MODEL',os.getenv('OPENAI_TEXT_MODEL','gpt-6-luna')))
     data.update(identity_version='speaker_identity_v2',citation_mode=os.getenv('GROUNDING_CITATION_MODE','span_id'))

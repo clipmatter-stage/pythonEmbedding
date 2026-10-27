@@ -23,7 +23,7 @@ def search_rules_fingerprint():
     files=('grounded_search.py','grounded_validation.py','fast_search.py','contextual_search.py',
            'grounded_title_search.py','grounded_summary_search.py','transcript_search_contract.py',
            'search_contract_v1.json','semantic_query_decomposition.py','speaker_identity.py',
-           'semantic_passage_evidence.py','exact_lexical.py','embeddings_service.py')
+           'semantic_passage_evidence.py','exact_lexical.py','embeddings_service.py','manual_metadata.py')
     digest=hashlib.sha256()
     for name in files:
         source=(Path(__file__).parent/name).read_bytes()
@@ -141,7 +141,8 @@ def ranked_diverse(rows,limit):
     return diverse(rows,limit)
 
 class GroundedSearch:
-    def __init__(self,base,judge,model,revision,read_cache,write_cache,embedding_contract,title_intent=None,title_indexed=False,summary_indexed_fields=(),snapshot_lock=None):
+    def __init__(self,base,judge,model,revision,read_cache,write_cache,embedding_contract,title_intent=None,title_indexed=False,summary_indexed_fields=(),snapshot_lock=None,metadata_search=None):
+        self.metadata_search=metadata_search
         self.snapshot_lock=snapshot_lock
         self.title_intent=title_intent;self.title_indexed=title_indexed;self.summary_indexed_fields=tuple(summary_indexed_fields)
         self.base=base;self.base.payload_fields=FIELDS;self.judge=judge;self.model=model;self.revision=revision;self.read_cache=read_cache;self.write_cache=write_cache;self.embedding_contract=embedding_contract
@@ -169,6 +170,7 @@ class GroundedSearch:
             if self.revision()!=epoch:raise ValidationUnavailable('Search index changed',reason='search_index_changed')
             result=copy.deepcopy(cached);meta=result['metadata']['passage_validation'];meta['cache_hit']=True;meta['cached_provider_calls']=meta['provider_calls'];meta['provider_calls']=0;meta['provider_usage']=[];result['ranking']['embedding_usage']=[];result['ranking']['timings']['total_seconds']=round(time.monotonic()-started,3);return result
         original=semantic_query_text(request)
+        metadata_rows=self.metadata_search(request)if self.metadata_search else []
         from grounded_title_search import title_candidates,merge_title_candidates
         from grounded_summary_search import summary_candidates,merge_summary_candidates
         title_rows=[];title_metadata={'matching_videos':0,'elapsed_seconds':0,'warnings':[],'exhaustive':True}
@@ -198,6 +200,8 @@ class GroundedSearch:
                     'evidence_verified':False,'candidate_sources':['video_title','video_summary'],
                     'candidates_retrieved':len({r['video_id']for r in [*title_rows,*summary_rows]}),'embedding_usage':[],'index_revision':epoch,
                     'timings':{'title_seconds':title_metadata['elapsed_seconds'],'summary_seconds':summary_metadata['elapsed_seconds'],'total_seconds':round(time.monotonic()-started,3)}}}
+            from manual_metadata import merge_metadata
+            result=merge_metadata(result,metadata_rows,request.top_k)
             if stable_snapshot(metadata,title_metadata,summary_metadata):self.write_cache(cache_key,result,SNAPSHOT_TTL)
             return result
         changes={'query':semantic_gloss(original),'word':None,'words':[],'top_k':self.base.settings.candidate_limit}
@@ -314,6 +318,8 @@ class GroundedSearch:
         if any(r.get('is_video_only')for r in merged):result['ranking']['score_type']='mixed_source_relevance'
         result['ranking']['timings']['title_seconds']=title_metadata['elapsed_seconds']
         result['ranking']['timings']['summary_seconds']=summary_metadata['elapsed_seconds']
+        from manual_metadata import merge_metadata
+        result=merge_metadata(result,metadata_rows,request.top_k)
         if stable_snapshot(metadata,title_metadata,summary_metadata):self.write_cache(cache_key,result,SNAPSHOT_TTL)
         return result
 
