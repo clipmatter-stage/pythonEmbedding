@@ -18,7 +18,7 @@ from openai import OpenAI
 from qdrant_client import QdrantClient, models
 from redis import Redis
 
-from grounded_search import FIELDS, contextual_candidate
+from grounded_search import CONTEXT_PAD_SECONDS, FIELDS, contextual_candidate
 from grounded_validation import candidate_id, provider_judge, validate_grounded, VERSION, SYSTEM
 from speaker_identity import view
 
@@ -35,7 +35,7 @@ def live_reference():
             or focus.get('approval_status') != 'approved' or focus.get('is_archived') is not False):
         raise RuntimeError('Live reference is not eligible')
     conditions = [models.FieldCondition(key='video_id', match=models.MatchValue(value=592)),
-        models.FieldCondition(key='start_time', range=models.Range(gte=max(0, focus['start_time']-20), lte=focus['end_time']+20))]
+        models.FieldCondition(key='start_time', range=models.Range(gte=max(0, focus['start_time']-CONTEXT_PAD_SECONDS), lte=focus['end_time']+CONTEXT_PAD_SECONDS))]
     for key, value in [('processing_status', 'completed'), ('approval_status', 'approved'), ('is_archived', False)]:
         conditions.append(models.FieldCondition(key=key, match=models.MatchValue(value=value)))
     neighbors, offset = client.scroll(collection, scroll_filter=models.Filter(must=conditions),
@@ -71,7 +71,7 @@ def frozen_website_batch(reference):
         point=client.retrieve(collection,ids=[entry['point_id']],with_payload=True,with_vectors=False)[0]
         focus={'id':str(point.id),**view(point.payload or{})}
         conditions=[models.FieldCondition(key='video_id',match=models.MatchValue(value=focus['video_id'])),
-            models.FieldCondition(key='start_time',range=models.Range(gte=max(0,focus['start_time']-20),lte=focus['end_time']+20))]
+            models.FieldCondition(key='start_time',range=models.Range(gte=max(0,focus['start_time']-CONTEXT_PAD_SECONDS),lte=focus['end_time']+CONTEXT_PAD_SECONDS))]
         for key,value in [('processing_status','completed'),('approval_status','approved'),('is_archived',False)]:
             conditions.append(models.FieldCondition(key=key,match=models.MatchValue(value=value)))
         neighbors,offset=client.scroll(collection,scroll_filter=models.Filter(must=conditions),limit=100,with_payload=FIELDS,with_vectors=False)

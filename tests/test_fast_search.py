@@ -7,7 +7,7 @@ from unittest.mock import Mock, patch
 
 from qdrant_client import QdrantClient, models
 from backfill_sparse_search import backfill
-from fast_search import FastSemanticSearch, FastSearchSettings, SPARSE_NAME, lexical_vector, with_sparse_vectors
+from fast_search import FastSemanticSearch, FastSearchSettings, SPARSE_NAME, grouped_points, lexical_vector, with_sparse_vectors
 
 
 def request(**changes):
@@ -200,6 +200,27 @@ class FastSearchTest(unittest.TestCase):
             result=self.service.search(request(query='namaz ki talqeen'))
         self.assertEqual([5922],[r['id']for r in result['results']])
         self.assertEqual(prayer.payload['text'],result['results'][0]['text'])
+
+    def test_grouped_points_keep_a_second_passage_when_firsts_fill_the_cap(self):
+        groups = [[f'v{i}a', f'v{i}b'] for i in range(30)]
+        chosen = grouped_points(groups, 20)
+        self.assertEqual(20, len(chosen))
+        self.assertIn('v0a', chosen)
+        self.assertIn('v0b', chosen)
+        self.assertLess(chosen.index('v0a'), chosen.index('v0b'))
+        # Room in the cap still admits every second passage, in the old order.
+        self.assertEqual(['a', 'b', 'c'], grouped_points([['a'], ['b', 'c']], 10))
+
+    def test_full_candidate_cap_keeps_the_top_videos_second_passage(self):
+        self.service.diversify_candidates = True
+        self.service.settings = FastSearchSettings(candidate_limit=20)
+        self.service.embed = lambda q: [1., 0.]
+        self.put(9001, 'مکہ میں عمومی بات', [1., 0.], video_id=1087, start_time=10, end_time=20)
+        self.put(9002, 'ایران اور ترکی کو معاہدے میں شامل کیا جائے', [0.2, 0.9], video_id=1087, start_time=31, end_time=77)
+        for offset in range(30):
+            self.put(9100 + offset, 'غیر متعلق', [0.7, 0.2], video_id=5000 + offset, start_time=1, end_time=5)
+        result = self.service.search(request(query='مکہ معاہدہ', top_k=40))
+        self.assertIn(9002, {row['id'] for row in result['results']})
 
     def test_service_keeps_every_legacy_route(self):
         root = Path(__file__).resolve().parents[1]

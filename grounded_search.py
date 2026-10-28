@@ -64,6 +64,9 @@ def stable_snapshot(metadata,title,summary):
         and not (set(summary.get('warnings',[])) - {'summary_retrieval_bounded'}))
 
 FIELDS=IDENTITY_FIELDS+['video_id','segment_index','text','speaker','transcript_speaker','diarization_speaker','start_time','end_time','timestamp_unit','video_title','youtube_url','language','video_created_at']
+# coherent_passage will join up to 60s of consecutive turns. The scroll has to
+# reach the far end of that span from a short focus segment.
+CONTEXT_PAD_SECONDS=60
 def diverse(rows,limit,key="retrieval_score"):
     groups=defaultdict(list)
     for row in sorted(rows,key=lambda r:(-r.get(key,r['score']),str(r['video_id']),str(r['id']))):groups[row['video_id']].append(row)
@@ -141,6 +144,33 @@ def ranked_diverse(rows,limit):
     # Give each retrieved video one verification slot before second passages.
     if limit<=0:return []
     return diverse(rows,limit)
+
+def validation_rows(pool,initial,maximum):
+    """One passage per video, then that video's next passage, then new videos.
+
+    Half of the spare validation slots (at least the next passage when only
+    one slot remains) go to the second sentence of videos already selected.
+    Otherwise a lower-ranked video's best hit crowds out the sentence that
+    actually carries the requested qualifier.
+    """
+    if maximum<=0:return []
+    primary=ranked_diverse(pool,min(initial,maximum))
+    chosen={str(row['id']) for row in primary}
+    grouped=defaultdict(list)
+    for row in pool:grouped[row['video_id']].append(row)
+    followups=[]
+    for row in primary:
+        hits=sorted(grouped.get(row['video_id'],[]),key=lambda item:(-item.get('retrieval_score',item.get('score',0)),str(item['id'])))
+        for hit in hits:
+            if str(hit['id']) not in chosen:
+                followups.append(hit);break
+    room=maximum-len(primary)
+    follow_budget=min(len(followups),room//2) if room>=2 else min(len(followups),room)
+    followups=followups[:follow_budget]
+    chosen.update(str(row['id']) for row in followups)
+    rest_budget=maximum-len(primary)-len(followups)
+    rest=ranked_diverse([row for row in pool if str(row['id']) not in chosen],rest_budget) if rest_budget>0 else []
+    return primary+followups+rest
 
 class GroundedSearch:
     def __init__(self,base,judge,model,revision,read_cache,write_cache,embedding_contract,title_intent=None,title_indexed=False,summary_indexed_fields=(),snapshot_lock=None,metadata_search=None):
@@ -236,13 +266,15 @@ class GroundedSearch:
         named={normalize(name)for name in [speaker,*variants]if name}
         pool=response['results']
         if speaker:pool=[r for r in pool if passes_constraint(r,speaker,variants) or (named and normalize(r.get('speaker') or '') in named)]
-        rows=ranked_diverse(pool,initial)
-        chosen={str(row['id'])for row in rows}
-        rows+=ranked_diverse([row for row in pool if str(row['id'])not in chosen],maximum-len(rows))if len(rows)<maximum else []
+        selected=validation_rows(pool,initial,maximum)
         from asr_search import reserve_candidates
         reserved=reserve_candidates(original,pool)
-        reserved_ids={str(row['id'])for row in reserved}
-        rows=[*reserved,*[row for row in rows if str(row['id'])not in reserved_ids]][:maximum]
+        seen=set();rows=[]
+        for row in [*reserved,*selected]:
+            identity=str(row['id'])
+            if identity in seen:continue
+            seen.add(identity);rows.append(row)
+            if len(rows)>=maximum:break
         trace=[{'point_id':str(r['id']),'video_id':r['video_id'],'stage':'candidate_retrieval',
                 'retrieval_score':r.get('retrieval_score',r['score']),
                 'selected_for_context':str(r['id'])in{str(x['id'])for x in rows}}for r in response['results']]
@@ -267,7 +299,7 @@ class GroundedSearch:
             if time.monotonic()>=deadline:warnings.append('validation_budget_reached');break
             focus=rows[offset:offset+initial];tick=time.monotonic()
             windows=[models.Filter(must=[models.FieldCondition(key='video_id',match=models.MatchValue(value=r['video_id'])),
-                models.FieldCondition(key='start_time',range=models.Range(gte=max(0,r['start_time']-20),lte=r['end_time']+20))])for r in focus]
+                models.FieldCondition(key='start_time',range=models.Range(gte=max(0,r['start_time']-CONTEXT_PAD_SECONDS),lte=r['end_time']+CONTEXT_PAD_SECONDS))])for r in focus]
             window=models.Filter(must=[*filters.must,models.Filter(should=windows)])
             points,next_offset=self.base.client.scroll(collection_name=self.base.collection,scroll_filter=window,
                 limit=500,with_payload=FIELDS,with_vectors=False,timeout=6);context_reads+=1

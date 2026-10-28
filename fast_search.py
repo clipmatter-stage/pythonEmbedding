@@ -25,6 +25,33 @@ from transcript_search_contract import valid_interval, semantic_query_text
 SPARSE_NAME = "lexical_tf_v1"
 
 
+def grouped_points(groups, limit, second_slots=8):
+    """Best hit per video, then the next hit of the strongest videos.
+
+    Grouped retrieval already asks for two hits per video. Emitting every
+    best hit before any second hit drops that later sentence once unique
+    videos fill `limit`. The second sentence of a top-ranked video can be
+    the one that carries a qualifier the best hit lacks.
+    """
+    lists = [list(hits) for hits in groups if hits]
+    if limit <= 0 or not lists:
+        return []
+    firsts = [hits[0] for hits in lists]
+    seconds = [hits[1] for hits in lists if len(hits) > 1]
+    if len(firsts) >= limit and seconds and limit > 1:
+        reserve = min(len(seconds), second_slots, limit // 2)
+        if reserve:
+            return firsts[:limit - reserve] + seconds[:reserve]
+    chosen = []
+    for depth in range(2):
+        for hits in lists:
+            if len(hits) > depth:
+                chosen.append(hits[depth])
+                if len(chosen) >= limit:
+                    return chosen
+    return chosen
+
+
 def lexical_tokens(text):
     text = unicodedata.normalize("NFKC", str(text)).casefold()
     text = text.translate(str.maketrans({"ي": "ی", "ى": "ی", "ك": "ک"}))
@@ -314,14 +341,16 @@ class FastSemanticSearch:
                     point.score = (video_ranks[video_id]
                                    + (1 / 61 if strong_keyword(identity) else 0.0)
                                    + (0.25 / 61) * alignments.get(identity, 0.0))
-                # One best passage per video before admitting second passages.
+                # One best passage per video, then the next passage of the
+                # strongest videos. A full candidate cap must not discard
+                # those second sentences.
                 buckets = defaultdict(list)
                 for point in points: buckets[(point.payload or {}).get('video_id')].append(point)
-                points = [hits[depth] for depth in range(2) for hits in buckets.values() if len(hits)>depth][:limit]
+                points = grouped_points(buckets.values(), limit)
             else:
                 arguments.update(group_by='video_id', group_size=2)
                 groups = self.client.query_points_groups(**arguments).groups
-                points = [group.hits[depth] for depth in range(2) for group in groups if len(group.hits)>depth][:limit]
+                points = grouped_points((group.hits for group in groups), limit)
         else:
             points = self.client.query_points(**arguments).points
         retrieved = time.perf_counter()

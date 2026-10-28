@@ -116,7 +116,7 @@ class SearchTests(unittest.TestCase):
   queries=[];judge=self.engine.judge
   self.engine.judge=lambda query,rows,timeout:(queries.append(query)or judge(query,rows,timeout))
   first=self.engine.search(request(query='Makkah'));calls=self.calls
-  for query in ['makkah','MAKKAH','Mecca','مکہ المکرمہ']:
+  for query in ['makkah','MAKKAH','Mecca','مکہ المکرمہ','makh','makka']:
    result=self.engine.search(request(query=query))
    self.assertEqual(first['results'],result['results']);self.assertEqual(query,result['query'])
    self.assertTrue(result['metadata']['passage_validation']['cache_hit'])

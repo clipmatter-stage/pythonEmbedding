@@ -11,7 +11,10 @@ import unicodedata
 from semantic_passage_evidence import consolidate_candidates, validate_passages, RetrievalBudgetReached
 CONFIG=json.loads(pathlib.Path(__file__).with_name('search_contract_v1.json').read_text())
 VERSION=CONFIG['version']
-GROUNDED_STRATEGY_VERSION='speaker_scoped_title_summary_transcript_v13_speaker_constraint'
+# v14 keeps a selected video's next passage in the validation set and folds
+# near-miss Roman tokens onto reviewed alias families. The grounded judgment
+# cache is keyed by this version (7-day TTL), so a stale no_matches is not replayed.
+GROUNDED_STRATEGY_VERSION='speaker_scoped_title_summary_transcript_v14_neighbor_passage'
 
 def semantic_query_text(request):
     """Combine legacy input fields without repeating query-derived keywords.
