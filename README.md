@@ -42,11 +42,19 @@ Summary search keeps its existing evidence requirements and can still be slow.
 ## Grounded contextual verification (optional)
 
 `SEARCH_PIPELINE=grounded` uses a cached, six-second-budget translation plan to
-retrieve the original query and faithful Urdu, Roman Urdu and English equivalents
-(at most four cached query embeddings, requested concurrently). It combines dense
-retrieval with the existing sparse keyword index, or an indexed `text` keyword
-lane when sparse vectors are unavailable. If neither keyword index is available,
-the response reports `keyword_index_unavailable`; it does not claim hybrid coverage.
+retrieve the proposition (search instructions such as "find the clip" removed)
+plus short spoken Urdu, Roman Urdu and English forms of that same proposition,
+falling back to faithful translations of the complete query. At most four query
+embeddings are requested concurrently. A shared audience word does not outrank a
+passage that covers the proposition; the original query is still what the judge
+checks. It combines dense retrieval with the existing sparse keyword index, or an
+indexed `text` keyword lane when sparse vectors are unavailable. If neither
+keyword index is available, the response reports `keyword_index_unavailable`; it
+does not claim hybrid coverage. `verify_relevance: true` selects this path on
+`/search` and `/search/incremental` even when `SEARCH_PIPELINE` is `fast`.
+`min_score` filters the judge's relevance score after retrieval. It is not a
+dense-vector cutoff. Grounded positives already require a judge score of at
+least 0.65, so a UI floor of 0.50 does not drop them.
 Qdrant groups each retrieval lane by video before truncation, retaining at most
 two passages per video per lane. Rank fusion combines votes at video level,
 including when different languages retrieve different passages of the same

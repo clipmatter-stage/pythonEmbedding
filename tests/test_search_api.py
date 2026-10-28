@@ -125,6 +125,8 @@ class SearchApiTest(unittest.TestCase):
         self.assertEqual(['نماز کی تلقین','namaz ki talqeen','encouraging prayer'],first['queries'])
         self.assertNotIn('semantic_query',first)
         self.assertIn('COMPLETE INPUT',calls[0]['messages'][0]['content'])
+        self.assertIn('spoken_queries',calls[0]['messages'][0]['content'])
+        self.assertEqual([],first.get('spoken_queries'))
 
     def test_failed_query_plan_is_not_cached_and_later_success_is_shared(self):
         good={'understanding_status':'enabled','retrieval_queries':['نماز کی تلقین','encouragement to pray'],
