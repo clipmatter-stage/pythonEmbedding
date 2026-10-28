@@ -22,10 +22,13 @@ def unknown_label(row):
 
 def view(row):
     out=dict(row)
+    source_label=row.get('source_speaker_label')
+    if not source_label:
+        source_label=row.get('speaker') or ''
     name=(row.get('identity_name')or row.get('speaker')or UNKNOWN)if supported(row)else UNKNOWN
     if supported(row)and row.get('identity_key')=='hafiz_naeem_ur_rehman':name='Hafiz Naeem Ur Rehman'
     out['source_identity_group']=row.get('source_identity_group')or hashlib.sha256(json.dumps([row.get('video_id'),row.get('transcript_speaker')or row.get('diarization_speaker'),row.get('speaker')],ensure_ascii=False).encode()).hexdigest()
-    out.update(speaker=name,speaker_display_name=unknown_label(row) if name==UNKNOWN else name,identity_name=name,identity_key=row.get('identity_key')if supported(row)else None,identity_status=row.get('identity_status')if supported(row)else 'unknown',identity_version=VERSION)
+    out.update(speaker=name,speaker_display_name=unknown_label(row) if name==UNKNOWN else name,identity_name=name,identity_key=row.get('identity_key')if supported(row)else None,identity_status=row.get('identity_status')if supported(row)else 'unknown',identity_version=VERSION,source_speaker_label=source_label)
     return out
 
 def patch_identity(client,collection,video_id,changes,*,rollback=False,dry_run=True):

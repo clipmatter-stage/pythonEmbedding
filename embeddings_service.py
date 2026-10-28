@@ -36,6 +36,7 @@ from contextual_search import (
 from fast_search import FastSemanticSearch, SPARSE_NAME, with_sparse_vectors
 from index_recovery_contract import lexical, valid_vector
 from semantic_query_decomposition import decompose_semantic_query
+from speaker_constraint import constraint_names, leading_person_key, refine_speaker_query
 from speaker_identity import view as identity_view, SearchIdentityClient, FIELDS as IDENTITY_FIELDS, speaker_search
 from transcript_search_contract import contract_search, search_session_binding, indexed_text_fields, valid_interval
 from semantic_passage_evidence import (
@@ -1296,10 +1297,15 @@ def get_contextual_search(pipeline_override: Optional[str] = None) -> Contextual
         raise ValueError("SEARCH_PIPELINE must be grounded, fast or verified")
 
     def analyze(query):
-        alias = detect_person_alias(query)
+        alias = detect_person_alias(query) or leading_person_key(query, PERSON_ALIASES)
         canonical = PERSON_ALIASES[alias]["canonical"] if alias else None
         aliases = PERSON_ALIASES[alias]["aliases"] if alias else []
-        decomposition = decompose_semantic_query(query, canonical, aliases)
+        names = constraint_names(alias, PERSON_ALIASES) if alias else []
+        decomposition = refine_speaker_query(query, decompose_semantic_query(query, canonical, aliases), canonical, names)
+        if decomposition.get("intent") == "speaker_only":
+            return {"semantic_query": query, "understanding_status": "disabled",
+                "extracted_speaker": canonical, "query_type": "speaker_only",
+                "query_decomposition": decomposition}
         topic = str(decomposition["retrieval_query"])
         use_llm = (os.getenv("SEARCH_LLM_UNDERSTANDING", "false").lower() == "true" if pipeline in {"fast","grounded"}
                    else os.getenv("USE_LLM_UNDERSTANDING", "true").lower() == "true")
@@ -1318,8 +1324,10 @@ def get_contextual_search(pipeline_override: Optional[str] = None) -> Contextual
         return {**intent, "query_decomposition": decomposition}
 
     def speaker_values(speaker):
-        alias = _ALIAS_LOOKUP.get(speaker.lower().strip())
-        return PERSON_ALIASES[alias]["speaker_variants"] if alias else []
+        if not speaker:
+            return []
+        alias = _ALIAS_LOOKUP.get(speaker.lower().strip()) or detect_person_alias(speaker)
+        return constraint_names(alias, PERSON_ALIASES) if alias else []
 
     def validate(query, candidates, speaker):
         names = requested_speaker_names(query, PERSON_ALIASES, speaker)

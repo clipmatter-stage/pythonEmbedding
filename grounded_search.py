@@ -1,6 +1,7 @@
 """Diverse semantic candidates -> original nearby turns -> one grounded rerank.
 No embedding-space change or new identity assertions. Exact matching is separate.
 """
+from speaker_constraint import passes_constraint
 from speaker_identity import view as identity_view, FIELDS as IDENTITY_FIELDS, supported as identity_supported
 import ast,copy,hashlib,json,time,os,re
 from dataclasses import asdict
@@ -24,7 +25,7 @@ def search_rules_fingerprint():
            'grounded_title_search.py','grounded_summary_search.py','transcript_search_contract.py',
            'search_contract_v1.json','semantic_query_decomposition.py','speaker_identity.py',
            'semantic_passage_evidence.py','exact_lexical.py','embeddings_service.py','manual_metadata.py','asr_search.py',
-           'intent_retrieval.py')
+           'intent_retrieval.py','speaker_constraint.py')
     digest=hashlib.sha256()
     for name in files:
         source=(Path(__file__).parent/name).read_bytes()
@@ -223,6 +224,8 @@ class GroundedSearch:
         semantic_started=time.monotonic()
         with capture_embeddings() as embedding_usage:response=self.base.search(expanded,video_ids)
         retrieved=time.monotonic()
+        if response.get('speaker_only'):
+            return self._speaker_speeches(request,response,original,title_rows,title_metadata,summary_rows,summary_metadata,started,epoch,cache_key)
         decomposition=response.get('query_decomposition')or{}
         speaker=request.speaker or response.get('speaker_filter')
         # Only deterministic decomposition may remove an actor from the judge's
@@ -232,7 +235,7 @@ class GroundedSearch:
         variants=self.base.speaker_values(speaker)if speaker and self.base.speaker_values else []
         named={normalize(name)for name in [speaker,*variants]if name}
         pool=response['results']
-        if named:pool=[r for r in pool if normalize(r.get('speaker',''))in named]
+        if speaker:pool=[r for r in pool if passes_constraint(r,speaker,variants) or (named and normalize(r.get('speaker') or '') in named)]
         rows=ranked_diverse(pool,initial)
         chosen={str(row['id'])for row in rows}
         rows+=ranked_diverse([row for row in pool if str(row['id'])not in chosen],maximum-len(rows))if len(rows)<maximum else []
@@ -337,6 +340,41 @@ class GroundedSearch:
         result['ranking']['timings']['summary_seconds']=summary_metadata['elapsed_seconds']
         from manual_metadata import merge_metadata
         result=merge_metadata(result,metadata_rows,request.top_k)
+        if stable_snapshot(metadata,title_metadata,summary_metadata):self.write_cache(cache_key,result,SNAPSHOT_TTL)
+        return result
+
+    def _speaker_speeches(self, request, response, original, title_rows, title_metadata, summary_rows, summary_metadata, started, epoch, cache_key):
+        """Return that speaker's transcript turns without judging speech boilerplate."""
+        rows=[]
+        for row in response.get('results') or []:
+            if float(row.get('score') or 0)<request.min_score:continue
+            passage=dict(row)
+            passage['speaker_identity_status']='supported_identity' if identity_supported(passage) else 'unverified_source_label'
+            passage['segment_ids']=list(map(str, passage.get('segment_ids') or [passage['id']]))
+            passage.update(evidence_verified=False, transcript_verified=False, evidence_source='speaker_speech')
+            rows.append(passage)
+        rows=rows[:request.top_k]
+        if self.revision()!=epoch:raise ValidationUnavailable('Search index changed',reason='search_index_changed')
+        _,metadata=validate_grounded(original,[],self.judge)
+        scan=(response.get('metadata') or {}).get('speaker_scan') or {}
+        bounded=not scan.get('exhaustive', True)
+        metadata.update(status='partial' if bounded and rows else 'completed' if rows else 'no_matches',
+            reason='speaker_speech_lookup', exhaustive=not bounded, retryable=bounded,
+            original_query=original, grounding_query=original, speaker_constraint=response.get('speaker_filter'),
+            speaker_identity_authority='source_metadata_only', provider_calls=0,
+            candidate_count=len(rows), evaluated_count=len(rows))
+        result={'query':original,'words':request.words,'speaker_filter':response.get('speaker_filter'),
+            'search_mode':'semantic','results':rows,'returned':len(rows),
+            'unique_videos':len({r['video_id'] for r in rows}),
+            'metadata':{'passage_validation':metadata,'title_retrieval':title_metadata,'summary_retrieval':summary_metadata},
+            'ranking':{'engine':'speaker_speech_lookup','score_type':'speaker_speech','evidence_verified':False,
+                'candidate_sources':['transcript'],'embedding_usage':[],
+                'candidates_retrieved':(response.get('ranking') or {}).get('candidates_retrieved', len(rows)),
+                'index_revision':epoch,'model':self.model,'rules_version':VERSION,
+                'timings':{'retrieval_seconds':0,'context_seconds':0,'validation_seconds':0,
+                    'total_seconds':round(time.monotonic()-started,3),
+                    'title_seconds':title_metadata.get('elapsed_seconds',0),
+                    'summary_seconds':summary_metadata.get('elapsed_seconds',0)}}}
         if stable_snapshot(metadata,title_metadata,summary_metadata):self.write_cache(cache_key,result,SNAPSHOT_TTL)
         return result
 
