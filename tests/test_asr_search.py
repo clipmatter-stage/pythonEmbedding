@@ -17,8 +17,29 @@ class AsrTests(unittest.TestCase):
  def test_canonicalization_does_not_remove_relationships_or_negations(self):
   from asr_search import canonical_query
   self.assertEqual('Makkah',canonical_query('makkah'))
+  self.assertEqual('Makkah',canonical_query('makh'))
+  self.assertEqual('Makkah',canonical_query('makka'))
   self.assertEqual('Makkah is not Medina',canonical_query('Makkah is not Medina'))
   self.assertEqual('makkah agreement with Iran',canonical_query('makkah agreement with Iran'))
+  self.assertEqual('makkah mohida',canonical_query('makh mohida'))
+  self.assertEqual('makkah mohida',canonical_query('makka muahida'))
+  self.assertEqual('makkah mohida',canonical_query('Makh Mohaida'))
+  self.assertEqual('مکہ معاہدے میں ایران اور ترکی کو بھی شامل کیا جائے',canonical_query('مکہ معاہدے میں ایران اور ترکی کو بھی شامل کیا جائے'))
+  self.assertEqual('gaza',canonical_query('gazza'))
+  self.assertEqual('gaza',canonical_query('ghazza'))
+  self.assertEqual('palestine',canonical_query('falastin'))
+  self.assertEqual('make a cake',canonical_query('make a cake'))
+  self.assertEqual('namaz ki talqeen',canonical_query('namaz ki talqeen'))
+
+ def test_phonetic_place_and_agreement_hints_include_native_forms(self):
+  self.assertIn('مکہ',retrieval_hints('makh mohida',[]))
+  self.assertIn('معاہدہ',retrieval_hints('makh mohida',[]))
+  self.assertIn('مکۃ المکرمہ',retrieval_hints('Makkah',[]))
+  self.assertNotIn('مکت المکرمہ',retrieval_hints('Medina mohida',['مدینہ']))
+  from asr_search import reserve_candidates
+  row={'id':'clip','video_id':1087,'text':'مکۃ المکرمہ میں دفاعی ایگریمنٹ','score':.4}
+  self.assertEqual(['clip'],[item['id'] for item in reserve_candidates('makh mohida',[row])])
+  self.assertEqual([],reserve_candidates('Medina',[row]))
 
  def test_contextual_interpretation_keeps_original_quote_and_timestamp(self):
   row={'id':'one','video_id':1087,'text':'مکت المکرمہ میں ہونے والے معاہدے پر بات ہوئی','start_time':31.,'end_time':46.,'score':.8}
