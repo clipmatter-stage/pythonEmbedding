@@ -105,7 +105,9 @@ def validate_grounded(query,candidates,judge,*,batch_size=8,max_candidates=32,ma
             accepted[key]={**row,'score':j['score'],'llm_relevance_score':j['score'],'passage_evidence':{str(i):q['quote']for i,q in enumerate(quotes)},'evidence_spans':quotes,'validation_id':key,'intent_match':True,'match_types':['semantic','grounded_passage'],'score_type':'grounded_relevance','asr_interpretation':interpretation,'asr_interpretation_authority':'text_context_inference'if interpretation else None}
         elif j['complete']or j['score']>=.65:return 'invalid_negative_judgment'
         evaluated.add(key);trace[key]={'candidate_id':key,'point_id':str(row['id']),'video_id':row['video_id'],'stage':'validation','score':j['score'],'reason':j['reason'],'accepted':key in accepted,'judgment_cache_hit':cached}
-        if not cached and write_judgment:
+        # Rejections are not stored. A related_only or specificity miss must
+        # not occupy the judgment key for the rest of the TTL.
+        if not cached and write_judgment and key in accepted:
             try:write_judgment(query,row,j)
             except Exception:pass
         return None

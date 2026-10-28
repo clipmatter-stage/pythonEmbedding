@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 from qdrant_client import QdrantClient, models
 
+from asr_search import canonical_query
 from fast_search import FastSearchSettings, FastSemanticSearch
 from grounded_search import GroundedSearch
 from grounded_validation import SYSTEM, candidate_id
@@ -196,10 +197,10 @@ class IntentRetrievalTests(unittest.TestCase):
     def _judge(self, query, rows, timeout):
         self.calls.append((query, [row["video_id"] for row in rows]))
         expected = {
-            ORGANIZE: {1, 3},
-            INVITE: {1, 3},
-            JANAMAZ: {2},
-            BY_NAME: {4},
+            canonical_query(ORGANIZE): {1, 3},
+            canonical_query(INVITE): {1, 3},
+            canonical_query(JANAMAZ): {2},
+            canonical_query(BY_NAME): {4},
         }.get(query, set())
         judgments = []
         for row in rows:
@@ -248,10 +249,10 @@ class IntentRetrievalTests(unittest.TestCase):
         organize = {row["video_id"] for row in self._accepted(ORGANIZE)["results"]}
         self.assertEqual({1, 3}, organize)
         self.assertTrue({1, 3} <= self._first_stage())
-        self.assertEqual(ORGANIZE, self.calls[0][0])
+        self.assertEqual(canonical_query(ORGANIZE), self.calls[0][0])
         invite = {row["video_id"] for row in self._accepted(INVITE)["results"]}
         self.assertEqual(organize, invite)
-        self.assertEqual(INVITE, self.calls[0][0])
+        self.assertEqual(canonical_query(INVITE), self.calls[0][0])
 
     def test_different_intents_do_not_cross_accept(self):
         self.assertEqual({2}, {row["video_id"] for row in self._accepted(JANAMAZ)["results"]})
