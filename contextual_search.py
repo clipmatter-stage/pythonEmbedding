@@ -10,7 +10,7 @@ from collections import defaultdict
 from itertools import zip_longest
 from dataclasses import dataclass
 from datetime import date
-from speaker_identity import matches_identity
+from speaker_constraint import passes_constraint
 import hashlib
 import json
 import logging
@@ -449,7 +449,7 @@ class ContextualSearch:
         # Known speaker aliases can be filtered before ANN retrieval. For an
         # arbitrary fuzzy name, use the bounded post-filter below instead.
         variants = self.speaker_values(speaker) if speaker and self.speaker_values else []
-        if variants:
+        if variants and len(variants) <= 1:
             conditions = []
             for field in ("speaker", "diarization_speaker"):
                 index_type = (self.speaker_index_types or {}).get(field)
@@ -484,7 +484,7 @@ class ContextualSearch:
                 payload = point.payload or {}
                 if not str(payload.get("text") or "").strip() or not valid_interval(payload):
                     continue
-                if speaker and not matches_identity(speaker,payload):
+                if speaker and not passes_constraint(payload, speaker, variants):
                     continue
                 if request.title and not self.title_matches(request.title, payload.get("video_title", "")):
                     continue
@@ -525,7 +525,7 @@ class ContextualSearch:
                     payload = point.payload or {}
                     if not str(payload.get("text") or "").strip() or not valid_interval(payload):
                         continue
-                    if speaker and not matches_identity(speaker,payload):
+                    if speaker and not passes_constraint(payload, speaker, variants):
                         continue
                     if request.title and not self.title_matches(request.title, payload.get("video_title", "")):
                         continue

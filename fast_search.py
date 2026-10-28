@@ -7,7 +7,7 @@ This is lexical TF-IDF, not a learned multilingual embedding or BM25 model.
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor
 from contextvars import copy_context
-from speaker_identity import view as identity_view, FIELDS as IDENTITY_FIELDS, matches_identity
+from speaker_identity import view as identity_view, FIELDS as IDENTITY_FIELDS
 from dataclasses import dataclass
 import hashlib
 import math
@@ -19,6 +19,7 @@ import unicodedata
 from qdrant_client import models
 from contextual_search import SearchInputError, source_filter, timestamp_url
 from intent_retrieval import alignment_score, compose_retrieval_queries, keyword_vote_weight
+from speaker_constraint import passes_constraint
 from transcript_search_contract import valid_interval, semantic_query_text
 
 SPARSE_NAME = "lexical_tf_v1"
@@ -85,12 +86,87 @@ class FastSemanticSearch:
         self.diversify_candidates = diversify_candidates
         self.lexical_indexed = lexical_indexed
 
+    def speaker_speeches(self, request, intent, video_ids=None):
+        """Bounded scan for one known speaker when the query has no topic.
+
+        "Hafiz Naeem bayan karte huye" asks for his speech, not for passages
+        that contain those boilerplate words. Reviewed identity and curated
+        source labels both qualify. The topic judge is not involved.
+        """
+        started = time.perf_counter()
+        query = semantic_query_text(request)
+        speaker = request.speaker or intent.get("extracted_speaker")
+        variants = self.speaker_values(speaker) if speaker and self.speaker_values else []
+        try:
+            filters = source_filter(request, video_ids)
+        except ValueError as error:
+            raise SearchInputError(str(error)) from error
+        cap = min(int(getattr(request, "max_scanned", 8000) or 8000), 8000)
+        offset = None
+        found = []
+        scanned = 0
+        while scanned < cap:
+            points, offset = self.client.scroll(
+                collection_name=self.collection, scroll_filter=filters, offset=offset,
+                limit=min(200, cap - scanned), with_payload=getattr(self, "payload_fields", True),
+                with_vectors=False, timeout=self.settings.timeout)
+            batch = points or []
+            scanned += len(batch)
+            for point in batch:
+                raw = point.payload or {}
+                if not str(raw.get("text") or "").strip() or not valid_interval(raw):
+                    continue
+                row = identity_view(raw)
+                if not passes_constraint(row, speaker, variants):
+                    continue
+                words = len(str(row.get("text") or "").split())
+                found.append({
+                    **row, "id": point.id, "segment_ids": [point.id], "match_count": 1,
+                    "score": 1.0, "retrieval_score": 1.0, "dense_score": None,
+                    "score_type": "speaker_speech", "llm_relevance_score": None,
+                    "fuzzy_score": 0.0, "matched_field": "speaker",
+                    "match_types": ["speaker_speech"], "word_count": words,
+                    "duration": row["end_time"] - row["start_time"],
+                    "youtube_url_timestamped": timestamp_url(row.get("youtube_url", ""), row["start_time"]),
+                })
+            if offset is None or not batch:
+                break
+        found.sort(key=lambda row: (-int(row["word_count"] >= 6), -row["word_count"], str(row.get("video_id")), str(row["id"])))
+        best = {}
+        for row in found:
+            best.setdefault(row.get("video_id"), row)
+        chosen = list(best.values())[:request.top_k]
+        for row in chosen:
+            row.pop("word_count", None)
+        exhaustive = offset is None
+        return {
+            "query": query, "words": request.words, "speaker_filter": speaker, "speaker_only": True,
+            "query_decomposition": intent.get("query_decomposition"),
+            "collection": self.collection, "search_mode": "semantic",
+            "total_semantic_hits": len(found), "total_speaker_hits": len(found),
+            "total_keyword_hits": 0, "total_title_hits": 0, "total_exact_phrase_hits": 0,
+            "returned": len(chosen), "unique_videos": len({row.get("video_id") for row in chosen}),
+            "metadata": {"passage_validation": None, "speaker_scan": {
+                "scanned": scanned, "matched": len(found), "exhaustive": exhaustive}},
+            "filters_applied": {"speaker": speaker, "min_score": None},
+            "ranking": {
+                "engine": "speaker_speech_scan", "score_type": "speaker_speech",
+                "score_is_probability": False, "candidate_limit": cap,
+                "candidates_retrieved": len(found), "evidence_verified": False,
+                "retrieval_warnings": [] if exhaustive else ["speaker_scan_bounded"],
+                "keyword_retrieval": "unavailable", "embedding_usage": [],
+                "timings": {"total_seconds": round(time.perf_counter() - started, 3)},
+            }, "results": chosen,
+        }
+
     def search(self, request, video_ids=None):
         started = time.perf_counter()
         query = semantic_query_text(request)
         if not query:
             raise SearchInputError("A non-empty query or words is required for semantic search")
         intent = self.understand(query)
+        if intent.get("query_type") == "speaker_only":
+            return self.speaker_speeches(request, intent, video_ids)
         semantic = intent.get("semantic_query") or query
         speaker = request.speaker or (intent.get("extracted_speaker") if intent.get("query_type") == "speaker_search" else None)
         try:
@@ -107,7 +183,10 @@ class FastSemanticSearch:
                 conditions.append(models.FieldCondition(key=field, match=models.MatchAny(any=variants)))
             elif variants and kind == "text":
                 conditions.extend(models.FieldCondition(key=field, match=models.MatchText(text=name)) for name in variants)
-        if conditions:
+        # An alias family is wider than one indexed string (Urdu labels,
+        # reviewed identity with a diarization id, close spellings). Filter
+        # those after retrieval. A single explicit speaker value still prefilters.
+        if conditions and len(variants) <= 1:
             filters.must.append(models.Filter(should=conditions))
         understanding_done = time.perf_counter()
         plan = self.retrieval_expander(semantic) if self.retrieval_expander else {}
@@ -251,7 +330,7 @@ class FastSemanticSearch:
             row = identity_view(point.payload or {})
             if not str(row.get("text") or "").strip() or not valid_interval(row):
                 continue
-            if speaker and not matches_identity(speaker,row):
+            if speaker and not passes_constraint(row, speaker, variants):
                 continue
             if request.title and not self.title_matches(request.title, row.get("video_title", "")):
                 continue

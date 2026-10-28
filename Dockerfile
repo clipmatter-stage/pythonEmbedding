@@ -33,7 +33,7 @@ COPY transcript_search_contract.py .
 COPY exact_search_cursor.py exact_lexical.py grounded_validation.py grounded_search.py search_observability.py .
 COPY grounded_title_search.py grounded_summary_search.py search_snapshots.py manual_metadata.py asr_search.py .
 COPY callback_transport.py .
-COPY index_operations.py speaker_identity.py .
+COPY index_operations.py speaker_identity.py speaker_constraint.py .
 COPY index_recovery_contract.py .
 COPY search_contract_v1.json search_snapshot_migration.json .
 COPY backfill_transcript_contract.py .
@@ -53,6 +53,10 @@ RUN python -c "from semantic_passage_evidence import validate_passages, BoundedR
 # when building a grounded plan. A missing file only showed up as a Railway
 # crash-loop after the image had already built.
 RUN python -c "from intent_retrieval import proposition, compose_retrieval_queries, alignment_score, keyword_vote_weight; assert all(callable(fn) for fn in (proposition, compose_retrieval_queries, alignment_score, keyword_vote_weight))"
+
+# fast_search imports this at module load. The contract JSON must already be
+# present: speaker_constraint reads it through transcript_search_contract.
+RUN python -c "from speaker_constraint import constraint_names, label_matches, passes_constraint, refine_speaker_query, speech_wrapper_only; assert all(callable(fn) for fn in (constraint_names, label_matches, passes_constraint, refine_speaker_query, speech_wrapper_only))"
 
 # Make startup script executable
 RUN chmod +x start.sh
