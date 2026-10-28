@@ -58,7 +58,7 @@ class ExactTests(unittest.TestCase):
   redis=Redis();reader=Reader([row(i,'IPP') for i in range(101)]);first=page(request(),reader,redis);RevisionedClient(reader,redis).upsert(points=[])
   with self.assertRaises(CursorError):page(request(exact_cursor=first['cursor']['next']),reader,redis)
  def test_multilingual_literal_normalized_alias_and_original_spans(self):
-  cases=[('IPP','I.P.P. IPPs آئی پی پی'),('falasteen','Palestine فلسطین palesteen'),('naujawan','نوجوان'),('bijli','بجلی'),('mehngai','مہنگائی'),('sood','سود'),('IMF','I.M.F. آئی ایم ایف'),('K-Electric','کے الیکٹرک'),('Interest','Sood سود Riba'),('Namaz','نماز Salah'),('Quran','قرآن'),('Tax','ٹیکس'),('Elite','اشرافیہ'),('Ghaza','غزہ'),('Youth','نوجوان'),('KE','کے الیکٹرک')]
+  cases=[('IPP','I.P.P. IPPs آئی پی پی'),('falasteen','Palestine فلسطین palesteen'),('naujawan','نوجوان'),('bijli','بجلی'),('mehngai','مہنگائی'),('sood','سود'),('IMF','I.M.F. آئی ایم ایف'),('K-Electric','کے الیکٹرک'),('Interest','Sood سود Riba'),('Namaz','نماز Salah'),('Quran','قرآن'),('Tax','ٹیکس'),('Elite','اشرافیہ'),('Ghaza','غزہ'),('Youth','نوجوان'),('KE','کے الیکٹرک'),('HNR','حافظ نعیم Hafiz Naeem ur Rehman'),('JI','جماعت اسلامی Jamaat-e-Islami')]
   for query,text in cases:
    spans=CompiledMatcher(query,'alias').spans(text);self.assertTrue(spans,(query,text))
    for span in spans:self.assertEqual(span['text'],text[span['start']:span['end']])
