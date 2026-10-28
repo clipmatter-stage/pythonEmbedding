@@ -463,7 +463,7 @@ class SearchApiTest(unittest.TestCase):
 
     def test_literal_normalized_alias_contracts_reach_new_endpoint(self):
         self.put(9010, "IPP I.P.P. آئی پی پی ipp", video_id=9010)
-        for contract, count in [("literal", 1), ("normalized", 3), ("alias", 4)]:
+        for contract, count in [("literal", 1), ("normalized", 4), ("alias", 4)]:
             response = asyncio.run(self.api.search(self.api.SearchRequest(
                 query="IPP", video_id=9010, search_mode="simple", filter_type="text", transcript_contract=contract,
             ), True))

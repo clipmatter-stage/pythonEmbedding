@@ -62,7 +62,7 @@ class ExactTests(unittest.TestCase):
   for query,text in cases:
    spans=CompiledMatcher(query,'alias').spans(text);self.assertTrue(spans,(query,text))
    for span in spans:self.assertEqual(span['text'],text[span['start']:span['end']])
-  self.assertEqual([],CompiledMatcher('Gaza','alias').spans('Palestine فلسطین'));self.assertEqual([],CompiledMatcher('bijli','literal').spans('بجلی'));self.assertEqual([],CompiledMatcher('IPP','normalized').spans('shipping IPProvider'));self.assertEqual(.9,title_score('Press Conference_Hafiz Naeem (25-10-22)','Hafiz Naeem'))
+  self.assertEqual([],CompiledMatcher('Gaza','alias').spans('Palestine فلسطین'));self.assertEqual([],CompiledMatcher('bijli','literal').spans('بجلی'));self.assertEqual([],CompiledMatcher('IPP','normalized').spans('shipping IPProvider'));self.assertEqual(3,len(CompiledMatcher('I.P.P.','normalized').spans('I.P.P. IPPs آئی پی پی')));self.assertEqual(3,len(CompiledMatcher('آئی پی پی','normalized').spans('I.P.P. IPPs آئی پی پی')));self.assertEqual(2,len(CompiledMatcher('I.M.F.','normalized').spans('IMF آئی ایم ایف IMForce')));self.assertEqual(.9,title_score('Press Conference_Hafiz Naeem (25-10-22)','Hafiz Naeem'))
  def test_failure_does_not_advance_cursor(self):
   redis=Redis();reader=Reader([row(i,'IPP') for i in range(101)]);first=page(request(),reader,redis);q=request(exact_cursor=first['cursor']['next']);before=copy.deepcopy(redis.data);old=reader.scroll
   def fail(**kw):raise TimeoutError()

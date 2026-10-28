@@ -30,28 +30,59 @@ def semantic_query_text(request):
         parts.append(text);tokens.extend(wanted)
     return ' '.join(parts)
 
-def normalized_with_spans(text):
+_FOLD=str.maketrans({'ي':'ی','ى':'ی','ك':'ک'})
+
+def _graphemes(text):
+    """Base character plus following combining marks, so NFKC can recompose."""
+    text=str(text);i=0;n=len(text)
+    while i<n:
+        j=i+1
+        while j<n and unicodedata.category(text[j]).startswith('M'):j+=1
+        yield i,j;i=j
+
+def _char_normalize(text):
     chars=[];spans=[]
-    for match in re.finditer(r'.[\u0300-\u036f]*',str(text),re.DOTALL):
-        normalized=unicodedata.normalize('NFKC',match.group()).casefold().translate(str.maketrans({'ي':'ی','ى':'ی','ك':'ک'}))
+    for start,end in _graphemes(text):
+        normalized=unicodedata.normalize('NFKC',text[start:end]).casefold().translate(_FOLD)
         for char in normalized:
             value=char if char.isalnum() or char=='_' or unicodedata.category(char).startswith('M') else ' '
             if value==' ' and (not chars or chars[-1]==' '):continue
-            chars.append(value);spans.append((match.start(),match.end()))
+            chars.append(value);spans.append((start,end))
     if chars and chars[-1]==' ':chars.pop();spans.pop()
-    value=''.join(chars)
-    for acronym,letters in CONFIG['acronyms'].items():
-        pattern=r'(?<!\w)'+' +'.join(map(re.escape,letters))+r'(?!\w)'
-        for m in reversed(list(re.finditer(pattern,value))):
-            letter_offsets=[i for i in range(m.start(),m.end()) if value[i]!=' ']
-            replacement=[spans[i] for i in letter_offsets]
-            spans[m.start():m.end()]=replacement
-            value=value[:m.start()]+acronym+value[m.end():]
+    return ''.join(chars),spans
 
-    # Orthographic plural of this acronym; this is not topic expansion.
-    for m in reversed(list(re.finditer(r'(?<!\w)ipps(?!\w)',value))):
-        original=spans[m.start():m.end()];spans[m.start():m.end()]=original[:2]+[(original[2][0],original[3][1])]
-        value=value[:m.start()]+'ipp'+value[m.end():]
+def _replace_tokens(value,spans,patterns):
+    """Collapse a whole token to its canonical acronym. Spans keep original offsets."""
+    for pattern,canonical in patterns:
+        for m in reversed(list(pattern.finditer(value))):
+            if m.start()==m.end() or m.end()>len(spans):continue
+            source=(spans[m.start()][0],spans[m.end()-1][1])
+            spans[m.start():m.end()]=[source]*len(canonical)
+            value=value[:m.start()]+canonical+value[m.end():]
+    return value,spans
+
+def _acronym_patterns():
+    """Spaced Latin letters, then reviewed spellings. Not a synonym list."""
+    letters=[];spellings=[]
+    for acronym,spec in CONFIG['acronyms'].items():
+        glyphs=spec['letters'] if isinstance(spec,dict) else list(spec)
+        letters.append((re.compile(r'(?<!\w)'+' +'.join(map(re.escape,glyphs))+r'(?!\w)'),acronym))
+        for spelling in (spec.get('spellings',[]) if isinstance(spec,dict) else []):
+            surface=_char_normalize(spelling)[0]
+            if surface and surface!=acronym:
+                spellings.append((surface,acronym))
+    spellings.sort(key=lambda item:len(item[0]),reverse=True)
+    compiled=[(re.compile(r'(?<!\w)'+re.escape(surface)+r'(?!\w)'),canonical) for surface,canonical in spellings]
+    return letters,compiled
+
+_LETTER_PATTERNS,_SPELLING_PATTERNS=_acronym_patterns()
+
+def normalized_with_spans(text):
+    value,spans=_char_normalize(text)
+    # Punctuation is already spaces, so I.P.P. / I-P-P / I P P share the letter pattern.
+    value,spans=_replace_tokens(value,spans,_LETTER_PATTERNS)
+    # Reviewed spellings (Urdu letter names, orthographic plural). Not topic expansion.
+    value,spans=_replace_tokens(value,spans,_SPELLING_PATTERNS)
     return value,spans
 
 def normalize(text):return normalized_with_spans(text)[0]
@@ -60,7 +91,7 @@ def query_variants(query,contract):
     value=normalize(query)
     if contract=='alias':
         for key,aliases in CONFIG['aliases'].items():
-            values={normalize(x) for x in aliases}|{key}
+            values={normalize(x) for x in [key,*aliases]}
             if value in values:return sorted(values)
     return [value]
 
@@ -193,14 +224,21 @@ class CompiledMatcher:
         self.contract=contract
         value=query.strip() if contract=='literal' else alias_with_spans(query)[0] if contract=='alias' else normalize(query)
         if not value:raise ValueError('Empty normalized query')
+        self.value=value
         self.pattern=re.compile((r'(?<!\w)' if re.match(r'\w',value[0]) else '')+re.escape(value)+(r'(?!\w)' if re.match(r'\w',value[-1]) else ''))
+    def _fold(self,quote):
+        return alias_with_spans(quote)[0] if self.contract=='alias' else normalize(quote)
     def spans(self,text):
         if self.contract=='literal':value=text;mapping=None
         else:value,mapping=alias_with_spans(text) if self.contract=='alias' else normalized_with_spans(text)
-        out=[]
+        out=[];last=-1
         for m in self.pattern.finditer(value):
             start=m.start() if mapping is None else mapping[m.start()][0];end=m.end() if mapping is None else mapping[m.end()-1][1]
-            out.append({'start':start,'end':end,'text':text[start:end]})
+            if end<=start or start<last:continue
+            quote=text[start:end]
+            # Keep a hit only when the original slice itself is the acronym. Never rewrite it.
+            if self.contract!='literal' and self._fold(quote)!=self.value:continue
+            last=end;out.append({'start':start,'end':end,'text':quote})
         return out
 
 

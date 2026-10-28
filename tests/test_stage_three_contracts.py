@@ -2,7 +2,7 @@
 import pathlib,sys,unittest
 from types import SimpleNamespace as NS
 sys.path.insert(0,str(pathlib.Path(__file__).resolve().parents[1]))
-from transcript_search_contract import match_spans,normalized_with_spans,transcript_results,title_score,contract_search
+from transcript_search_contract import match_spans,normalized_with_spans,transcript_results,title_score,contract_search,normalize,query_variants
 from semantic_passage_evidence import BoundedRetrieval,ValidationUnavailable
 
 def row(i,text,**extra):
@@ -33,17 +33,52 @@ class StageThreeContractTests(unittest.TestCase):
     def test_literal_normalized_and_explicit_alias_are_distinct(self):
         text='IPP I.P.P. I P P آئی پی پی ipp'
         self.assertEqual(1,len(match_spans(text,'IPP','literal')))
-        self.assertEqual(4,len(match_spans(text,'IPP','normalized')))
+        # Reviewed acronym spellings share the normalized family. Other aliases do not.
+        self.assertEqual(5,len(match_spans(text,'IPP','normalized')))
         self.assertEqual(5,len(match_spans(text,'IPP','alias')))
-        self.assertEqual(1,len(match_spans(text,'آئی پی پی','normalized')))
+        self.assertEqual(5,len(match_spans(text,'آئی پی پی','normalized')))
         self.assertEqual(5,len(match_spans(text,'آئی پی پی','alias')))
+        self.assertEqual([],match_spans('Palestine','falasteen','normalized'))
+        self.assertEqual(1,len(match_spans('Palestine','falasteen','alias')))
 
     def test_all_acronym_variants_have_same_normalized_occurrences(self):
-        text='IPP and I.P.P. and I P P'
-        for query in ['IPP','I.P.P.','I P P']:
+        text='IPP and I.P.P. and I P P and آئی پی پی'
+        expected=['IPP','I.P.P','I P P','آئی پی پی']
+        for query in ['IPP','I.P.P.','I P P','آئی پی پی']:
+            self.assertEqual('ipp',normalize(query))
+            self.assertEqual(['ipp'],query_variants(query,'normalized'))
+            self.assertEqual(['ipp'],query_variants(query,'alias'))
             spans=match_spans(text,query)
-            self.assertEqual(['IPP','I.P.P','I P P'],[s['text'] for s in spans])
-            for span in spans:self.assertEqual(span['text'],text[span['start']:span['end']])
+            self.assertEqual(expected,[s['text'] for s in spans])
+            for span in spans:
+                self.assertEqual(span['text'],text[span['start']:span['end']])
+                self.assertEqual('ipp',normalize(span['text']))
+                self.assertNotEqual('ipp',span['text'])
+
+    def test_imf_acronym_family_matches_dotted_spaced_and_urdu_spellings(self):
+        text='IMF, I.M.F. then I M F and آئی ایم ایف.'
+        expected=['IMF','I.M.F','I M F','آئی ایم ایف']
+        decomposed_urdu='آئی ایم ایف'.replace('آ','ا\u0653').replace('ی','ي')
+        for query in ['IMF','I.M.F.','I M F','آئی ایم ایف',decomposed_urdu]:
+            self.assertEqual('imf',normalize(query),query)
+            self.assertEqual(['imf'],query_variants(query,'normalized'))
+            spans=match_spans(text,query)
+            self.assertEqual(expected,[s['text'] for s in spans])
+            for span in spans:
+                self.assertEqual(span['text'],text[span['start']:span['end']])
+                self.assertEqual('imf',normalize(span['text']))
+
+    def test_acronym_matches_are_whole_tokens_and_keep_original_quotes(self):
+        for query in ['IPP','I.P.P.','I P P','آئی پی پی','IMF','I.M.F.','I M F','آئی ایم ایف']:
+            for text in ['shipping','skipper','IPProvider','I.P.Provider','snippet','hippo',
+                         'notipp','ippish','ippsomething','confirmation','IMForce','himself',
+                         'timeframe','آئیپیپی','آئی ایم']:
+                self.assertEqual([],match_spans(text,query), (query,text))
+        ipp='See I.P.P. and آئی پی پی.'
+        spans=match_spans(ipp,'IPP')
+        self.assertEqual(['I.P.P','آئی پی پی'],[s['text'] for s in spans])
+        self.assertEqual([],match_spans('IPProvider said IP.P and I PP','IPP'))
+        self.assertEqual(['IPPs'],[s['text'] for s in match_spans('the IPPs','آئی پی پی')])
 
     def test_boundaries_case_unicode_punctuation_whitespace_and_original_spans(self):
         self.assertEqual([],match_spans('shipping skipper IPProvider','IPP'))
