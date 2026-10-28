@@ -486,6 +486,33 @@ if USE_OPENAI_EMBEDDINGS:
         openai_client = OpenAI(api_key=OPENAI_API_KEY)
         logger.info(f"Using OpenAI embeddings: {OPENAI_EMBEDDING_MODEL} (dim={EMBEDDING_DIMENSION})")
 
+# Embedding calls use the OpenAI client's own retry loop: exponential backoff
+# with jitter, Retry-After when present, and a small bound. That loop retries
+# 429, timeouts, and 5xx, and does not retry other 4xx. Judge calls stay at 0.
+OPENAI_EMBEDDING_MAX_RETRIES = 2
+
+
+def openai_embedding_client():
+    if isinstance(openai_client, OpenAI):
+        return openai_client.with_options(max_retries=OPENAI_EMBEDDING_MAX_RETRIES)
+    return openai_client
+
+
+def embedding_rate_limit_detail():
+    """Shape Laravel EmbeddingSearchService already copies off a failed /search."""
+    diagnostic_id = uuid.uuid4().hex
+    logger.warning(
+        "QUERY_EMBEDDING_RATE_LIMITED diagnostic_id=%s reason=openai_embeddings_429",
+        diagnostic_id,
+    )
+    return {
+        "message": "Search could not complete. Please retry.",
+        "code": "search_service_rate_limited",
+        "retryable": True,
+        "reason": "openai_embeddings_429",
+        "diagnostic_id": diagnostic_id,
+    }
+
 # Rate limiting configuration
 RATE_LIMIT_REQUESTS = int(os.getenv("RATE_LIMIT_REQUESTS", "100"))
 RATE_LIMIT_WINDOW = int(os.getenv("RATE_LIMIT_WINDOW", "60"))
@@ -972,9 +999,10 @@ def get_openai_embeddings_batch(texts: List[str], model_name: str = None) -> Lis
         if any(not text for text in cleaned):
             raise ValueError("Cannot embed empty text")
         embeddings = []
+        client = openai_embedding_client()
         for start in range(0, len(cleaned), 20):
             batch = cleaned[start:start + 20]
-            response = openai_client.embeddings.create(
+            response = client.embeddings.create(
                 input=batch, model=model_name, dimensions=EMBEDDING_DIMENSION,
             )
             vectors = [item.embedding for item in sorted(response.data, key=lambda item: item.index)]
@@ -1089,8 +1117,8 @@ retrieve candidates; they never prove relevance.
 
 
 def get_semantic_query_embedding(text, timeout):
-    # Identical OpenAI model/dimensions/cache space to document indexing. Query
-    # transport has its own deadline and no hidden SDK retries.
+    # Same model, dimensions, and cache key as document indexing. Each attempt
+    # keeps the caller timeout; the OpenAI client bounds retries around it.
     from search_observability import record
     embedding_started=time.monotonic()
     key = (OPENAI_EMBEDDING_MODEL, EMBEDDING_DIMENSION, text)
@@ -1100,7 +1128,7 @@ def get_semantic_query_embedding(text, timeout):
     if not USE_OPENAI_EMBEDDINGS or not openai_client:
         raise HTTPException(status_code=503, detail="Embedding provider unavailable; retry later")
     try:
-        response = openai_client.with_options(max_retries=0).embeddings.create(
+        response = openai_embedding_client().embeddings.create(
             model=OPENAI_EMBEDDING_MODEL, dimensions=EMBEDDING_DIMENSION,
             input=[text], timeout=min(8, timeout))
         if len(response.data) != 1 or len(response.data[0].embedding) != EMBEDDING_DIMENSION:
@@ -1108,8 +1136,12 @@ def get_semantic_query_embedding(text, timeout):
         record({"model":OPENAI_EMBEDDING_MODEL,"cache_hit":False,"provider_calls":1,"input_tokens":getattr(response.usage,"prompt_tokens",None),"elapsed_ms":round((time.monotonic()-embedding_started)*1000,2)})
         embedding_cache[key] = response.data[0].embedding
         return embedding_cache[key]
-    except Exception:
-        raise HTTPException(status_code=503, detail="Embedding provider failed; retry later")
+    except HTTPException:
+        raise
+    except openai.RateLimitError as error:
+        raise HTTPException(status_code=503, detail=embedding_rate_limit_detail()) from error
+    except Exception as error:
+        raise HTTPException(status_code=503, detail="Embedding provider failed; retry later") from error
 
 
 def judge_passage_batch(query, candidates, timeout, required_facets=None, verification=False):

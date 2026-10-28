@@ -3,6 +3,7 @@ import asyncio
 import importlib
 import json
 import os
+import time
 from pathlib import Path
 import sys
 import types
@@ -894,6 +895,120 @@ class SearchApiTest(unittest.TestCase):
         self.assertTrue(second["metadata"]["cache_hit"])
         self.assertNotEqual(first["results"][0]["video_id"], second["results"][0]["video_id"])
         self.assertEqual("qdrant_maxsim", first["metadata"]["ranking"]["engine"])
+
+    def _embedding_response(self, vector):
+        return {
+            "object": "list",
+            "model": "text-embedding-3-large",
+            "data": [{"object": "embedding", "index": 0, "embedding": vector}],
+            "usage": {"prompt_tokens": 3, "total_tokens": 3},
+        }
+
+    def _embedding_transport(self, handler):
+        client = OpenAI(api_key="test", http_client=httpx.Client(transport=httpx.MockTransport(handler)))
+        self.addCleanup(client.close)
+        return client
+
+    def test_query_embedding_retries_429_then_succeeds(self):
+        calls = []
+
+        def handler(request):
+            calls.append((time.monotonic(), request.url.path, json.loads(request.content)))
+            if len(calls) == 1:
+                return httpx.Response(
+                    429, headers={"retry-after": "0.05"},
+                    json={"error": {"message": "rate limit", "type": "rate_limit_error"}},
+                )
+            return httpx.Response(200, json=self._embedding_response([0.25, 0.5]))
+
+        client = self._embedding_transport(handler)
+        with patch.object(self.api, "openai_client", client):
+            started = time.monotonic()
+            vector = self.api.get_semantic_query_embedding("Mecca", 8)
+            again = self.api.get_semantic_query_embedding("Mecca", 8)
+        self.assertEqual([0.25, 0.5], vector)
+        self.assertEqual(vector, again)
+        self.assertEqual(2, len(calls))
+        self.assertGreaterEqual(calls[1][0] - calls[0][0], 0.04)
+        self.assertLess(time.monotonic() - started, 2)
+        self.assertTrue(all(path.endswith("/embeddings") for _, path, _ in calls))
+        self.assertEqual(self.api.OPENAI_EMBEDDING_MODEL, calls[0][2]["model"])
+        self.assertEqual(self.api.EMBEDDING_DIMENSION, calls[0][2]["dimensions"])
+
+    def test_exhausted_embedding_429_is_structured_search_error(self):
+        calls = []
+
+        def handler(request):
+            calls.append(request.url.path)
+            return httpx.Response(
+                429, headers={"retry-after": "0.01"},
+                json={"error": {"message": "rate limit", "type": "rate_limit_error"}},
+            )
+
+        client = self._embedding_transport(handler)
+
+        class Engine:
+            def search(self, request, video_ids=None):
+                self.api.get_semantic_query_embedding(request.query, 8)
+                return {"results": []}
+
+        engine = Engine()
+        engine.api = self.api
+        with patch.object(self.api, "openai_client", client), patch.object(
+            self.api, "search_engine", return_value=engine,
+        ), self.assertLogs(self.api.logger, level="WARNING") as logs:
+            with self.assertRaises(self.api.HTTPException) as error:
+                asyncio.run(self.api.search(self.api.SearchRequest(query="مکہ معاہدے"), True))
+        self.assertEqual(503, error.exception.status_code)
+        detail = error.exception.detail
+        self.assertEqual("Search could not complete. Please retry.", detail["message"])
+        self.assertEqual("search_service_rate_limited", detail["code"])
+        self.assertIs(True, detail["retryable"])
+        self.assertEqual("openai_embeddings_429", detail["reason"])
+        self.assertTrue(detail["diagnostic_id"])
+        self.assertEqual(self.api.OPENAI_EMBEDDING_MAX_RETRIES + 1, len(calls))
+        self.assertTrue(all(path.endswith("/embeddings") for path in calls))
+        output = "\n".join(logs.output)
+        self.assertIn(detail["diagnostic_id"], output)
+        self.assertIn("reason=openai_embeddings_429", output)
+        self.assertNotIn("rate limit", output)
+        key = (self.api.OPENAI_EMBEDDING_MODEL, self.api.EMBEDDING_DIMENSION, "مکہ معاہدے")
+        self.assertNotIn(key, self.api.embedding_cache)
+
+    def test_embedding_non_429_4xx_is_not_retried(self):
+        calls = []
+
+        def handler(request):
+            calls.append(request.url.path)
+            return httpx.Response(
+                400, json={"error": {"message": "invalid input", "type": "invalid_request_error"}},
+            )
+
+        client = self._embedding_transport(handler)
+        with patch.object(self.api, "openai_client", client):
+            with self.assertRaises(self.api.HTTPException) as error:
+                self.api.get_semantic_query_embedding("Mecca", 8)
+        self.assertEqual(1, len(calls))
+        self.assertEqual(503, error.exception.status_code)
+        self.assertEqual("Embedding provider failed; retry later", error.exception.detail)
+        self.assertNotIn(
+            (self.api.OPENAI_EMBEDDING_MODEL, self.api.EMBEDDING_DIMENSION, "Mecca"),
+            self.api.embedding_cache,
+        )
+
+    def test_query_embedding_retries_transient_5xx(self):
+        calls = []
+
+        def handler(request):
+            calls.append(request.url.path)
+            if len(calls) == 1:
+                return httpx.Response(503, json={"error": {"message": "unavailable"}})
+            return httpx.Response(200, json=self._embedding_response([0.1, 0.2]))
+
+        client = self._embedding_transport(handler)
+        with patch.object(self.api, "openai_client", client):
+            self.assertEqual([0.1, 0.2], self.api.get_semantic_query_embedding("Mecca agreement", 8))
+        self.assertEqual(2, len(calls))
 
 
 if __name__ == "__main__":
