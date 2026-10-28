@@ -24,7 +24,7 @@ RUN if [ "$INSTALL_RERANKING" = "true" ]; then \
 
 # Copy application code
 COPY embeddings_test.py .
-COPY embeddings_service.py contextual_search.py fast_search.py worker.py .
+COPY embeddings_service.py contextual_search.py fast_search.py worker.py intent_retrieval.py .
 COPY backfill_sparse_search.py .
 RUN python -m py_compile embeddings_service.py contextual_search.py fast_search.py worker.py backfill_sparse_search.py
 COPY semantic_query_decomposition.py .
@@ -47,6 +47,12 @@ COPY start.sh .
 RUN python -c "from semantic_query_decomposition import build_structured_rerank_fallback, decompose_semantic_query, extract_meaningful_query_terms, has_conceptual_topic_evidence, has_complete_facet_coverage, passes_structured_topic_validation, recover_empty_structured_rerank; assert all(callable(fn) for fn in (build_structured_rerank_fallback, decompose_semantic_query, extract_meaningful_query_terms, has_conceptual_topic_evidence, has_complete_facet_coverage, passes_structured_topic_validation, recover_empty_structured_rerank))"
 
 RUN python -c "from semantic_passage_evidence import validate_passages, BoundedRetrieval, requested_speaker_names; assert all(callable(fn) for fn in (validate_passages, BoundedRetrieval, requested_speaker_names))"
+
+# Fail the image build if spoken-intent retrieval is absent. fast_search.py
+# imports this at module load, and embeddings_service.py imports proposition
+# when building a grounded plan. A missing file only showed up as a Railway
+# crash-loop after the image had already built.
+RUN python -c "from intent_retrieval import proposition, compose_retrieval_queries, alignment_score, keyword_vote_weight; assert all(callable(fn) for fn in (proposition, compose_retrieval_queries, alignment_score, keyword_vote_weight))"
 
 # Make startup script executable
 RUN chmod +x start.sh
