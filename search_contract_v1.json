@@ -1,16 +1,14 @@
 {
-  "version": "transcript_contract_v2",
+  "version": "transcript_contract_v3",
   "acronyms": {
-    "ipp": [
-      "i",
-      "p",
-      "p"
-    ],
-    "imf": [
-      "i",
-      "m",
-      "f"
-    ]
+    "ipp": {
+      "letters": ["i", "p", "p"],
+      "spellings": ["آئی پی پی", "ipps"]
+    },
+    "imf": {
+      "letters": ["i", "m", "f"],
+      "spellings": ["آئی ایم ایف"]
+    }
   },
   "aliases": {
     "ipp": [

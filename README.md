@@ -117,7 +117,7 @@ without inspecting and verifying the affected operation.
 ## Phase 3 exact search and worker callbacks
 
 The deterministic `/search/exact` path uses `exact_cursor_v1` with the shared
-`transcript_contract_v2` matching rules. Continue using the opaque returned
+`transcript_contract_v3` matching rules. Continue using the opaque returned
 cursor until `counts_final=true`; an empty partial page is not a final no-match.
 Cursor expiry, authorization changes and index changes require a new search.
 This path makes no embedding or generative model requests.
