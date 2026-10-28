@@ -23,7 +23,8 @@ def search_rules_fingerprint():
     files=('grounded_search.py','grounded_validation.py','fast_search.py','contextual_search.py',
            'grounded_title_search.py','grounded_summary_search.py','transcript_search_contract.py',
            'search_contract_v1.json','semantic_query_decomposition.py','speaker_identity.py',
-           'semantic_passage_evidence.py','exact_lexical.py','embeddings_service.py','manual_metadata.py','asr_search.py')
+           'semantic_passage_evidence.py','exact_lexical.py','embeddings_service.py','manual_metadata.py','asr_search.py',
+           'intent_retrieval.py')
     digest=hashlib.sha256()
     for name in files:
         source=(Path(__file__).parent/name).read_bytes()

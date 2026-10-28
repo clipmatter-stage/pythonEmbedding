@@ -18,6 +18,7 @@ import unicodedata
 
 from qdrant_client import models
 from contextual_search import SearchInputError, source_filter, timestamp_url
+from intent_retrieval import alignment_score, compose_retrieval_queries, keyword_vote_weight
 from transcript_search_contract import valid_interval, semantic_query_text
 
 SPARSE_NAME = "lexical_tf_v1"
@@ -110,8 +111,12 @@ class FastSemanticSearch:
             filters.must.append(models.Filter(should=conditions))
         understanding_done = time.perf_counter()
         plan = self.retrieval_expander(semantic) if self.retrieval_expander else {}
-        queries = list(dict.fromkeys([semantic, *[q.strip() for q in plan.get("queries", [])
-                    if isinstance(q, str) and q.strip() and len(q) <= 2000]]))[:4]
+        # Grounded search embeds the proposition and spoken forms. Fast mode
+        # keeps the single raw query it already used.
+        if self.retrieval_expander:
+            queries = compose_retrieval_queries(semantic, plan)
+        else:
+            queries = [semantic] if semantic else []
         if len(queries) == 1:
             vectors = [self.embed(semantic)]
         else:
@@ -180,26 +185,56 @@ class FastSemanticSearch:
                 with ThreadPoolExecutor(max_workers=4) as executor:
                     groups_by_lane = list(executor.map(lambda lane:self.client.query_points_groups(**lane).groups, lanes))
                 merged = {}; ranks = defaultdict(float); video_ranks = defaultdict(float)
+                semantic_lanes = len(vectors)
                 for lane_index, groups in enumerate(groups_by_lane):
+                    semantic_lane = lane_index < semantic_lanes
                     for rank, group in enumerate(groups, 1):
-                        video_ranks[group.id] += 1 / (60 + rank)
+                        hit_weights = []
                         for depth, hit in enumerate(group.hits):
                             identity = str(hit.id); merged.setdefault(identity, hit)
-                            ranks[identity] += 1 / (60 + rank + depth)
+                            if semantic_lane:
+                                weight = 1.0
+                            else:
+                                weight = keyword_vote_weight(
+                                    str((hit.payload or {}).get('text') or ''), queries, keyword_terms)
+                            hit_weights.append(weight)
+                            ranks[identity] += weight / (60 + rank + depth)
                             provenance[identity].append({'lane':lane_index,
-                                'kind':'semantic' if lane_index<len(vectors) else 'keyword',
-                                'rank':rank,'depth':depth})
+                                'kind':'semantic' if semantic_lane else 'keyword',
+                                'rank':rank,'depth':depth,'weight':weight})
+                        video_ranks[group.id] += max(hit_weights or [0.0]) / (60 + rank)
                 # Fuse videos first: different languages often retrieve
                 # different passages of the SAME relevant video. Point-only
                 # fusion would discard those independent retrieval votes.
+                # Coverage is scored per spoken/faithful variant so one shared
+                # audience word cannot fill the grounded candidate cap.
+                alignments = {}
+                best_alignment = defaultdict(float)
+                for identity, point in merged.items():
+                    text = str((point.payload or {}).get('text') or '')
+                    alignments[identity] = alignment_score([*queries, *keyword_terms], text)
+                    video_id = (point.payload or {}).get('video_id')
+                    best_alignment[video_id] = max(best_alignment[video_id], alignments[identity])
+                for video_id, covered in best_alignment.items():
+                    video_ranks[video_id] += semantic_lanes * covered / 61
+                def strong_keyword(identity):
+                    return any(item['kind']=='keyword' and item.get('weight', 0) >= 1
+                               for item in provenance[identity])
                 points = sorted(merged.values(), key=lambda p:(
                     -video_ranks[(p.payload or {}).get('video_id')],
-                    -any(source['kind']=='keyword' for source in provenance[str(p.id)]),
+                    -int(strong_keyword(str(p.id))),
+                    -alignments.get(str(p.id), 0.0),
                     -ranks[str(p.id)],str(p.id)))
                 # A video's multilingual votes establish its rank, not proof
-                # that an arbitrary passage from it matches. Prefer its actual
-                # keyword anchor over a semantic-only turn from another topic.
-                for point in points: point.score = video_ranks[(point.payload or {}).get('video_id')]
+                # that an arbitrary passage from it matches. Prefer a keyword
+                # anchor that covers a distinctive term over a semantic-only
+                # turn from another topic. A generic audience overlap does not.
+                for point in points:
+                    identity = str(point.id)
+                    video_id = (point.payload or {}).get('video_id')
+                    point.score = (video_ranks[video_id]
+                                   + (1 / 61 if strong_keyword(identity) else 0.0)
+                                   + (0.25 / 61) * alignments.get(identity, 0.0))
                 # One best passage per video before admitting second passages.
                 buckets = defaultdict(list)
                 for point in points: buckets[(point.payload or {}).get('video_id')].append(point)

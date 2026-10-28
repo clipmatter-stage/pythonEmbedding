@@ -993,7 +993,7 @@ def understand_query(query: str, multilingual_retrieval: bool = False) -> Dict:
     Handles Urdu, English, and mixed queries.
     """
     # Check cache first
-    cache_key = ("intent_multilingual_v1" if multilingual_retrieval else "intent", OPENAI_TEXT_MODEL, query.strip())
+    cache_key = ("intent_multilingual_v2" if multilingual_retrieval else "intent", OPENAI_TEXT_MODEL, query.strip())
     if cache_key in embedding_cache:
         return embedding_cache[cache_key]
 
@@ -1036,10 +1036,17 @@ topic terms in retrieval_terms (up to four total); omit function words and speak
 For a clearly identified place or topic, one retrieval term may be a plausible phonetic ASR
 misspelling of its native-script form. Never replace the input intent or invent a different
 entity. Such variants only retrieve candidates; they never establish that the passage matches.
+Also return spoken_queries: exactly three SHORT utterances a speaker would say aloud for the
+same proposition, one in native Urdu script, one in Roman Urdu, and one in English. Remove
+search instructions such as "find the clip" or "the leader talked about". Use ordinary spoken
+wording a transcript might contain, not a translation of the question. Preserve actors, actions,
+objects, recipients, negation, and direction. Do not replace the proposition with a broader
+topic or a different action, and do not add events the query does not state. These only
+retrieve candidates; they never prove relevance.
 """ if multilingual_retrieval else "")},
                 {"role": "user", "content": f"Analyze this search query: {query}"}
             ],
-            max_completion_tokens=500 if multilingual_retrieval else 300,
+            max_completion_tokens=700 if multilingual_retrieval else 300,
             reasoning_effort="none",
             response_format={"type": "json_object"},
             timeout=6.0 if multilingual_retrieval else 8.0
@@ -1063,6 +1070,9 @@ entity. Such variants only retrieve candidates; they never establish that the pa
             queries = result.get("retrieval_queries")
             result["retrieval_queries"] = [value.strip() for value in queries
                 if isinstance(value, str) and 0 < len(value.strip()) <= 2000][:3] if isinstance(queries, list) else []
+            spoken = result.get("spoken_queries")
+            result["spoken_queries"] = [value.strip() for value in spoken
+                if isinstance(value, str) and 0 < len(value.strip()) <= 400][:3] if isinstance(spoken, list) else []
         if result.get("query_type") not in {"speaker_search", "topic_search", "quote_search", "title_search", "general"}:
             result["query_type"] = "general"
 
@@ -1239,21 +1249,28 @@ def grounded_title_intent(query):
 
 def grounded_retrieval_plan(query):
     """Share successful query-only plans across replicas; never cache failures."""
-    key = 'grounded_plan:asr-v2:' + hashlib.sha256(json_module.dumps(
-        [OPENAI_TEXT_MODEL, query.strip()], ensure_ascii=False).encode()).hexdigest()
+    from intent_retrieval import proposition
+    focused = proposition(query) or query.strip()
+    key = 'grounded_plan:intent-v1:' + hashlib.sha256(json_module.dumps(
+        [OPENAI_TEXT_MODEL, focused], ensure_ascii=False).encode()).hexdigest()
     def usable(plan):
-        return (isinstance(plan, dict) and not plan.get('warnings')
-                and isinstance(plan.get('queries'), list) and 1 <= len(plan['queries']) <= 3
+        if not isinstance(plan, dict) or plan.get('warnings'):
+            return False
+        spoken = plan.get('spoken_queries', [])
+        return (isinstance(plan.get('queries'), list) and 1 <= len(plan['queries']) <= 3
                 and all(isinstance(value, str) and 0 < len(value.strip()) <= 2000 for value in plan['queries'])
+                and isinstance(spoken, list) and len(spoken) <= 3
+                and all(isinstance(value, str) and 0 < len(value.strip()) <= 400 for value in spoken)
                 and isinstance(plan.get('retrieval_terms'), list)
                 and all(isinstance(value, str) and 1 < len(value.strip()) <= 100 for value in plan['retrieval_terms'])
                 and len(plan['retrieval_terms']) <= 4)
     shared = read_shared_cache(key)
     if usable(shared):
         return shared
-    intent = understand_query(query, multilingual_retrieval=True)
+    intent = understand_query(focused, multilingual_retrieval=True)
     from asr_search import retrieval_hints
     plan = {'queries': intent.get('retrieval_queries', []),
+            'spoken_queries': intent.get('spoken_queries', []),
             'retrieval_terms': retrieval_hints(query,intent.get('retrieval_terms', [])), 'warnings': []}
     if intent.get('understanding_status') == 'enabled' and usable(plan):
         write_shared_cache(key, plan, 604800)
@@ -1262,7 +1279,7 @@ def grounded_retrieval_plan(query):
     shared = read_shared_cache(key)
     if usable(shared):
         return shared
-    return {'queries': [], 'retrieval_terms': [], 'warnings': ['multilingual_expansion_unavailable']}
+    return {'queries': [], 'spoken_queries': [], 'retrieval_terms': [], 'warnings': ['multilingual_expansion_unavailable']}
 
 
 @lru_cache(maxsize=3)
