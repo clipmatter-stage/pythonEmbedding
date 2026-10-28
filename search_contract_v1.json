@@ -1,5 +1,5 @@
 {
-  "version": "transcript_contract_v3",
+  "version": "transcript_contract_v4",
   "acronyms": {
     "ipp": {
       "letters": ["i", "p", "p"],
@@ -23,7 +23,10 @@
     "k electric": [
       "k electric",
       "kelectric",
-      "کے الیکٹرک"
+      "کے الیکٹرک",
+      "کےالیکٹرک",
+      "KE",
+      "K.E."
     ],
     "palestine": [
       "palestine",
@@ -34,7 +37,8 @@
     "naujawan": [
       "naujawan",
       "nojawan",
-      "نوجوان"
+      "نوجوان",
+      "youth"
     ],
     "bijli": [
       "bijli",
@@ -46,7 +50,39 @@
     ],
     "sood": [
       "sood",
-      "سود"
+      "سود",
+      "interest",
+      "Interest-based system",
+      "riba",
+      "ربا"
+    ],
+    "namaz": [
+      "namaz",
+      "نماز",
+      "salah",
+      "prayer"
+    ],
+    "quran": [
+      "quran",
+      "Qur'an",
+      "قرآن",
+      "قران"
+    ],
+    "tax": [
+      "tax",
+      "taxes",
+      "taxation",
+      "ٹیکس"
+    ],
+    "elite": [
+      "elite",
+      "ashrafia",
+      "اشرافیہ"
+    ],
+    "gaza": [
+      "gaza",
+      "ghaza",
+      "غزہ"
     ]
   }
 }

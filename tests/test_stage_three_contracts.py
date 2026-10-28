@@ -2,7 +2,7 @@
 import pathlib,sys,unittest
 from types import SimpleNamespace as NS
 sys.path.insert(0,str(pathlib.Path(__file__).resolve().parents[1]))
-from transcript_search_contract import match_spans,normalized_with_spans,transcript_results,title_score,contract_search,normalize,query_variants
+from transcript_search_contract import CONFIG,alias_with_spans,match_spans,normalized_with_spans,transcript_results,title_score,contract_search,normalize,query_variants
 from semantic_passage_evidence import BoundedRetrieval,ValidationUnavailable
 
 def row(i,text,**extra):
@@ -167,3 +167,99 @@ class StageThreeContractTests(unittest.TestCase):
         self.assertEqual(1,len(match_spans('X IPP X',' IPP ','literal')))
         self.assertEqual(1,len(match_spans('X.','.','literal')))
         self.assertEqual([],match_spans('shipping','ipp','literal'))
+
+    def test_curated_retrieval_aliases_share_a_key_without_rewriting_quotes(self):
+        # Explicit alias families only. Acronym folding and person/party names stay as they were.
+        self.assertEqual('transcript_contract_v4', CONFIG['version'])
+        self.assertEqual({'ipp', 'imf'}, set(CONFIG['acronyms']))
+        self.assertEqual(['i', 'p', 'p'], CONFIG['acronyms']['ipp']['letters'])
+        self.assertEqual(['آئی پی پی', 'ipps'], CONFIG['acronyms']['ipp']['spellings'])
+        self.assertEqual(['i', 'm', 'f'], CONFIG['acronyms']['imf']['letters'])
+        self.assertEqual(['آئی ایم ایف'], CONFIG['acronyms']['imf']['spellings'])
+        self.assertFalse(set(CONFIG['aliases']) & {'hnr', 'hafiz naeem', 'jamaat', 'jamaat e islami'})
+        owners = {}
+        for key, aliases in CONFIG['aliases'].items():
+            for item in [key, *aliases]:
+                surface = normalize(item)
+                self.assertTrue(surface not in owners or owners[surface] == key, (surface, key, owners.get(surface)))
+                owners[surface] = key
+
+        families = {
+            'sood': (
+                ['Interest-based system', 'Interest', 'Sood', 'سود', 'Riba', 'ربا'],
+                'The interested public discussed an Interest-based system, Sood, سود, Riba and ربا today.',
+                ['Interest-based system', 'Sood', 'سود', 'Riba', 'ربا'],
+            ),
+            'naujawan': (
+                ['Youth', 'Naujawan', 'Nojawan', 'نوجوان'],
+                'The youthful speaker greeted the Youth, the Naujawan, a Nojawan and every نوجوان, not the نوجوانوں.',
+                ['Youth', 'Naujawan', 'Nojawan', 'نوجوان'],
+            ),
+            'k electric': (
+                ['K-Electric', 'KE', 'K.E.', 'kelectric', 'کے الیکٹرک', 'کےالیکٹرک'],
+                'K-Electric and KE and K.E. and kelectric and کے الیکٹرک and کےالیکٹرک raised tariffs, unlike the keeper.',
+                ['K-Electric', 'KE', 'K.E', 'kelectric', 'کے الیکٹرک', 'کےالیکٹرک'],
+            ),
+            'namaz': (
+                ['Namaz', 'نماز', 'Salah', 'Prayer'],
+                'Offer Namaz, نماز, Salah and Prayer, not prayers or namazein.',
+                ['Namaz', 'نماز', 'Salah', 'Prayer'],
+            ),
+            'quran': (
+                ['Quran', "Qur'an", 'قرآن', 'قران'],
+                "Read the Quran, the Qur'an, the قرآن and the قران, not a quranic note.",
+                ['Quran', "Qur'an", 'قرآن', 'قران'],
+            ),
+            'tax': (
+                ['Tax', 'Taxes', 'Taxation', 'ٹیکس'],
+                'Tax, Taxes and Taxation and ٹیکس, not a taxi or syntax or taxpayer.',
+                ['Tax', 'Taxes', 'Taxation', 'ٹیکس'],
+            ),
+            'elite': (
+                ['Elite', 'Ashrafia', 'اشرافیہ'],
+                'The Elite and Ashrafia and اشرافیہ, not elites.',
+                ['Elite', 'Ashrafia', 'اشرافیہ'],
+            ),
+            'gaza': (
+                ['Gaza', 'Ghaza', 'غزہ'],
+                'Gaza and Ghaza and غزہ, not Palestine and not gazan.',
+                ['Gaza', 'Ghaza', 'غزہ'],
+            ),
+        }
+        approved = {}
+        for key, (forms, text, expected) in families.items():
+            approved[key] = query_variants(forms[0], 'alias')
+            self.assertIn(key, approved[key])
+            for form in forms:
+                self.assertEqual(key, alias_with_spans(form)[0], form)
+                self.assertEqual(approved[key], query_variants(form, 'alias'), form)
+                # Default exact/normalized search does not expand this family.
+                self.assertEqual([normalize(form)], query_variants(form, 'normalized'), form)
+                spans = match_spans(text, form, 'alias')
+                self.assertEqual(expected, [span['text'] for span in spans], form)
+                for span in spans:
+                    self.assertEqual(span['text'], text[span['start']:span['end']])
+                    self.assertNotEqual(key, span['text'])
+                    self.assertEqual(key, alias_with_spans(span['text'])[0])
+                    self.assertIn(normalize(span['text']), approved[key])
+                normalized = match_spans(text, form, 'normalized')
+                for span in normalized:
+                    self.assertEqual(normalize(form), normalize(span['text']))
+                    self.assertEqual(span['text'], text[span['start']:span['end']])
+                self.assertLess(len(normalized), len(spans), form)
+        self.assertEqual([], match_spans('سود', 'interest', 'normalized'))
+        self.assertEqual(['سود'], [span['text'] for span in match_spans('سود', 'interest', 'alias')])
+        self.assertEqual([], match_spans('نوجوان نماز', 'youth prayer', 'normalized'))
+        self.assertEqual(['نوجوان نماز'], [span['text'] for span in match_spans('نوجوان نماز', 'youth prayer', 'alias')])
+        self.assertEqual([], match_spans('نوجوان', 'youth prayer', 'alias'))
+        for query, text in [
+            ('interest', 'interested'), ('tax', 'taxi'), ('tax', 'syntax'), ('tax', 'taxpayer'),
+            ('K-Electric', 'keeper'), ('K-Electric', 'kelectricity'), ('namaz', 'prayers'),
+            ('namaz', 'namazein'), ('namaz', 'نمازیں'), ('quran', 'quranic'), ('quran', 'قرآنی'),
+            ('elite', 'elites'), ('youth', 'youthful'), ('youth', 'نوجوانوں'), ('sood', 'سودا'),
+            ('Gaza', 'Palestine'), ('Gaza', 'gazan'), ('Ghaza', 'فلسطین'),
+        ]:
+            self.assertEqual([], match_spans(text, query, 'alias'), (query, text))
+        self.assertEqual('ipp', normalize('I.P.P.'))
+        self.assertEqual(['ipp'], query_variants('آئی پی پی', 'normalized'))
+        self.assertEqual(['imf'], query_variants('I.M.F.', 'alias'))
