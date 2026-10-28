@@ -18,6 +18,17 @@ PLACE_VARIANTS=[(_PLACE_ALIASES,_PLACE_FORMS)]
 AGREEMENT_VARIANTS=[(_AGREEMENT_ALIASES,_AGREEMENT_FORMS)]
 _PLACE_QUERY_KEYS={normalize(alias) for alias in _PLACE_ALIASES}
 _LATIN=re.compile(r'^[a-z]+$')
+# Trailing sentence marks are not a new request. They must not fork the
+# judgment cache from the same words.
+_TRAILING_MARKS=re.compile(r'(?:[\s.!?؟،,;:۔…])+$')
+# Urdu topic heads in ـہ. The nominative is the retrieval and cache form.
+# Oblique/plural ـے and ـوں fold onto it. Function words are not in this table.
+_TOPIC_HEADS=(
+    ('معاہدہ',('معاہدہ','معاہدے','معاہدوں')),
+)
+_INFLECTION_OF={}
+for _canonical,_forms in _TOPIC_HEADS:
+    for _form in _forms:_INFLECTION_OF[normalize(_form)]=_canonical
 
 def roman_key(token):
     """Skeleton of a Roman token. Aspiration h and short a are spelling noise."""
@@ -114,14 +125,33 @@ def reserve_candidates(query,rows,limit=4):
     found.sort(key=lambda row:(-row.get('retrieval_score',row.get('score',0)),str(row['video_id']),str(row['id'])))
     return found[:limit]
 
-def canonical_query(query):
-    """Rewrite near-miss tokens. A whole place name still becomes Makkah.
+def _fold_topic_heads(text):
+    """Map a reviewed oblique/plural topic head onto its nominative.
 
-    Other words, including relationships and negations, stay in the request.
+    Whole tokens only. A longer word, a function word, or an unlisted ـے
+    ending is left as written.
+    """
+    folded=[];changed=False
+    for token in text.split():
+        canonical=_INFLECTION_OF.get(normalize(token))
+        if canonical and normalize(token)!=normalize(canonical):
+            folded.append(canonical);changed=True
+        else:folded.append(token)
+    return ' '.join(folded) if changed else text
+
+def canonical_query(query):
+    """One cache and retrieval string for spelling, inflection, and punctuation.
+
+    Near-miss Roman tokens fold onto reviewed alias families. Reviewed Urdu
+    topic-head inflections fold onto the nominative. A trailing full stop,
+    Urdu danda, or comma is not a distinct request. A whole place name still
+    becomes Makkah. Relationships and negations stay in the request.
     """
     text=' '.join((query or '').split())
+    text=_TRAILING_MARKS.sub('',text).strip()
     if not text:return query
+    text=_fold_topic_heads(text)
     if normalize(text) in _PLACE_QUERY_KEYS:return 'Makkah'
     rewritten=_rewrite_tokens(text)
     if normalize(rewritten) in _PLACE_QUERY_KEYS:return 'Makkah'
-    return rewritten if rewritten!=text else query
+    return rewritten

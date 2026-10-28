@@ -151,6 +151,24 @@ class SearchTests(unittest.TestCase):
   self.engine.search(request(query='fees'));self.assertGreater(self.calls,calls)
  def test_genuine_no_match_returns_no_unverified_dense_fallback(self):
   self.put(1,'Generic education and elections');r=self.engine.search(request(query='Minecraft'));self.assertEqual([],r['results']);self.assertEqual('no_matches',r['metadata']['passage_validation']['status'])
+  self.assertFalse(any(key.startswith('grounded:')for key in self.cache))
+  self.assertFalse(any(key.startswith('grounded_judgment:')for key in self.cache))
+
+ def test_rejection_is_not_replayed_when_a_later_judgment_is_relevant(self):
+  self.put(1,'University tuition costs 100000 rupees. Families cannot afford it',video=1087)
+  state={'n':0}
+  def judge(query,rows,timeout):
+    state['n']+=1
+    positive=state['n']>1
+    quote='tuition costs 100000 rupees'
+    return {'judgments':[{'candidate_id':candidate_id(row),'score':.94 if positive else .08,'relevant':positive,'complete':positive,'roles_supported':positive,'relationship_supported':positive,'quotes':[quote]if positive else [],'reason':'relevant'if positive else 'specificity'}for row in rows]}
+  self.engine.judge=judge
+  first=self.engine.search(request(query='students and high education fees'))
+  self.assertEqual([],first['results']);self.assertEqual(1,state['n'])
+  self.assertFalse(any(key.startswith('grounded:')or key.startswith('grounded_judgment:')for key in self.cache))
+  second=self.engine.search(request(query='students and high education fees'))
+  self.assertEqual([1087],[row['video_id']for row in second['results']])
+  self.assertEqual(2,state['n']);self.assertGreaterEqual(second['results'][0]['score'],.9)
 
  def test_expansion_failure_cannot_be_cached_as_completed_no_match(self):
   from semantic_passage_evidence import ValidationUnavailable,validation_error_detail

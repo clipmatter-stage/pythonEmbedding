@@ -126,6 +126,49 @@ class MakkahRetrievalTests(unittest.TestCase):
         self.assertIsNone(result["speaker_filter"])
         self.assertIsNone(result["metadata"]["passage_validation"]["speaker_constraint"])
 
+    def test_oblique_agreement_shares_nominative_retrieval_and_cache(self):
+        """معاہدے must not keep a separate poisoned judgment from معاہدہ."""
+        embedded = []
+        self.base.embed = lambda query: embedded.append(query) or [1.0, 0.0]
+
+        def judge(query, rows, timeout):
+            self.judged.append(query)
+            poisoned = "معاہدے" in query or "۔" in query
+            judgments = []
+            for row in rows:
+                yes = (not poisoned) and _accepts(query, row["text"])
+                quote = "مکہ معاہدے میں ایران اور ترکی" if yes else ""
+                judgments.append({
+                    "candidate_id": candidate_id(row),
+                    "score": 0.94 if yes else 0.08,
+                    "relevant": yes, "complete": yes,
+                    "roles_supported": yes, "relationship_supported": yes,
+                    "quotes": [quote] if yes else [],
+                    "reason": "relevant" if yes else "related_only",
+                })
+            return {"judgments": judgments}
+
+        self.engine.judge = judge
+        with patch.dict(os.environ, {"GROUNDING_INITIAL_CANDIDATES": "8", "GROUNDING_MAX_CANDIDATES": "16"}):
+            oblique = self.engine.search(request(query="مکہ معاہدے", min_score=0.5, top_k=5))
+            nominative = self.engine.search(request(query="مکہ معاہدہ", min_score=0.5, top_k=5))
+            punctuated = self.engine.search(request(query="مکہ معاہدے۔", min_score=0.5, top_k=5))
+        for result, typed in ((oblique, "مکہ معاہدے"), (nominative, "مکہ معاہدہ"), (punctuated, "مکہ معاہدے۔")):
+            clip = self._clip(result)
+            self.assertEqual(31, clip["start_time"], typed)
+            self.assertEqual(77, clip["end_time"], typed)
+            self.assertEqual(1087, clip["video_id"], typed)
+            self.assertEqual(typed, result["query"])
+            self.assertEqual("مکہ معاہدہ", result["metadata"]["passage_validation"]["grounding_query"])
+        self.assertEqual({"مکہ معاہدہ"}, set(embedded))
+        self.assertEqual({"مکہ معاہدہ"}, set(self.judged))
+        self.assertTrue(nominative["metadata"]["passage_validation"]["cache_hit"])
+        self.assertTrue(punctuated["metadata"]["passage_validation"]["cache_hit"])
+        self.assertEqual(
+            [row["video_id"] for row in oblique["results"]],
+            [row["video_id"] for row in nominative["results"]],
+        )
+
     def test_iran_turkey_request_uses_the_later_passage_not_a_speaker_constraint(self):
         result = self._search(LONG)
         clip = self._clip(result)
@@ -134,12 +177,14 @@ class MakkahRetrievalTests(unittest.TestCase):
         self.assertIn("ایران", clip["text"])
         self.assertIn("ترکی", clip["text"])
         self.assertTrue(self.judged)
-        self.assertEqual({LONG}, set(self.judged))
+        folded = "مکہ معاہدہ میں ایران اور ترکی کو بھی شامل کیا جائے"
+        self.assertEqual({folded}, set(self.judged))
         validation = result["metadata"]["passage_validation"]
         self.assertIsNone(result["speaker_filter"])
         self.assertIsNone(validation["speaker_constraint"])
-        self.assertEqual(LONG, validation["grounding_query"])
+        self.assertEqual(folded, validation["grounding_query"])
         self.assertEqual(LONG, validation["original_query"])
+        self.assertEqual(LONG, result["query"])
 
     def test_phonetic_roman_reaches_the_same_agreement_clip(self):
         for query in ("makh mohida", "makka mohida", "makh muahida", "Makh Mohaida", "makkah mohida"):

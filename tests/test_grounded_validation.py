@@ -6,17 +6,21 @@ from semantic_passage_evidence import ValidationUnavailable
 def row(i):return {'id':str(i),'video_id':i,'text':'University tuition costs more than families can afford.','start_time':1,'end_time':5,'segment_ids':[str(i)]}
 def judgment(r,positive=True):return {'candidate_id':candidate_id(r),'score':.9 if positive else .1,'relevant':positive,'complete':positive,'roles_supported':positive,'relationship_supported':positive,'quotes':['tuition costs more than families can afford']if positive else [],'reason':'relevant'if positive else 'related_only'}
 class GroundedTests(unittest.TestCase):
- def test_validated_judgments_survive_batch_reordering_without_provider_calls(self):
+ def test_accepted_judgment_is_reused_and_rejection_is_not_cached(self):
   cache={}
   def read(q,r):return cache.get((q,candidate_id(r)))
-  def write(q,r,j):cache[(q,candidate_id(r))]=copy.deepcopy(j)
-  def judge(q,rs,timeout):return {'judgments':[judgment(r,r['id']=='1')for r in rs]}
+  def write(q,r,j):
+    self.assertTrue(j['relevant']);cache[(q,candidate_id(r))]=copy.deepcopy(j)
+  calls=[]
+  def judge(q,rs,timeout):
+    calls.append([r['id']for r in rs]);return {'judgments':[judgment(r,r['id']=='1')for r in rs]}
   first,meta=validate_grounded('fees',[row(1),row(2)],judge,read_judgment=read,write_judgment=write)
-  def unavailable(*args):raise AssertionError('Cached judgments must not call the provider')
-  second,meta=validate_grounded('fees',[row(2),row(1)],unavailable,read_judgment=read,write_judgment=write)
+  second,meta=validate_grounded('fees',[row(2),row(1)],judge,read_judgment=read,write_judgment=write)
+  self.assertEqual([['1','2'],['2']],calls)
   self.assertEqual([r['validation_id']for r in first],[r['validation_id']for r in second])
-  self.assertEqual(0,meta['provider_calls']);self.assertEqual(2,meta['judgment_cache_hits'])
-  self.assertEqual(2,meta['evaluated_count']);self.assertTrue(all(t['judgment_cache_hit']for t in meta['trace']))
+  self.assertEqual(1,meta['provider_calls']);self.assertEqual(1,meta['judgment_cache_hits'])
+  self.assertEqual(2,meta['evaluated_count'])
+  self.assertEqual({('fees',candidate_id(row(1)))},set(cache))
 
  def test_cached_fabricated_quote_is_rejected_and_rejudged(self):
   bad={**judgment(row(1)),'quotes':['This quotation was invented']};calls=[]

@@ -58,7 +58,11 @@ def snapshot_key(engine,epoch,params,video_ids,initial,maximum,legacy_commit=Non
            getattr(engine.judge,'cache_contract',None),contract,epoch,params,video_ids]
     return 'grounded:'+hashlib.sha256(json.dumps(parts,sort_keys=True,ensure_ascii=False,default=str).encode()).hexdigest()
 
-def stable_snapshot(metadata,title,summary):
+def stable_snapshot(metadata,title,summary,results=()):
+    # An empty no_matches is one judge pass, not a verified empty corpus.
+    # Freezing it would replay a rejection after the judgment TTL policy
+    # has already refused to store that rejection.
+    if metadata.get('status')=='no_matches' and not results:return False
     return (metadata['status'] in {'completed','no_matches'}
         and not (set(title.get('warnings',[])) - {'title_retrieval_bounded'})
         and not (set(summary.get('warnings',[])) - {'summary_retrieval_bounded'}))
@@ -246,7 +250,7 @@ class GroundedSearch:
                     'timings':{'title_seconds':title_metadata['elapsed_seconds'],'summary_seconds':summary_metadata['elapsed_seconds'],'total_seconds':round(time.monotonic()-started,3)}}}
             from manual_metadata import merge_metadata
             result=merge_metadata(result,metadata_rows,request.top_k)
-            if stable_snapshot(metadata,title_metadata,summary_metadata):self.write_cache(cache_key,result,SNAPSHOT_TTL)
+            if stable_snapshot(metadata,title_metadata,summary_metadata,result.get('results')):self.write_cache(cache_key,result,SNAPSHOT_TTL)
             return result
         changes={'query':semantic_gloss(original),'word':None,'words':[],'top_k':self.base.settings.candidate_limit}
         expanded=request.model_copy(update=changes)if hasattr(request,'model_copy')else __import__('types').SimpleNamespace(**{**vars(request),**changes})
@@ -372,7 +376,7 @@ class GroundedSearch:
         result['ranking']['timings']['summary_seconds']=summary_metadata['elapsed_seconds']
         from manual_metadata import merge_metadata
         result=merge_metadata(result,metadata_rows,request.top_k)
-        if stable_snapshot(metadata,title_metadata,summary_metadata):self.write_cache(cache_key,result,SNAPSHOT_TTL)
+        if stable_snapshot(metadata,title_metadata,summary_metadata,result.get('results')):self.write_cache(cache_key,result,SNAPSHOT_TTL)
         return result
 
     def _speaker_speeches(self, request, response, original, title_rows, title_metadata, summary_rows, summary_metadata, started, epoch, cache_key):
@@ -407,7 +411,7 @@ class GroundedSearch:
                     'total_seconds':round(time.monotonic()-started,3),
                     'title_seconds':title_metadata.get('elapsed_seconds',0),
                     'summary_seconds':summary_metadata.get('elapsed_seconds',0)}}}
-        if stable_snapshot(metadata,title_metadata,summary_metadata):self.write_cache(cache_key,result,SNAPSHOT_TTL)
+        if stable_snapshot(metadata,title_metadata,summary_metadata,result.get('results')):self.write_cache(cache_key,result,SNAPSHOT_TTL)
         return result
 
 def summary_search(engine,request):
