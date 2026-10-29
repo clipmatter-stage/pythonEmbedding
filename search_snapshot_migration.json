@@ -3,5 +3,13 @@
   "legacy_deployments": [
     "8aede66847e30521ff8df7e5c0796292a08422f5"
   ],
-  "planner_model": "gpt-6-luna"
+  "planner_model": "gpt-6-luna",
+  "persistent_carry_over": {
+    "compatible_rules_fingerprint": "4ca8868d866d8dd457d78d84ea2817e220ad4a1268fca49fbe039d046fa47b35",
+    "previous_rules_fingerprints": [
+      "2605f5a769c97483c8250bf66347de5ef27c1c0e5d816be00a48b9913e34b2cc"
+    ],
+    "previous_deployment": "446bb7adbbb883d4b95e7c4dd07d33a3055ea580",
+    "reviewed_change": "empty-result Urdu-lane rerank (GROUNDED_EMPTY_RESULT_URDU_RERANK); alters only searches that end with zero results, and only non-empty results are ever saved"
+  }
 }

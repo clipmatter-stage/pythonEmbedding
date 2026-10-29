@@ -362,6 +362,25 @@ and validation budget. This is not a hard HTTP latency limit. Set
 `GROUNDING_INITIAL_CANDIDATES` and `GROUNDING_MAX_CANDIDATES` to tune these bounds
 (`1 <= initial <= maximum <= 32`). It does not change the default fast pipeline.
 
+Only when that strict pass ends cleanly with zero results (no title, summary or
+manual-metadata hit, no budget or context warning) and retrieved candidates are
+still unjudged, one extra batch of `GROUNDING_INITIAL_CANDIDATES` passages is
+judged. It is taken, in order, from the first Urdu-script expansion's own
+retrieval lane, skipping passages already judged. Same judge, prompt, quote
+checks, thresholds, batch size and six-call budget. This lets a Roman Urdu or
+English request reach the Urdu-script passage that its fused ranking placed just
+below the cut. Any search with at least one result never runs it, and its output
+is unchanged. The response records the attempt in
+`passage_validation.empty_result_rerank`. Kill switch:
+`GROUNDED_EMPTY_RESULT_URDU_RERANK=false` (default on); with it off, saved
+results that only this pass found are not replayed.
+
+Saved results are keyed by a hash of the search-rule source files. When a
+reviewed change only affects searches that end with zero results, list the
+previous hash under `persistent_carry_over` in `search_snapshot_migration.json`
+(bound to the new hash), so existing non-empty saved results keep being served.
+`tests/test_empty_result_rerank.py` fails if the rules change without that review.
+
 Explicit known-speaker/action requests, including
 `hafiz naeem nojawano ko namaz ki talqeen`, separate the speaker constraint from
 the action. Retrieval matches configured names; grounding accepts only exact
