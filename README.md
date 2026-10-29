@@ -375,6 +375,22 @@ is unchanged. The response records the attempt in
 `GROUNDED_EMPTY_RESULT_URDU_RERANK=false` (default on); with it off, saved
 results that only this pass found are not replayed.
 
+If the strict pass and that extra pass both still end with zero results, the
+response may list up to 3 videos (best passage per video) that the judge
+already scored at least 0.4 but did not verify (reason `related_only`,
+`specificity`, `insufficient_evidence` or `role_mismatch`; never `negation`).
+No extra judge call is made. Each such row carries
+`verification_status: "related_unverified"`, `evidence_verified: false`,
+`transcript_verified: false` and `match_types: ["related_unverified"]`; the
+response carries `fallback: "related_not_verified"` at the top level, in
+`metadata.passage_validation` (with `related_unverified_count`) and in
+`ranking`. `passage_validation.status` stays `no_matches`. These responses
+are never saved, and a saved response carrying the flag is never replayed, so
+a later verified answer is never blocked. Searches with at least one verified,
+title, summary or manual-metadata result never use it. Kill switch:
+`GROUNDED_RELATED_UNVERIFIED_FALLBACK=false` (default on) restores the empty
+answer exactly.
+
 Saved results are keyed by a hash of the search-rule source files. When a
 reviewed change only affects searches that end with zero results, list the
 previous hash under `persistent_carry_over` in `search_snapshot_migration.json`

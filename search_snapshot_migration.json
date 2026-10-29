@@ -5,11 +5,12 @@
   ],
   "planner_model": "gpt-6-luna",
   "persistent_carry_over": {
-    "compatible_rules_fingerprint": "4ca8868d866d8dd457d78d84ea2817e220ad4a1268fca49fbe039d046fa47b35",
+    "compatible_rules_fingerprint": "47bd2f67aaba08ea1e54cdc588122660c53a263fea2cd19fddb3745215eb5bed",
     "previous_rules_fingerprints": [
+      "4ca8868d866d8dd457d78d84ea2817e220ad4a1268fca49fbe039d046fa47b35",
       "2605f5a769c97483c8250bf66347de5ef27c1c0e5d816be00a48b9913e34b2cc"
     ],
-    "previous_deployment": "446bb7adbbb883d4b95e7c4dd07d33a3055ea580",
-    "reviewed_change": "empty-result Urdu-lane rerank (GROUNDED_EMPTY_RESULT_URDU_RERANK); alters only searches that end with zero results, and only non-empty results are ever saved"
+    "previous_deployment": "50ff29004a4241e1ffc770587dc5da114c3b9bff",
+    "reviewed_change": "related-but-unverified fallback (GROUNDED_RELATED_UNVERIFIED_FALLBACK) on top of the empty-result Urdu-lane rerank (GROUNDED_EMPTY_RESULT_URDU_RERANK); both alter only searches that end with zero verified results, fallback responses are never saved, and only non-empty verified results are carried"
   }
 }
