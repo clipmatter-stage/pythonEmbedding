@@ -52,9 +52,10 @@ def legacy_snapshot_commits(engine):
 def carried_rules_fingerprints():
     """Earlier search-rule fingerprints whose saved results stay valid.
 
-    Only non-empty results are ever saved, and the reviewed change listed in
-    search_snapshot_migration.json only alters searches that end with zero
-    results. The carry-over is bound to the exact current rules fingerprint,
+    Only non-empty verified results are ever saved (the related-but-unverified
+    fallback is never saved), and the reviewed changes listed in
+    search_snapshot_migration.json only alter searches that end with zero
+    verified results. The carry-over is bound to the exact current rules fingerprint,
     so any later search-rule edit disables it until it is reviewed again.
     """
     path=Path(__file__).parent/'search_snapshot_migration.json'
@@ -66,6 +67,51 @@ def carried_rules_fingerprints():
 def empty_result_rerank_enabled():
     # Kill switch: GROUNDED_EMPTY_RESULT_URDU_RERANK=false restores the strict-only pass.
     return os.getenv('GROUNDED_EMPTY_RESULT_URDU_RERANK','true').strip().lower()not in{'0','false','no','off'}
+
+def related_fallback_enabled():
+    # Kill switch: GROUNDED_RELATED_UNVERIFIED_FALLBACK=false restores the empty answer.
+    return os.getenv('GROUNDED_RELATED_UNVERIFIED_FALLBACK','true').strip().lower()not in{'0','false','no','off'}
+
+# Judge reasons that still describe the requested topic. 'negation' (the passage
+# says the opposite) and invalid/quote failures are never shown.
+RELATED_REASONS=('related_only','specificity','insufficient_evidence','role_mismatch')
+RELATED_MIN_SCORE=0.4   # Below every acceptance score (0.65); fallback-only, not a global threshold.
+RELATED_MAX_VIDEOS=3    # A short, clearly labelled list; one passage per video.
+FALLBACK_FLAG='related_not_verified'
+
+def is_related_fallback(result):
+    """True for a response that contains only unverified related passages."""
+    if not isinstance(result,dict):return False
+    validation=(result.get('metadata')or{}).get('passage_validation')or{}
+    return result.get('fallback')==FALLBACK_FLAG or validation.get('fallback')==FALLBACK_FLAG
+
+def related_candidates(stages,contexts,min_score=0.0,limit=RELATED_MAX_VIDEOS):
+    """Best judged-but-rejected passage per video from the existing judgments.
+
+    No new provider call: scores and reasons come from the strict pass and the
+    empty-result rerank stage that already ran.
+    """
+    passages={candidate_id(row):row for row in contexts}
+    best={}
+    for stage in stages:
+        for item in stage.get('trace')or[]:
+            if item.get('stage')!='validation'or item.get('accepted')or item.get('reason')not in RELATED_REASONS:continue
+            score=item.get('score')
+            if type(score)not in(int,float)or score<max(RELATED_MIN_SCORE,min_score or 0):continue
+            row=passages.get(item.get('candidate_id'))
+            if row is None:continue
+            current=best.get(row['video_id'])
+            if current is None or score>current[0]:best[row['video_id']]=(score,item['reason'],row)
+    ranked=sorted(best.values(),key=lambda item:(-item[0],str(item[2]['video_id']),str(item[2]['id'])))[:limit]
+    out=[]
+    for score,reason,row in ranked:
+        row={key:value for key,value in row.items()if key not in('passage_evidence','evidence_spans','validation_id','intent_match')}
+        row.update(score=score,llm_relevance_score=score,score_type='related_unverified',
+                   verification_status='related_unverified',judge_reason=reason,
+                   evidence_verified=False,transcript_verified=False,evidence_source='transcript_related_unverified',
+                   match_types=['related_unverified'],matched_field='related_unverified')
+        out.append(row)
+    return out
 
 _URDU_SCRIPT=re.compile(r'[\u0600-\u06ff]')
 def urdu_lane_candidates(pool,queries,checked,limit):
@@ -254,12 +300,14 @@ class GroundedSearch:
             for rules in carried_rules_fingerprints():
                 previous=self.read_cache(snapshot_key(self,epoch,params,video_ids,initial,maximum,rules_fingerprint=rules))
                 # Only non-empty saved results are carried; they never reach the new pass.
-                if previous is not None and previous.get('results'):
+                if previous is not None and previous.get('results')and not is_related_fallback(previous):
                     if self.revision()!=epoch:raise ValidationUnavailable('Search index changed',reason='search_index_changed')
                     self.write_cache(cache_key,previous,SNAPSHOT_TTL);cached=previous;break
         if (cached is not None and not empty_result_rerank_enabled()
                 and ((cached.get('metadata')or{}).get('passage_validation')or{}).get('empty_result_rerank',{}).get('accepted')):
             cached=None  # Kill switch: never replay results that only the extra pass found.
+        if is_related_fallback(cached):
+            cached=None  # Unverified related passages are never replayed from saved results.
         if cached is not None:
             if self.revision()!=epoch:raise ValidationUnavailable('Search index changed',reason='search_index_changed')
             result=copy.deepcopy(cached);meta=result['metadata']['passage_validation'];meta['cache_hit']=True;meta['cached_provider_calls']=meta['provider_calls'];meta['provider_calls']=0;meta['provider_usage']=[];result['ranking']['embedding_usage']=[];result['ranking']['timings']['total_seconds']=round(time.monotonic()-started,3);return result
@@ -434,6 +482,15 @@ class GroundedSearch:
         result['ranking']['timings']['summary_seconds']=summary_metadata['elapsed_seconds']
         from manual_metadata import merge_metadata
         result=merge_metadata(result,metadata_rows,request.top_k)
+        if metadata.get('status')=='no_matches'and not result.get('results')and related_fallback_enabled():
+            related=related_candidates(stages,contexts,request.min_score)
+            if related:
+                # Never saved: an unverified answer must not block a later verified one.
+                result.update(results=related,returned=len(related),unique_videos=len({r['video_id']for r in related}),
+                              fallback=FALLBACK_FLAG)
+                result['metadata']['passage_validation'].update(fallback=FALLBACK_FLAG,related_unverified_count=len(related))
+                result['ranking'].update(fallback=FALLBACK_FLAG,evidence_verified=False,score_type='related_unverified')
+                return result
         if stable_snapshot(metadata,title_metadata,summary_metadata,result.get('results')):self.write_cache(cache_key,result,SNAPSHOT_TTL)
         return result
 
