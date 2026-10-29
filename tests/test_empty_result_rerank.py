@@ -206,7 +206,9 @@ class CarryOverTests(unittest.TestCase):
         carry=migration['persistent_carry_over']
         # Fails on any later search-rule edit: re-review the carry-over, then update the fingerprint.
         self.assertEqual(grounded_search.search_rules_fingerprint(),carry['compatible_rules_fingerprint'])
-        self.assertIn('2605f5a769c97483c8250bf66347de5ef27c1c0e5d816be00a48b9913e34b2cc',carry['previous_rules_fingerprints'])
+        # Fix B chain: live Fix A rules first, then the pre-Fix-A rules.
+        self.assertEqual(['4ca8868d866d8dd457d78d84ea2817e220ad4a1268fca49fbe039d046fa47b35',
+                          '2605f5a769c97483c8250bf66347de5ef27c1c0e5d816be00a48b9913e34b2cc'],carry['previous_rules_fingerprints'])
         self.assertEqual(carry['previous_rules_fingerprints'],grounded_search.carried_rules_fingerprints())
         with patch('grounded_search.search_rules_fingerprint',return_value='edited-rules'):
             self.assertEqual([],grounded_search.carried_rules_fingerprints())
