@@ -49,11 +49,48 @@ def legacy_snapshot_commits(engine):
     if len(engine.embedding_contract)>2 and engine.embedding_contract[2]!=migration.get('planner_model'):return []
     return migration.get('legacy_deployments',[])
 
-def snapshot_key(engine,epoch,params,video_ids,initial,maximum,legacy_commit=None):
+def carried_rules_fingerprints():
+    """Earlier search-rule fingerprints whose saved results stay valid.
+
+    Only non-empty results are ever saved, and the reviewed change listed in
+    search_snapshot_migration.json only alters searches that end with zero
+    results. The carry-over is bound to the exact current rules fingerprint,
+    so any later search-rule edit disables it until it is reviewed again.
+    """
+    path=Path(__file__).parent/'search_snapshot_migration.json'
+    if not path.exists():return []
+    carry=json.loads(path.read_text()).get('persistent_carry_over')or{}
+    if carry.get('compatible_rules_fingerprint')!=search_rules_fingerprint():return []
+    return [value for value in carry.get('previous_rules_fingerprints',[])if isinstance(value,str)and value]
+
+def empty_result_rerank_enabled():
+    # Kill switch: GROUNDED_EMPTY_RESULT_URDU_RERANK=false restores the strict-only pass.
+    return os.getenv('GROUNDED_EMPTY_RESULT_URDU_RERANK','true').strip().lower()not in{'0','false','no','off'}
+
+_URDU_SCRIPT=re.compile(r'[\u0600-\u06ff]')
+def urdu_lane_candidates(pool,queries,checked,limit):
+    """Unjudged pool rows in the order of the first Urdu-script expansion's own lane.
+
+    Lane indexes of semantic lanes follow ranking.retrieval_queries. The
+    original query (lane 0) is never used as the translation lane.
+    """
+    lane=next((i for i,value in enumerate(queries or [])if i>0 and isinstance(value,str)
+               and _URDU_SCRIPT.search(value)and value.strip()!=str(queries[0]).strip()),None)
+    if lane is None or limit<=0:return None,[]
+    ranked=[]
+    for row in pool:
+        if str(row['id'])in checked:continue
+        votes=[(item.get('rank',10**9),item.get('depth',0))for item in row.get('retrieval_lanes')or[]
+               if item.get('lane')==lane and item.get('kind')=='semantic']
+        if votes:ranked.append((min(votes),str(row['id']),row))
+    ranked.sort(key=lambda item:item[:2])
+    return lane,[row for _,_,row in ranked[:limit]]
+
+def snapshot_key(engine,epoch,params,video_ids,initial,maximum,legacy_commit=None,rules_fingerprint=None):
     contract=engine.embedding_contract[:2]if legacy_commit else engine.embedding_contract
     parts=['stable_snapshot_v1'if legacy_commit else 'persistent_snapshot_v1',
            GROUNDED_STRATEGY_VERSION,engine.title_indexed,engine.summary_indexed_fields,initial,maximum,
-           VERSION,hashlib.sha256(SYSTEM.encode()).hexdigest(),legacy_commit or search_rules_fingerprint(),
+           VERSION,hashlib.sha256(SYSTEM.encode()).hexdigest(),legacy_commit or rules_fingerprint or search_rules_fingerprint(),
            asdict(engine.base.settings),engine.base.sparse_enabled,engine.model,
            getattr(engine.judge,'cache_contract',None),contract,epoch,params,video_ids]
     return 'grounded:'+hashlib.sha256(json.dumps(parts,sort_keys=True,ensure_ascii=False,default=str).encode()).hexdigest()
@@ -213,6 +250,16 @@ class GroundedSearch:
                 if previous is not None:
                     if self.revision()!=epoch:raise ValidationUnavailable('Search index changed',reason='search_index_changed')
                     self.write_cache(cache_key,previous,SNAPSHOT_TTL);cached=previous;break
+        if cached is None:
+            for rules in carried_rules_fingerprints():
+                previous=self.read_cache(snapshot_key(self,epoch,params,video_ids,initial,maximum,rules_fingerprint=rules))
+                # Only non-empty saved results are carried; they never reach the new pass.
+                if previous is not None and previous.get('results'):
+                    if self.revision()!=epoch:raise ValidationUnavailable('Search index changed',reason='search_index_changed')
+                    self.write_cache(cache_key,previous,SNAPSHOT_TTL);cached=previous;break
+        if (cached is not None and not empty_result_rerank_enabled()
+                and ((cached.get('metadata')or{}).get('passage_validation')or{}).get('empty_result_rerank',{}).get('accepted')):
+            cached=None  # Kill switch: never replay results that only the extra pass found.
         if cached is not None:
             if self.revision()!=epoch:raise ValidationUnavailable('Search index changed',reason='search_index_changed')
             result=copy.deepcopy(cached);meta=result['metadata']['passage_validation'];meta['cache_hit']=True;meta['cached_provider_calls']=meta['provider_calls'];meta['provider_calls']=0;meta['provider_usage']=[];result['ranking']['embedding_usage']=[];result['ranking']['timings']['total_seconds']=round(time.monotonic()-started,3);return result
@@ -296,12 +343,9 @@ class GroundedSearch:
         read_judgment=None if warnings else lambda q,row:self.read_cache(judgment_key(q,row))
         write_judgment=None if warnings else lambda q,row,j:self.write_cache(judgment_key(q,row),j,JUDGMENT_TTL)
         context_seconds=validation_seconds=0.;deadline=time.monotonic()+60
-        for offset in range(0,len(rows),initial):
-            calls_left=6-sum(m['provider_calls']for m in stages)
-            if calls_left<=0:warnings.append('validation_call_budget_reached');break
-            if offset and len({r['video_id']for r in accepted})>=min(request.top_k,10):break
-            if time.monotonic()>=deadline:warnings.append('validation_budget_reached');break
-            focus=rows[offset:offset+initial];tick=time.monotonic()
+        def context_batch(focus,warnings):
+            nonlocal context_reads,context_seconds
+            tick=time.monotonic()
             windows=[models.Filter(must=[models.FieldCondition(key='video_id',match=models.MatchValue(value=r['video_id'])),
                 models.FieldCondition(key='start_time',range=models.Range(gte=max(0,r['start_time']-CONTEXT_PAD_SECONDS),lte=r['end_time']+CONTEXT_PAD_SECONDS))])for r in focus]
             window=models.Filter(must=[*filters.must,models.Filter(should=windows)])
@@ -323,6 +367,14 @@ class GroundedSearch:
                 if len(passage['text'])>6000:warnings.append('source_passage_exceeds_validation_budget');continue
                 batch.append(passage)
             context_seconds+=time.monotonic()-tick
+            return batch
+        for offset in range(0,len(rows),initial):
+            calls_left=6-sum(m['provider_calls']for m in stages)
+            if calls_left<=0:warnings.append('validation_call_budget_reached');break
+            if offset and len({r['video_id']for r in accepted})>=min(request.top_k,10):break
+            if time.monotonic()>=deadline:warnings.append('validation_budget_reached');break
+            focus=rows[offset:offset+initial]
+            batch=context_batch(focus,warnings)
             if not batch:continue
             if time.monotonic()>=deadline:warnings.append('validation_budget_reached');break
             contexts.extend(batch)
@@ -335,6 +387,11 @@ class GroundedSearch:
                 warnings.append('expansion_validation_unavailable');break
             accepted.extend(r for r in passed if r['score']>=request.min_score);stages.append(stage)
             validation_seconds+=stage['elapsed_seconds']
+        rerank=None
+        if (not accepted and stages and not warnings and not title_rows and not summary_rows and not metadata_rows
+                and not any(m['status']=='partial'for m in stages)and empty_result_rerank_enabled()):
+            rerank=self._empty_result_rerank(response,pool,contexts,initial,stages,deadline,context_batch,
+                judging_query,read_judgment,write_judgment,request,accepted,trace)
         # Empty candidate sets are evaluated without a provider call.
         if not stages:
             _,metadata=validate_grounded(judging_query,[],self.judge)
@@ -353,6 +410,7 @@ class GroundedSearch:
                         initial_candidate_limit=initial,maximum_candidate_limit=maximum,
                         retrieval_candidates=len(response['results']),selected_candidates=len(rows),
                         has_unchecked_candidates=bool({str(r['id'])for r in pool}-checked_ids),exhaustive=False)
+        if rerank is not None:metadata['empty_result_rerank']=rerank
         if self.revision()!=epoch:raise ValidationUnavailable('Search index changed',reason='search_index_changed')
         accepted=[r for r in accepted if r['score']>=request.min_score];accepted=diverse(accepted,request.top_k,key="score")
         # Grouping occurs AFTER diversity/output selection, so one video cannot consume the output budget.
@@ -378,6 +436,42 @@ class GroundedSearch:
         result=merge_metadata(result,metadata_rows,request.top_k)
         if stable_snapshot(metadata,title_metadata,summary_metadata,result.get('results')):self.write_cache(cache_key,result,SNAPSHOT_TTL)
         return result
+
+    def _empty_result_rerank(self,response,pool,contexts,initial,stages,deadline,context_batch,
+                             judging_query,read_judgment,write_judgment,request,accepted,trace):
+        """One extra judged batch after a clean strict no-match.
+
+        Roman Urdu and English queries can rank the matching Urdu-script
+        passage just below the judged cut. The Urdu-script expansion's own lane
+        orders the remaining candidates; the same judge, prompt, quote checks,
+        thresholds and batch size apply. Searches with any result never run this.
+        """
+        checked={str(identity)for row in contexts for identity in row.get('segment_ids',[row['id']])}
+        lane,focus=urdu_lane_candidates(pool,(response.get('ranking')or{}).get('retrieval_queries'),checked,initial)
+        info={'trigger':'strict_no_matches','lane_index':lane,'candidates':len(focus),'accepted':0,'provider_calls':0}
+        calls_left=6-sum(m['provider_calls']for m in stages)
+        if lane is None:return {**info,'status':'skipped','reason':'no_urdu_script_expansion'}
+        if not focus:return {**info,'status':'skipped','reason':'no_unjudged_candidates'}
+        if calls_left<=0:return {**info,'status':'skipped','reason':'validation_call_budget_reached'}
+        if time.monotonic()>=deadline:return {**info,'status':'skipped','reason':'validation_budget_reached'}
+        local_warnings=[]
+        batch=context_batch(focus,local_warnings)
+        info['context_warnings']=local_warnings
+        if not batch:return {**info,'status':'skipped','reason':'no_new_passages'}
+        if time.monotonic()>=deadline:return {**info,'status':'skipped','reason':'validation_budget_reached'}
+        try:
+            passed,stage=validate_grounded(judging_query,batch,self.judge,batch_size=6,max_calls=min(3,calls_left),
+                deadline_seconds=max(.1,deadline-time.monotonic()),concurrency=2,
+                read_judgment=read_judgment,write_judgment=write_judgment)
+        except ValidationUnavailable as error:
+            # The strict pass already answered no_matches; keep that answer.
+            return {**info,'status':'unavailable','reason':getattr(error,'reason',None)or'validation_unavailable'}
+        contexts.extend(batch);stages.append(stage)
+        found=[r for r in passed if r['score']>=request.min_score]
+        accepted.extend(found)
+        trace.extend({'point_id':str(r['id']),'video_id':r['video_id'],'stage':'empty_result_rerank','lane_index':lane,'selected_for_context':True}for r in focus)
+        return {**info,'status':stage['status'],'accepted':len(found),'provider_calls':stage['provider_calls'],
+                'candidates':len(batch)}
 
     def _speaker_speeches(self, request, response, original, title_rows, title_metadata, summary_rows, summary_metadata, started, epoch, cache_key):
         """Return that speaker's transcript turns without judging speech boilerplate."""
