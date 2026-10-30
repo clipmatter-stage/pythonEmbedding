@@ -139,6 +139,21 @@ def _fold_topic_heads(text):
         else:folded.append(token)
     return ' '.join(folded) if changed else text
 
+def token_family(token):
+    """One key for a reviewed place or agreement spelling, including inflections.
+
+    Other tokens are only whitespace-normalized. This is not a phrase list.
+    """
+    folded=_fold_topic_heads(str(token or ''))
+    key=normalize(folded.split()[0] if folded.split() else '')
+    if len(key)<3:return key
+    families=(_PLACE_ALIASES+_PLACE_FORMS,_AGREEMENT_ALIASES+_AGREEMENT_FORMS)
+    for forms in families:
+        parts={normalize(part) for form in forms for part in str(form).split()}
+        parts={part for part in parts if len(part)>=3}
+        if key in parts:return min(parts)
+    return key
+
 def canonical_query(query):
     """One cache and retrieval string for spelling, inflection, and punctuation.
 

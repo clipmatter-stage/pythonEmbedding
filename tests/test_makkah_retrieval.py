@@ -356,5 +356,183 @@ class ContinuousSpeechTests(unittest.TestCase):
         self.assertIsNone(result["metadata"]["passage_validation"]["speaker_constraint"])
 
 
+PLACE = "مکۃ المکرمہ میں دفاعی ایگریمنٹ طے پایا"
+LATER = "ایران اور ترکی کو بھی اس معاہدے میں شامل کیا جائے"
+
+
+def _snippet(text):
+    for snippet in ("ایران اور ترکی", "دفاعی ایگریمنٹ", "مکۃ المکرمہ", "معاہد"):
+        if snippet in text:
+            return snippet
+    return text[:80]
+
+
+class SplitAgreementSpeechTests(unittest.TestCase):
+    """The live line names parties the agreement sentence does not.
+
+    Those sentences are one speech with a pause longer than one second.
+    Judged apart, each is only half the request and the result is empty.
+    """
+
+    def setUp(self):
+        self.client = QdrantClient(":memory:")
+        self.client.create_collection(
+            "source", vectors_config=models.VectorParams(size=2, distance=models.Distance.COSINE))
+        self.cache = {}
+        self.base = FastSemanticSearch(
+            self.client, "source", lambda query: [1.0, 0.0],
+            lambda query: {"semantic_query": query, "understanding_status": "disabled"},
+            lambda query, value: True, lambda query, value: True,
+            settings=FastSearchSettings(candidate_limit=100),
+        )
+        self.engine = GroundedSearch(
+            self.base, self._judge, "fixture-model", lambda: "epoch",
+            self.cache.get, lambda key, value, ttl: self.cache.update({key: value}),
+            ("same-model", 2),
+        )
+        self._put(7101, PLACE, [1.0, 0.0], 31, 40)
+        self._put(7103, LATER, [0.3, 0.95], 52, 77)
+        for index in range(15):
+            self._put(8000 + index, "غیر متعلق سیاسی تقریر", [0.9, 0.2], 1, 5, video_id=3000 + index)
+
+    def tearDown(self):
+        self.client.close()
+
+    def _put(self, identity, text, vector, start, end, video_id=1087):
+        self.client.upsert("source", [models.PointStruct(id=identity, vector=vector, payload={
+            "video_id": video_id, "text": text, "speaker": "Unverified Label",
+            "transcript_speaker": "A", "start_time": start, "end_time": end,
+            "processing_status": "completed", "approval_status": "approved",
+            "is_archived": False,
+        })])
+
+    def _judge(self, query, rows, timeout):
+        judgments = []
+        for row in rows:
+            yes = _accepts(query, row["text"])
+            judgments.append({
+                "candidate_id": candidate_id(row),
+                "score": 0.9 if yes else 0.2,
+                "relevant": yes, "complete": yes,
+                "roles_supported": yes, "relationship_supported": yes,
+                "quotes": [_snippet(row["text"])] if yes else [],
+                "reason": "relevant" if yes else "related_only",
+            })
+        return {"judgments": judgments}
+
+    def _search(self, query):
+        self.cache.clear()
+        with patch.dict(os.environ, {"GROUNDING_INITIAL_CANDIDATES": "8", "GROUNDING_MAX_CANDIDATES": "16"}):
+            return self.engine.search(request(query=query, min_score=0.5, top_k=5))
+
+    def test_live_iran_turkey_line_joins_the_paused_agreement_speech(self):
+        result = self._search(LONG)
+        clips = [row for row in result["results"] if row["video_id"] == 1087]
+        self.assertTrue(clips, result["metadata"]["passage_validation"]["status"])
+        clip = clips[0]
+        self.assertLessEqual(clip["start_time"], 40)
+        self.assertGreaterEqual(clip["end_time"], 70)
+        self.assertIn("ایران", clip["text"])
+        self.assertIn("ترکی", clip["text"])
+        self.assertTrue("ایگریمنٹ" in clip["text"] or "معاہد" in clip["text"])
+        self.assertEqual(LONG, result["query"])
+        self.assertIsNone(result["speaker_filter"])
+        self.assertIsNone(result["metadata"]["passage_validation"]["speaker_constraint"])
+
+    def test_short_makkah_lines_still_return_the_agreement_clip(self):
+        for query in ("مکہ", "مکہ معاہدہ", "مکہ معاہدے"):
+            with self.subTest(query=query):
+                result = self._search(query)
+                clips = [row for row in result["results"] if row["video_id"] == 1087]
+                self.assertTrue(clips, result["metadata"]["passage_validation"]["status"])
+                self.assertTrue("ایگریمنٹ" in clips[0]["text"] or "معاہد" in clips[0]["text"])
+                self.assertEqual(query, result["query"])
+                self.assertIsNone(result["metadata"]["passage_validation"]["speaker_constraint"])
+
+
+class SpecificityParaphraseTests(unittest.TestCase):
+    """A 0.61 specificity rejection of a passage that states the request is empty."""
+
+    def setUp(self):
+        self.client = QdrantClient(":memory:")
+        self.client.create_collection(
+            "source", vectors_config=models.VectorParams(size=2, distance=models.Distance.COSINE))
+        self.cache = {}
+        self.base = FastSemanticSearch(
+            self.client, "source", lambda query: [1.0, 0.0],
+            lambda query: {"semantic_query": query, "understanding_status": "disabled"},
+            lambda query, value: True, lambda query, value: True,
+            settings=FastSearchSettings(candidate_limit=100),
+        )
+        self.engine = GroundedSearch(
+            self.base, self._judge, "fixture-model", lambda: "epoch",
+            self.cache.get, lambda key, value, ttl: self.cache.update({key: value}),
+            ("same-model", 2),
+        )
+        self._put(7103, EVIDENCE, 1087, [1.0, 0.0], 31, 77)
+        self._put(7201, "مکہ معاہدے پر عمومی بات ہوئی", 2001, [0.8, 0.2], 10, 20)
+        self._put(7202, "مکہ معاہدے میں ایران اور ترکی کو شامل نہیں کیا جائے", 2002, [0.7, 0.3], 10, 20)
+
+    def tearDown(self):
+        self.client.close()
+
+    def _put(self, identity, text, video_id, vector, start, end):
+        self.client.upsert("source", [models.PointStruct(id=identity, vector=vector, payload={
+            "video_id": video_id, "text": text, "speaker": "Unverified Label",
+            "transcript_speaker": "A", "start_time": start, "end_time": end,
+            "processing_status": "completed", "approval_status": "approved",
+            "is_archived": False,
+        })])
+
+    def _judge(self, query, rows, timeout):
+        judgments = []
+        for row in rows:
+            if "ایران" in query:
+                judgments.append({
+                    "candidate_id": candidate_id(row),
+                    "score": 0.61, "relevant": False, "complete": False,
+                    "roles_supported": False, "relationship_supported": False,
+                    "quotes": [], "reason": "specificity", "asr_interpretation": None,
+                })
+                continue
+            yes = _accepts(query, row["text"])
+            judgments.append({
+                "candidate_id": candidate_id(row),
+                "score": 0.9 if yes else 0.2,
+                "relevant": yes, "complete": yes,
+                "roles_supported": yes, "relationship_supported": yes,
+                "quotes": [_snippet(row["text"])] if yes else [],
+                "reason": "relevant" if yes else "related_only",
+            })
+        return {"judgments": judgments}
+
+    def _search(self, query):
+        self.cache.clear()
+        with patch.dict(os.environ, {"GROUNDING_INITIAL_CANDIDATES": "8", "GROUNDING_MAX_CANDIDATES": "16"}):
+            return self.engine.search(request(query=query, min_score=0.5, top_k=5))
+
+    def test_live_line_keeps_a_passage_the_judge_called_specificity(self):
+        from grounded_validation import SYSTEM
+        self.assertIn("Use specificity only when", SYSTEM)
+        result = self._search(LONG)
+        clips = [row for row in result["results"] if row["video_id"] == 1087]
+        self.assertTrue(clips, result["metadata"]["passage_validation"]["status"])
+        self.assertEqual(31, clips[0]["start_time"])
+        self.assertEqual(77, clips[0]["end_time"])
+        self.assertIn("ایران", clips[0]["text"])
+        self.assertIn("ترکی", clips[0]["text"])
+        self.assertNotIn(2002, {row["video_id"] for row in result["results"]})
+        self.assertNotIn(2001, {row["video_id"] for row in result["results"]})
+        self.assertEqual(LONG, result["query"])
+
+    def test_short_makkah_lines_still_return_the_agreement_clip(self):
+        for query in ("مکہ", "مکہ معاہدہ", "مکہ معاہدے"):
+            with self.subTest(query=query):
+                result = self._search(query)
+                clips = [row for row in result["results"] if row["video_id"] == 1087]
+                self.assertTrue(clips, query)
+                self.assertIn("معاہد", clips[0]["text"])
+
+
 if __name__ == "__main__":
     unittest.main()

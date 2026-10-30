@@ -154,6 +154,9 @@ FIELDS=IDENTITY_FIELDS+['video_id','segment_index','text','speaker','transcript_
 # coherent_passage will join up to 60s of consecutive turns. The scroll has to
 # reach the far end of that span from a short focus segment.
 CONTEXT_PAD_SECONDS=60
+# A pause inside one speaker's turn is still that turn. One second left the
+# agreement sentence and the later inclusion sentence in separate judgments.
+SAME_TURN_GAP_SECONDS=20
 def diverse(rows,limit,key="retrieval_score"):
     groups=defaultdict(list)
     for row in sorted(rows,key=lambda r:(-r.get(key,r['score']),str(r['video_id']),str(r['id']))):groups[row['video_id']].append(row)
@@ -194,7 +197,7 @@ def coherent_passage(focus, neighbors):
                 if type(row.get('segment_index'))is not int or row['segment_index']!=edge['segment_index']+direction:break
             gap=turns[0]['start_time']-row['end_time']if direction<0 else row['start_time']-turns[-1]['end_time']
             proposed=sorted([*turns,row],key=lambda r:r['start_time'])
-            if (not 0<=gap<=1 or proposed[-1]['end_time']-proposed[0]['start_time']>60
+            if (not 0<=gap<=SAME_TURN_GAP_SECONDS or proposed[-1]['end_time']-proposed[0]['start_time']>60
                     or sum(len(r['text'])+1 for r in proposed)>2400):break
             turns=proposed;index+=direction
     current.update(text=' '.join(r['text'].strip()for r in turns),start_time=turns[0]['start_time'],
@@ -219,7 +222,7 @@ def contextual_candidate(focus, neighbors, named=()):
                 or not valid_interval(row)or len(str(row.get('text')or'').split())<8):continue
         if named and normalize(row.get('speaker',''))not in named:continue
         gap=max(0,focus['start_time']-row['end_time'],row['start_time']-focus['end_time'])
-        if gap>20:continue
+        if gap>SAME_TURN_GAP_SECONDS:continue
         options.append((gap,abs(row['start_time']-focus['start_time']),str(row['id']),row))
     if not options:return passage
     recovered=coherent_passage(min(options,key=lambda item:item[:3])[3],neighbors)

@@ -83,6 +83,22 @@ class GroundedTests(unittest.TestCase):
    if len(calls)==1:raise TimeoutError()
    return {'judgments':[judgment(r,False)for r in b]}
   rows,meta=validate_grounded('Minecraft',[row(1)],judge);self.assertEqual([],rows);self.assertEqual('no_matches',meta['status']);self.assertEqual(2,meta['provider_calls'])
+ def test_specificity_near_miss_keeps_a_connected_paraphrase_and_not_a_negation(self):
+  from grounded_validation import proposition_quote
+  query='مکہ معاہدہ میں ایران اور ترکی کو بھی شامل کیا جائے'
+  evidence='مکہ معاہدے میں ایران اور ترکی کو بھی شامل کرنے کی بات ہوئی'
+  self.assertIn('ایران',proposition_quote(query,evidence))
+  self.assertIsNone(proposition_quote(query,'مکہ معاہدے پر عمومی بات ہوئی'))
+  self.assertIsNone(proposition_quote(query,'مکہ معاہدے میں ایران اور ترکی کو شامل نہیں کیا جائے'))
+  self.assertIsNone(proposition_quote('ایران کو شامل نہیں کیا جائے',evidence))
+  row={'id':'1','video_id':1087,'text':evidence,'start_time':31.,'end_time':77.,'segment_ids':['1']}
+  def judge(q,rows,t):return {'judgments':[{'candidate_id':candidate_id(rows[0]),'score':.61,'relevant':False,'complete':False,'roles_supported':False,'relationship_supported':False,'quotes':[],'reason':'specificity','asr_interpretation':None}]}
+  rows,meta=validate_grounded(query,[row],judge)
+  self.assertEqual(['1087'],[str(r['video_id'])for r in rows]);self.assertEqual('completed',meta['status'])
+  self.assertIn('ایران',rows[0]['passage_evidence']['0'])
+  weak={**row,'id':'2','text':'مکہ معاہدے پر عمومی بات ہوئی'}
+  empty,_=validate_grounded(query,[weak],judge);self.assertEqual([],empty)
+  rows,_=validate_grounded(query,[row],lambda q,rs,t:{'judgments':[{**judge(q,rs,t)['judgments'][0],'score':.2}]});self.assertEqual([],rows)
  def test_roles_and_negation_cannot_be_ignored(self):
   def judge(q,b,t):return {'judgments':[{**judgment(b[0]),'roles_supported':False}]}
   with self.assertRaises(ValidationUnavailable):validate_grounded('fees',[row(1)],judge)

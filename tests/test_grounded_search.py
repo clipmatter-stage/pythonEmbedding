@@ -283,9 +283,17 @@ class SearchTests(unittest.TestCase):
   rows[0]['segment_index']=1;rows[2]['source_identity_group']='different-source-group'
   self.assertNotIn('3',coherent_passage(rows[1],rows)['segment_ids'])
  def test_context_does_not_bridge_long_gaps(self):
-  from grounded_search import coherent_passage
-  rows=[{'id':str(i),'video_id':1,'speaker':'Alice','text':str(i),'start_time':i*10,'end_time':i*10+1}for i in range(1,4)]
+  from grounded_search import SAME_TURN_GAP_SECONDS,coherent_passage
+  gap=SAME_TURN_GAP_SECONDS+10
+  rows=[{'id':str(i),'video_id':1,'speaker':'Alice','text':str(i),'start_time':i*gap,'end_time':i*gap+1}for i in range(1,4)]
   self.assertEqual(['2'],coherent_passage(rows[1],rows)['segment_ids'])
+ def test_same_speaker_pause_stays_one_passage(self):
+  from grounded_search import coherent_passage
+  rows=[{'id':'1','video_id':1087,'speaker':'A','transcript_speaker':'A','text':'مکۃ المکرمہ میں دفاعی ایگریمنٹ','start_time':31.,'end_time':40.},
+        {'id':'2','video_id':1087,'speaker':'A','transcript_speaker':'A','text':'ایران اور ترکی کو بھی اس معاہدے میں شامل کیا جائے','start_time':52.,'end_time':77.}]
+  joined=coherent_passage(rows[0],rows)
+  self.assertEqual(['1','2'],joined['segment_ids'])
+  self.assertIn('ایران',joined['text']);self.assertIn('ایگریمنٹ',joined['text'])
 
  def test_grounded_session_binding_changes_with_limits(self):
   from unittest.mock import patch
